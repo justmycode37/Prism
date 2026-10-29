@@ -1,29 +1,27 @@
 # Prism
 
-Prism is a native macOS console for an autonomous research cascade. Many inexpensive agents gather evidence; progressively fewer agents analyze it, design strategies and make paper execution decisions. The existing SwiftUI interface, glass rendering, navigation and appearance controls are preserved.
+Prism is a native macOS console for a paper-only research harness focused on public equities involved in AI infrastructure. It gathers public reporting, company material, market charts and other evidence, then routes that material through a fixed reverse cascade. Example symbols include MRVL, NBIS, APLD, CRWV, IREN and MU; they are discovery seeds, not an allowlist. The sector catalogue is dynamic and can discover additional qualifying public companies.
 
-The default cascade has **33 agents**:
+The application has **33 agents** with fixed model routing:
 
-| Layer | Agents | Model | Reasoning | Output |
-| --- | ---: | --- | --- | --- |
-| Collect | 24 | GPT-6 Luna | Low | Source-linked findings |
-| Analyze | 6 | GPT-6.1 Sol | Medium | Ranked hypotheses with statistical context |
-| Strategize | 2 | GPT-6 Astra | High | Declarative strategy candidates |
-| Execute | 1 | GPT-6 Astra | Max | Decisions checked by deterministic paper execution |
+| Layer | Agents | Model | Reasoning |
+| --- | ---: | --- | --- |
+| Collect | 24 | GPT-6 Luna | Low |
+| Analyze | 6 | GPT-6.1 Sol | Medium |
+| Strategize | 2 | GPT-6 Astra | High |
+| Execute | 1 | GPT-6 Astra | Max |
 
-Layer counts, sources and limits are configured by the backend; model and reasoning progression are fixed by layer. Crawling is bounded by configured sources, per-host pacing, robots policies, depth and request limits. It does not promise to collect the entire internet. Model claims never substitute for measured strategy validation.
+Default concurrency is 8, configurable up to 32. The runtime uses the existing OpenAI credential integration. Gemini is not a runtime provider. Agents organize evidence and hypotheses; deterministic host code owns validation, budget reservations, paper fills and accounting.
 
 ## Run
 
 The app requires macOS 26+ and Xcode 26+. The local backend uses Python 3.12+ and its standard library.
 
 ```sh
-xcodebuild -project Prism.xcodeproj -scheme Prism \
-  -configuration Debug -derivedDataPath build \
-  CODE_SIGNING_ALLOWED=NO build
+xcodebuild -project Prism.xcodeproj -scheme Prism -configuration Debug -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
 ```
 
-For a macOS login service, run:
+Install and control the local background service:
 
 ```sh
 python3 scripts/prismctl.py install
@@ -32,27 +30,18 @@ python3 scripts/prismctl.py start
 python3 scripts/prismctl.py stop
 ```
 
-Installation links the local control token with the app's Keychain entry. The runtime reads its OpenAI credential from the configured private key file or environment. A new cascade starts **paused** in `.prism-runtime/cascade.sqlite3`; use the existing Start control when ready. The rebuilt backend does not import the previous research database or execute its strategy code.
-
-The service continues independently of the console while the Mac is awake. Closing the console does not stop research. Execution is simulated paper trading; there is no exchange order submission or custody integration.
-
-To change cascade settings unavailable in the existing UI, provide a partial JSON configuration:
-
-```sh
-python3 scripts/prismctl.py configure --config-file /path/to/cascade-settings.json
-```
-
-## Documentation and checks
-
-- [Architecture](docs/Architecture.md): layer contracts, information flow and module boundaries.
-- [Agents](docs/Agents.md): responsibilities, routing and the four role manuals.
-- [Runtime](docs/Runtime.md): startup, configuration, crawling, controls and persistence.
-- [Validation](docs/Validation.md): checks performed for this rebuild and remaining limitations.
-- [Design](docs/Design.md) and [third-party components](docs/ThirdParty.md): the preserved native presentation and bundled assets.
+The runtime starts paused in `.prism-runtime/cascade.sqlite3`. Its OpenAI credential comes from `PRISM_OPENAI_KEY_FILE`, `OPENAI_API_KEY`, or the existing private runtime credential/Keychain entry. Closing the console does not stop the installed service. Read [Runtime](docs/Runtime.md) for configuration and controls.
 
 ```sh
 PYTHONPATH=backend python3 -m unittest discover -s backend/tests -v
 scripts/check-ui-contract.sh
 ```
 
-The local glass prototype uses `PRISM_EXPERIMENTAL_GLASS` to tune private macOS rendering APIs. Remove that compilation condition to build the public `NSGlassEffectView` fallback. The prototype needs regression checks after OS updates and is not suitable for Mac App Store distribution.
+## Documentation
+
+- [Architecture](docs/Architecture.md): evidence flow and layer boundaries.
+- [Agents](docs/Agents.md): fixed roster and responsibilities.
+- [Runtime](docs/Runtime.md): catalogue, public sources and data limits.
+- [Validation](docs/Validation.md): verification results and data limitations.
+
+The local glass prototype uses `PRISM_EXPERIMENTAL_GLASS` for private macOS rendering APIs. Remove that compilation condition to use the public `NSGlassEffectView` fallback. See [Design](docs/Design.md) and [third-party components](docs/ThirdParty.md).

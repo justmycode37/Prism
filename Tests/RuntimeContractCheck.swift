@@ -28,8 +28,21 @@ struct RuntimeContractCheck {
         try require(state.agents.allSatisfy { $0.parentId == nil || agentIDs.contains($0.parentId!) },
                     "The unchanged hierarchy renderer must receive valid reporting links.")
         try require(state.agentRoles?.count == 4, "The role catalog must contain the four cascade layers.")
-        try require(state.markets.first?.change24h == 0.025 && state.markets.first?.fundingRate == 0.0001,
-                    "Market return and funding fields must decode as fractions.")
+        try require(state.markets.first?.change24h == 0.025 && state.markets.first?.fundingRate == nil,
+                    "Equity daily changes and absent funding must decode.")
+        try require(state.cascade?.sector?.id == "ai_infrastructure" && state.cascade?.collection?.collectorCount == 24,
+                    "The dynamic sector and collection coverage must reach the console.")
+        try require(state.cascade?.sector?.companies.first?.symbol == "MRVL" &&
+                    state.cascade?.sector?.companies.first?.sourceUrls.count == 1,
+                    "Discovered company identity and source provenance must decode.")
+        var legacy = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        legacy.removeValue(forKey: "cascade")
+        var legacyMarkets = legacy["markets"] as! [[String: Any]]
+        legacyMarkets[0]["change_24h"] = NSNull()
+        legacy["markets"] = legacyMarkets
+        let legacyState = try decoder.decode(RuntimeState.self, from: JSONSerialization.data(withJSONObject: legacy))
+        try require(legacyState.cascade == nil && legacyState.markets[0].change24h == nil,
+                    "Legacy metadata and unknown market changes must remain optional.")
         try require(state.portfolio.positions.first?.entryPrice == 100 && state.portfolio.trades.first?.id == "contract-fill",
                     "Nonempty paper positions and fills must decode.")
         try require(state.portfolio.totalPnl == 1 && state.portfolio.totalReturn == 0.0001,

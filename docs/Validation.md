@@ -1,24 +1,30 @@
 # Validation
 
-This record covers the reverse-cascade rebuild on 29 October 2026. Historical validation of the removed backend is not evidence for this implementation.
+Verified on October 29, 2026.
 
-## Checks
+## Automated checks
 
-- **Passed:** `scripts/check-ui-contract.sh` against state assembled by the new runtime.
-- **Passed:** Python syntax compilation of the new launcher and CLI; CLI argument/help smoke check.
-- **Passed:** XcodeGen project regeneration, removing stale role-manual references.
-- **Passed:** Xcode Debug build with Swift 6 and code signing disabled. Artifact: `build/Cascade/Build/Products/Debug/Prism.app`; build log: `/tmp/prism-cascade-xcodebuild.log`. CoreSimulator service diagnostics and skipped App Intents metadata extraction did not prevent the macOS build.
-- **Passed:** 57 backend tests, including the complete synthetic four-layer cascade through real statistical validation and paper execution, budget/restart checkpoints, stop handling, provenance rejection, statistical lookahead defenses, costs, exposure, quote freshness, collector HTTP behavior, strict model schemas and the authenticated loopback API. The loopback checks require local networking permission in a restricted environment.
-- **Passed:** SHA-256 comparison of all 22 files under `Prism/` against the pre-rebuild snapshot: every file is unchanged.
-- **Passed:** read-only public collection smoke tests retrieved news evidence from the five default publishers and 999 closed BTC spot candles. Blocked feeds were removed from defaults; unsupported ECB PDF links retain the feed summary.
-- **Passed:** installed service reports `reverse_cascade`, layer counts 24/6/2/1, paper mode, paused status, credential configured, zero calls and zero spend.
+- `PYTHONPATH=backend python3 -m unittest discover -s backend/tests -v`: 85 tests passed.
+- `scripts/check-ui-contract.sh`: passed. The real backend state decodes into Swift models with 33 agents, four layers, equity observations, dynamic company provenance, nullable daily changes and optional legacy metadata.
+- `xcodebuild -project Prism.xcodeproj -scheme Prism -configuration Debug -derivedDataPath build CODE_SIGNING_ALLOWED=NO build`: succeeded. The existing App Intents metadata warning remains informational.
+- `git diff --check`: passed.
 
-The fixture uses a temporary database and injects an empty credential loader, so decoding checks make no provider calls and do not touch the user's live database.
+Coverage includes dynamic listed-company admission, source provenance and ambiguous-name rejection; collection of an 80-symbol universe across 24 scouts; cross-collector sharing of article bodies longer than 2,200 characters; acquisition completion before model fan-out; call-budget deferral and checkpoint reuse; pause behavior; atomic legacy configuration/account migration; and retrieval of 2,300 evidence records.
 
-The UI contract check generates state with the real new runtime, compiles the unchanged `Prism/Models/RuntimeState.swift`, and checks the 33-agent roster, four layers, model routing, the existing Overview Start action, nullable strategy metrics, market fractions, paper records, P&L and Settings JSON encoding.
+Market fixtures cover actual Yahoo chart metadata, adjustments, missing daily changes, malformed quotes and symbols, duplicate sessions, incomplete bars, daily calendar gaps, 252-session Sharpe annualization, insufficient listing history, and weekend signal timing. Existing statistical holdout, frozen-rule, cost, portfolio and transport security checks remain in the suite.
 
-## Scope
+## Live public-source checks
 
-No paid OpenAI calls or live exchange orders were made. The existing macOS login service was replaced with the new backend after checks passed, reusing its existing control-token link; the new service starts paused. No claim of a profitable strategy, complete web coverage or live model compatibility follows from mocked tests. The new database starts paused.
+Read-only checks through the production fetcher reached the Nasdaq listing directory, Bing News RSS, NVIDIA announcements, HPCwire, Semiconductor Engineering and Data Center Dynamics. A focused Credo news query admitted CRDO outside the configured seeds with nine source records. SEC returned HTTP 403; the exchange-directory fallback supplied listings and the gap remained visible.
 
-The SwiftUI presentation remains unchanged. Full VoiceOver, keyboard navigation, minimum window sizing, appearance regression and desktop-dependent glass rendering remain manual checks. The private glass prototype continues to require OS-update regression testing.
+The public Yahoo endpoint returned MRVL equity metadata and 1,254 usable closed daily sessions. Quote time remained the source's market timestamp, and the five-year chart baseline was not substituted for a daily percentage change.
+
+Google News RSS search was blocked by its robots policy and is excluded from defaults. Some company sites also returned HTTP 403. Default coverage combines sources, and retrieval failures remain observable.
+
+## Limits
+
+No paid model calls, real orders, service restart or graphical app interaction was used for these checks. Provider handoffs and strategy admission use offline fixtures in tests. Successful checks establish neither exhaustive coverage nor profitable strategies.
+
+Yahoo is an unofficial source and may be delayed or revised. Daily histories exclude the current exchange-local date conservatively; absent corporate-action adjustments prevent statistical admission. Weekends do not age an equity signal by trading sessions; holidays count conservatively as weekdays. Fresh quotes remain necessary for all paper fills. Short listing histories can remain insufficient for the 300-bar gate.
+
+The fetcher handles RSS, Atom and ordinary HTML, with finite depth, bytes, requests and time. It does not render JavaScript, parse PDFs, or bypass robots and access controls. Sector membership is an evidence-based classifier with operator-supplied seeds; it can miss companies and requires review when source context is ambiguous.

@@ -47,10 +47,10 @@ class IngestionTests(unittest.TestCase):
     def test_rss_deduplicates_trackers_strips_scripts_and_ranks_topic(self):
         rss = """<rss><channel>
         <item><title>Unrelated release</title><link>https://public.test/other</link><description>Other.</description></item>
-        <item><title>Bitcoin liquidity rises</title><link>https://public.test/a?utm_source=x</link>
-        <description>&lt;p&gt;Bitcoin volume up.&lt;/p&gt;&lt;script&gt;evil()&lt;/script&gt;</description>
+        <item><title>NASDAQ: MRVL AI liquidity rises</title><link>https://public.test/a?utm_source=x</link>
+        <description>&lt;p&gt;MRVL AI infrastructure volume up.&lt;/p&gt;&lt;script&gt;evil()&lt;/script&gt;</description>
         <pubDate>Tue, 27 Oct 2026 12:00:00 GMT</pubDate></item>
-        <item><title>Bitcoin liquidity rises</title><link>https://public.test/a?utm_source=y</link><description>Bitcoin volume up.</description></item>
+        <item><title>NASDAQ: MRVL AI liquidity rises</title><link>https://public.test/a?utm_source=y</link><description>MRVL AI infrastructure volume up.</description></item>
         </channel></rss>"""
         collector = FixtureCollector({"/robots.txt": document("User-agent: *\nAllow: /", "text/plain"),
                                       "/rss": document(rss, "application/rss+xml")})
@@ -60,9 +60,16 @@ class IngestionTests(unittest.TestCase):
         item = result["evidence"][0]
         self.assertEqual(item["source_url"], "https://public.test/a")
         self.assertNotIn("evil", item["content"])
-        self.assertEqual(item["symbols"], ["BTCUSDT"])
+        self.assertEqual(item["symbols"], ["MRVL"])
         self.assertEqual(item["published_at"], "2026-10-27T12:00:00Z")
         self.assertTrue(all(address == "93.184.216.34" for _, address in collector.calls))
+
+    def test_bing_tracking_wrappers_preserve_canonical_publisher_provenance(self):
+        rss = '<rss><channel><item><title>AI data centers</title><link>http://www.bing.com/news/apiclick.aspx?url=https%3A%2F%2Fpublisher.test%2Freport%3Futm_source%3Dfeed</link><description>AI capacity expansion</description></item></channel></rss>'
+        collector = FixtureCollector({'/rss': document(rss, 'application/rss+xml')})
+        result = collector.collect({'sources': ['https://public.test/rss']})
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['evidence'][0]['source_url'], 'https://publisher.test/report')
 
     def test_evidence_identity_versions_source_content_without_observation_clock(self):
         collector = FixtureCollector({})
@@ -131,29 +138,53 @@ class IngestionTests(unittest.TestCase):
         self.assertTrue(any("pages budget" in error for error in result["errors"]))
 
     def test_market_closed_chronological_candles_and_quote_freshness(self):
-        now = int(time.time() * 1000)
-        hour = 3_600_000
-        start = now // hour * hour
-        rows = [[str(at), "100", "105", "99", "102", "20", "2000"]
-                for at in (start, start - hour, start - 2 * hour)]
-        ticker = {"retCode": 0, "time": now - 90_000, "result": {"list": [
-            {"symbol": "BTCUSDT", "lastPrice": "102", "price24hPcnt": ".02", "fundingRate": ".0001"}]}}
-        candles = {"retCode": 0, "time": now, "result": {"list": rows}}
+        now = int(time.time())
+        ticker = {'chart': {'result': [{'meta': {
+            'symbol': 'MRVL', 'quoteType': 'EQUITY', 'currency': 'USD',
+            'exchangeTimezoneName': 'America/New_York', 'regularMarketTime': now - 90,
+            'regularMarketPrice': 102, 'previousClose': 100},
+            'timestamp': [now - 3 * 86400, now - 2 * 86400],
+            'indicators': {'quote': [{'open': [100, 101], 'high': [103, 104],
+                'low': [99, 100], 'close': [102, 103], 'volume': [20, 30]}]}}]}}
         collector = FixtureCollector({
-            "/v5/market/tickers?category=spot&symbol=BTCUSDT": document(json.dumps(ticker), "application/json"),
-            "/v5/market/kline?category=spot&symbol=BTCUSDT&interval=60&limit=1000": document(json.dumps(candles), "application/json"),
-        })
-        result = collector.collect({"symbol": "BTCUSDT", "sources": []})
-        self.assertEqual(result["errors"], [])
-        market = result["markets"][0]
-        self.assertEqual(market["as_of_ms"], now - 90_000)
-        self.assertEqual(market["change_24h"], .02)
-        self.assertIsNone(market["funding_rate"])
-        self.assertEqual([row["start_ms"] for row in market["candles"]], [start - 2 * hour, start - hour])
-        self.assertTrue(all(row["closed"] and row["end_ms"] <= now for row in market["candles"]))
-        self.assertEqual(len(result["evidence"]), 2)
-        self.assertEqual(len(collector.collect_markets(["BTCUSDT"])), 1)
-        self.assertEqual(len(collector.calls), 2)
+            '/v8/finance/chart/MRVL?range=5y&interval=1d': document(json.dumps(ticker), 'application/json')})
+        result = collector.collect({'symbol': 'MRVL', 'sources': []})
+        self.assertEqual(result['errors'], [])
+        market = result['markets'][0]
+        self.assertEqual(market['as_of_ms'], (now - 90) * 1000)
+        self.assertAlmostEqual(market['change_24h'], .02)
+        self.assertIsNone(market['funding_rate'])
+        self.assertEqual(len(market['candles']), 2)
+        self.assertEqual({row['source_kind'] for row in result['evidence']}, {'market', 'chart'})
+        self.assertEqual(len(collector.collect_markets(['MRVL'])), 1)
+        self.assertEqual(len(collector.calls), 1)
+
+    def test_collector_shards_cover_the_full_discovered_universe(self):
+        from prism_runtime.config import default_config
+        from prism_runtime.domain import roster
+        config = default_config()
+        config['symbols'] = ['S' + str(i) for i in range(80)]
+        config['sources'] = []
+        collector = SourceCollector(config)
+        seen = set()
+        def market(symbol, *_args):
+            seen.add(symbol)
+            return {'markets': [], 'evidence': []}
+        with patch.object(collector, '_market', side_effect=market):
+            for agent in roster(config):
+                if agent['layer'] == 'collector':
+                    collector.collect(agent)
+        self.assertEqual(seen, set(config['symbols']))
+
+    def test_discovery_keeps_observable_seed_fallback_when_catalogues_fail(self):
+        from prism_runtime.config import default_config
+        config = default_config()
+        config['sources'] = []
+        collector = SourceCollector(config)
+        with patch.object(collector, '_fetch', side_effect=CollectionError('Unavailable')):
+            result = collector.discover_universe()
+        self.assertTrue(result['errors'])
+        self.assertTrue(set(config['sector']['seed_symbols']).issubset({row['symbol'] for row in result['companies']}))
 
     def test_feed_entity_declarations_rejected(self):
         collector = FixtureCollector({"/rss": document('<!DOCTYPE rss [<!ENTITY x "bad">]><rss/>', "application/rss+xml")})

@@ -17,10 +17,10 @@ DEFAULT_CONFIG = {
     'market_refresh_seconds': 60,
     'daily_limit_usd': None,
     'max_calls_per_day': None,
-    'max_output_tokens': 4096,
-    'max_input_bytes': 48000,
-    'max_evidence_per_cycle': 240,
-    'max_handoffs_per_agent': 32,
+    'max_output_tokens': 8192,
+    'max_input_bytes': 1000000,
+    'max_evidence_per_cycle': 4000,
+    'max_handoffs_per_agent': 64,
     'layers': {
         'collector': {'count': 24, 'model': 'gpt-6-luna', 'reasoning_effort': 'low'},
         'analyst': {'count': 6, 'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium'},
@@ -33,13 +33,17 @@ DEFAULT_CONFIG = {
         'gpt-6.1-sol': {'input': 10.0, 'output': 50.0},
         'gpt-6-astra': {'input': 30.0, 'output': 150.0},
     },
-    'symbols': ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'ADAUSDT'],
+    'symbols': ['MRVL', 'NBIS', 'APLD', 'CRWV', 'IREN', 'MU', 'NVDA', 'AMD', 'AVGO', 'ANET', 'VRT', 'TSM', 'ARM', 'SMCI', 'ALAB', 'DELL', 'HPE', 'CLS'],
+    'sector': {'id': 'ai_infrastructure', 'max_symbols': 80, 'discovery_enabled': True,
+               'seed_symbols': ['MRVL', 'NBIS', 'APLD', 'CRWV', 'IREN', 'MU', 'NVDA', 'AMD', 'AVGO', 'ANET', 'VRT', 'TSM', 'ARM', 'SMCI', 'ALAB', 'DELL', 'HPE', 'CLS'],
+               'keywords': ['AI infrastructure', 'AI data centers', 'semiconductor supply chain', 'accelerated computing', 'data center power', 'AI networking']},
     'ingestion': {
-        'max_pages': 16, 'max_response_bytes': 1000000,
-        'request_timeout_seconds': 8, 'crawl_depth': 1, 'max_seconds': 30,
-        'max_requests': 48, 'items_per_feed': 4, 'articles_per_feed': 1,
-        'pages_per_site': 3, 'crawl_articles': True,
-        'candle_limit': 1000, 'candle_interval': '60',
+        'max_pages': 48, 'max_response_bytes': 1000000,
+        'request_timeout_seconds': 8, 'crawl_depth': 2, 'max_seconds': 90,
+        'max_requests': 160, 'items_per_feed': 12, 'articles_per_feed': 3,
+        'pages_per_site': 6, 'crawl_articles': True,
+        'candle_limit': 1260, 'candle_interval': 'D', 'max_content_chars': 24000,
+        'max_evidence': 128, 'shared_evidence_limit': 256, 'workers': 4,
     },
     'risk': {
         'max_gross_fraction': 0.30, 'max_symbol_fraction': 0.10,
@@ -69,8 +73,8 @@ def validate_config_update(changes: dict) -> dict:
     result = {}
     integer_ranges = {'max_concurrency': (1, 32), 'cycle_interval_seconds': (60, 86400),
                       'market_refresh_seconds': (15, 900), 'max_calls_per_day': (1, 100000),
-                      'max_output_tokens': (1024, 32768), 'max_input_bytes': (4000, 200000),
-                      'max_evidence_per_cycle': (24, 2000), 'max_handoffs_per_agent': (4, 128)}
+                      'max_output_tokens': (1024, 32768), 'max_input_bytes': (4000, 2000000),
+                      'max_evidence_per_cycle': (24, 20000), 'max_handoffs_per_agent': (4, 256)}
     for key, value in changes.items():
         if key in {'daily_limit_usd', 'max_calls_per_day'} and value is None:
             result[key] = None
@@ -101,9 +105,22 @@ def validate_config_update(changes: dict) -> dict:
             if counts[-1] != 1 or any(a <= b for a, b in zip(counts, counts[1:])):
                 raise ValueError('The cascade must narrow at every layer to one executor.')
             result[key] = copy.deepcopy(value)
+        elif key == 'symbols':
+            if not isinstance(value, list) or not 1 <= len(value) <= 256 or any(not isinstance(x, str) or not x or len(x) > 20 for x in value) or len(set(value)) != len(value):
+                raise ValueError('Symbols must be a deduplicated list of tickers.')
+            result[key] = list(value)
+        elif key == 'sector':
+            if not isinstance(value, dict) or not value or not set(value) <= {'id', 'max_symbols', 'discovery_enabled', 'seed_symbols', 'keywords'}:
+                raise ValueError('Invalid sector settings.')
+            if 'id' in value and value['id'] != 'ai_infrastructure': raise ValueError('Invalid sector id.')
+            if 'max_symbols' in value and (isinstance(value['max_symbols'], bool) or not isinstance(value['max_symbols'], int) or not 12 <= value['max_symbols'] <= 256): raise ValueError('Invalid sector symbol limit.')
+            if 'discovery_enabled' in value and not isinstance(value['discovery_enabled'], bool): raise ValueError('Invalid discovery flag.')
+            if 'seed_symbols' in value and (not isinstance(value['seed_symbols'], list) or not 1 <= len(value['seed_symbols']) <= 256 or any(not isinstance(x, str) or not x or len(x) > 20 for x in value['seed_symbols']) or len(set(value['seed_symbols'])) != len(value['seed_symbols'])): raise ValueError('Invalid sector seed symbols.')
+            if 'keywords' in value and (not isinstance(value['keywords'], list) or not 1 <= len(value['keywords']) <= 40 or any(not isinstance(x, str) or not x.strip() or len(x) > 100 for x in value['keywords'])): raise ValueError('Invalid sector keywords.')
+            result[key] = copy.deepcopy(value)
         elif key == 'sources':
-            if not isinstance(value, list) or len(value) > 16:
-                raise ValueError('Configure at most 16 public sources.')
+            if not isinstance(value, list) or len(value) > 128:
+                raise ValueError('Configure at most 128 public sources.')
             for source in value:
                 if not isinstance(source, (str, dict)):
                     raise ValueError('A source must be a URL or source object.')
@@ -127,11 +144,11 @@ def validate_config_update(changes: dict) -> dict:
                     raise ValueError('Sources must use public HTTPS URLs.')
             result[key] = copy.deepcopy(value)
         elif key == 'ingestion':
-            ranges = {'workers': (1, 8), 'max_pages': (1, 40), 'max_response_bytes': (1024, 2000000),
+            ranges = {'workers': (1, 16), 'max_pages': (1, 96), 'max_response_bytes': (1024, 2000000),
                       'request_timeout_seconds': (1, 20), 'crawl_depth': (0, 2), 'max_seconds': (5, 90),
-                      'max_requests': (4, 96), 'items_per_feed': (1, 12), 'articles_per_feed': (0, 4),
-                      'pages_per_site': (0, 8), 'candle_limit': (300, 1000), 'max_evidence': (1, 96),
-                      'max_content_chars': (256, 12000), 'host_delay_seconds': (.25, 10)}
+                      'max_requests': (4, 512), 'items_per_feed': (1, 32), 'articles_per_feed': (0, 8),
+                      'pages_per_site': (0, 16), 'candle_limit': (300, 1260), 'max_evidence': (1, 256),
+                      'shared_evidence_limit': (1, 1024), 'max_content_chars': (256, 48000), 'host_delay_seconds': (.25, 10)}
             if not isinstance(value, dict) or not value:
                 raise ValueError('Invalid ingestion settings.')
             for name, number in value.items():
@@ -139,7 +156,7 @@ def validate_config_update(changes: dict) -> dict:
                     if not isinstance(number, bool):
                         raise ValueError('crawl_articles must be boolean.')
                 elif name == 'candle_interval':
-                    if number not in {'1', '3', '5', '15', '30', '60', '120', '240', '360', '720', 'D'}:
+                    if number != 'D':
                         raise ValueError('Invalid candle interval.')
                 elif name not in ranges or isinstance(number, bool) or not isinstance(number, (float, int)) or not math.isfinite(number) or not ranges[name][0] <= number <= ranges[name][1]:
                     raise ValueError('Invalid ingestion limit.')

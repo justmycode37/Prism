@@ -9,7 +9,8 @@ probability that a strategy will make money. All accepted strategies remain pape
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import hashlib
 import json
 import math
@@ -97,6 +98,17 @@ def closed_candles(market, *, now_ms=None):
     result = []
     previous_end = None
     interval = None
+    equity_daily = (str(market.get("asset_class", "")).lower() == "equity"
+                    and market.get("interval_ms") == 86_400_000)
+    if str(market.get('asset_class', '')).lower() == 'equity' and not equity_daily:
+        raise ValueError('Equity research requires explicit daily candle intervals')
+    if equity_daily and market.get('history_adjustment') == 'unverified':
+        raise ValueError('Equity historical corporate-action adjustment is unverified')
+    if equity_daily:
+        try:
+            exchange_zone = ZoneInfo(market.get("exchange_timezone", "America/New_York"))
+        except (ZoneInfoNotFoundError, TypeError) as exc:
+            raise ValueError("Invalid exchange timezone") from exc
     for row in bars:
         if not isinstance(row, dict):
             raise ValueError("Candle must be an object")
@@ -110,15 +122,34 @@ def closed_candles(market, *, now_ms=None):
             # A present, incomplete exchange bar is not historical evidence.
             continue
         width = end - start
-        if interval is None:
+        if equity_daily:
+            if width != 86_400_000:
+                raise ValueError("Equity daily candles must have 24-hour widths")
+            local_start = datetime.fromtimestamp(start / 1000, timezone.utc).astimezone(exchange_zone)
+            if (local_start.hour, local_start.minute, local_start.second, local_start.microsecond) != (0, 0, 0, 0):
+                raise ValueError("Equity daily candles must start at exchange-local midnight")
+            if result and local_start.date() <= datetime.fromtimestamp(result[-1]["start_ms"] / 1000, timezone.utc).astimezone(exchange_zone).date():
+                raise ValueError("Equity candles must have unique ordered local dates")
+            if result:
+                prior_local = datetime.fromtimestamp(result[-1]["start_ms"] / 1000, timezone.utc).astimezone(exchange_zone)
+                expected = prior_local.replace(tzinfo=None) + timedelta(days=1)
+                local_gap = (local_start.replace(tzinfo=None) - expected).days
+                if local_gap < 0 or local_gap > 7:
+                    raise ValueError("Equity session gap exceeds seven days or is unordered")
+                overlap = previous_end - start
+                offset_change = (local_start.utcoffset() - prior_local.utcoffset()).total_seconds() * 1000
+                if overlap > 0 and not (local_gap == 0 and overlap == offset_change and overlap <= 3_600_000):
+                    raise ValueError('Equity session overlap is not explained by daylight saving time')
+        elif interval is None:
             interval = width
-        if width != interval or (previous_end is not None and start != previous_end):
+        if not equity_daily and (width != interval or (previous_end is not None and start != previous_end)):
             raise ValueError("Candles must be chronological, unique, regular and gap free")
         values = {key: _number(row.get(key), key, positive=True) for key in ("open", "high", "low", "close")}
         volume = _number(row.get("volume", 0), "volume")
         if volume < 0 or values["high"] < max(values["open"], values["close"]) or values["low"] > min(values["open"], values["close"]) or values["low"] > values["high"]:
             raise ValueError("Invalid candle OHLC or volume")
-        result.append({"start_ms": start, "end_ms": end, **values, "volume": volume, "closed": True})
+        result.append({"start_ms": start, "end_ms": end, **values, "volume": volume,
+                       "closed": True, "asset_class": "equity" if equity_daily else market.get("asset_class")})
         previous_end = end
     return result
 
@@ -186,7 +217,8 @@ def _run_segment(spec, bars, start, end, *, fee_bps=FEE_BPS, slippage_bps=SLIPPA
         max_drawdown = max(max_drawdown, 1 - equity / peak)
         previous_equity = equity
     deviation = statistics.stdev(returns) if len(returns) > 1 else 0
-    annual_bars = 365.25 * 86_400_000 / (bars[0]["end_ms"] - bars[0]["start_ms"])
+    annual_bars = (252 if bars[0].get("asset_class") == "equity" else
+                   365.25 * 86_400_000 / (bars[0]["end_ms"] - bars[0]["start_ms"]))
     sharpe = statistics.fmean(returns) / deviation * math.sqrt(annual_bars) if deviation else 0.0
     if not math.isfinite(sharpe) or not math.isfinite(costs):
         raise ValueError("Historical prices produced nonfinite metrics")

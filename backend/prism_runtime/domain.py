@@ -18,12 +18,12 @@ def identity(value) -> str:
 
 
 TOPICS = [
-    'price and volume', 'market microstructure', 'funding and positioning', 'volatility',
-    'central banks and macroeconomics', 'inflation and interest rates', 'regulation', 'exchange announcements',
-    'protocol development', 'security incidents', 'institutional adoption', 'cross asset flows',
-    'liquidity', 'market sentiment', 'on chain activity', 'stablecoins',
-    'derivatives', 'token supply', 'earnings and economic releases', 'geopolitics',
-    'research publications', 'market breadth', 'technical breakouts', 'relative value',
+    'semiconductor demand', 'accelerator roadmaps', 'memory supply and pricing', 'HBM capacity',
+    'networking and optical interconnects', 'cloud compute demand', 'data center construction', 'power availability',
+    'cooling systems', 'manufacturing capacity', 'foundry utilization', 'advanced packaging',
+    'AI server shipments', 'hyperscaler capital expenditure', 'chip design and IP', 'supply chain constraints',
+    'data center leases', 'energy procurement', 'export controls', 'earnings and guidance',
+    'competitive positioning', 'infrastructure financing', 'deployment timelines', 'industry research',
 ]
 
 
@@ -43,6 +43,11 @@ def roster(config):
                 'team': f'{depth + 1}. {layer.title()}s', 'kind': 'specialist' if depth == 0 else 'orchestrator',
                 'layer': layer, 'depth': depth, 'parent_id': parent, 'topic': topic,
                 'symbol': config['symbols'][index % len(config['symbols'])] if depth == 0 else None,
+                'symbols': list(config['symbols']) if depth == 0 else [],
+                'source_shard': index if depth == 0 else None,
+                'source_shard_count': len(ids['collector']) if depth == 0 else None,
+                'subtheme': ('semiconductors', 'memory', 'networking', 'cloud_compute',
+                             'data_centers', 'power', 'cooling', 'manufacturing')[index % 8] if depth == 0 else None,
                 'model': settings['model'], 'reasoning_effort': settings['reasoning_effort'],
                 'mandate': f'{topic.capitalize()}; send only source-linked results to the next cascade layer.',
                 'instructions': instructions, 'instruction_path': str(path.relative_to(path.parents[2])),

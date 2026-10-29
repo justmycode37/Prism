@@ -39,6 +39,7 @@ class Runtime:
         self._generation = 0
         self._market_thread = None
         self._key_configured = False
+        self._credentials = {'openai_configured': False}
         self._key_checked = 0.0
         self.store.seed_agents(roster(self.store.config()))
         if self.store.get_document('portfolio') is None:
@@ -49,9 +50,10 @@ class Runtime:
         with self._state_lock:
             if time.monotonic() - self._key_checked > 30:
                 try:
-                    self._key_configured = bool(self.key_loader())
+                    self._credentials['openai_configured'] = bool(self.key_loader())
                 except Exception:
-                    self._key_configured = False
+                    self._credentials['openai_configured'] = False
+                self._key_configured = all(self._credentials.values())
                 self._key_checked = time.monotonic()
             return self._key_configured
 
@@ -122,7 +124,8 @@ class Runtime:
         method = getattr(self.collector, 'collect_markets', None)
         if method is None:
             return
-        markets = method(self.store.config()['symbols'])
+        symbols = list(dict.fromkeys(self._symbols() + [row['symbol'] for row in self.store.get_document('portfolio', {}).get('positions', [])]))
+        markets = method(symbols)
         if isinstance(markets, dict):
             markets = markets.get('markets', [])
         if markets:
@@ -137,7 +140,8 @@ class Runtime:
             known = {item['symbol']: item for item in self._markets()}
             for market in markets:
                 symbol = market.get('symbol')
-                if symbol in self.store.config()['symbols']:
+                held = {row['symbol'] for row in self.store.get_document('portfolio', {}).get('positions', [])}
+                if symbol in self._symbols() or symbol in held:
                     # Failed/stale refreshes never replace a newer observation.
                     old = known.get(symbol, {})
                     if market.get('as_of_ms', 0) >= old.get('as_of_ms', 0):
@@ -147,10 +151,80 @@ class Runtime:
     def _markets(self):
         return self.store.get_document('markets', [])
 
+    def _symbols(self, cycle=None):
+        if cycle and cycle.get('symbols'):
+            return cycle['symbols']
+        universe = self.store.get_document('sector_universe', {})
+        return universe.get('symbols') or self.store.config()['symbols']
+
+    def _discover(self, generation):
+        """Refresh sector membership once per cycle, before freezing assignments."""
+        config = self.store.config()
+        method = getattr(self.collector, 'discover_universe', None)
+        result = {}
+        if method and config.get('sector', {}).get('discovery_enabled', True):
+            try:
+                result = method()
+            except Exception:
+                self.store.event('discovery', 'Sector discovery unavailable; configured AI equity seeds retained.', 'warning')
+        if not self._active(generation):
+            return None
+        from .sector import normalize_symbol
+        companies = []
+        seen = set()
+        for row in result.get('companies', []):
+            symbol = normalize_symbol(row.get('symbol')) if isinstance(row, dict) else None
+            if symbol and symbol not in seen:
+                companies.append({**row, 'symbol': symbol})
+                seen.add(symbol)
+        # Seeds are starting coverage, not a whitelist. Failed discovery is explicit.
+        for symbol in config.get('sector', {}).get('seed_symbols', config['symbols']):
+            if symbol not in seen:
+                companies.append({'symbol': symbol, 'name': symbol, 'themes': [], 'source_urls': [],
+                                  'evidence_ids': [], 'discovery_reason': 'Configured sector seed; discovery verification unavailable.'})
+                seen.add(symbol)
+        companies = companies[:config.get('sector', {}).get('max_symbols', 80)]
+        evidence = self._valid_evidence(result.get('evidence', []))[:config['max_evidence_per_cycle']]
+        self.store.save_evidence(evidence)
+        universe = {'id': 'ai_infrastructure', 'name': 'AI infrastructure', 'companies': companies,
+                    'symbols': [row['symbol'] for row in companies], 'discovered_at': timestamp(),
+                    'discovery_status': 'partial' if result.get('errors') else 'completed' if result else 'seed_coverage',
+                    'evidence_ids': [row['id'] for row in evidence]}
+        self.store.set_document('sector_universe', universe)
+        held = {row['symbol'] for row in self.store.get_document('portfolio', {}).get('positions', [])}
+        selected_symbols = set(universe['symbols']) | held
+        self.store.set_document('markets', [row for row in self._markets() if row['symbol'] in selected_symbols])
+        if result.get('errors'):
+            self.store.event('discovery', f'{len(result["errors"])} discovery source(s) unavailable; {len(companies)} AI equities retained.', 'warning')
+        return universe
+
+    @staticmethod
+    def _valid_evidence(items):
+        return [row for row in items if isinstance(row, dict) and all(isinstance(row.get(key), str) and row[key]
+                for key in ('id', 'source_url', 'content', 'observed_at'))]
+
+    def _retain_evidence(self, cycle, items):
+        config = self.store.config()
+        with self._state_lock:
+            key = 'cycle_evidence_' + cycle['id']
+            retained = set(self.store.get_document(key, []))
+            sources = set(self.store.get_document('cycle_sources_' + cycle['id'], []))
+            bounded = []
+            for item in self._valid_evidence(items):
+                if item['id'] in retained or len(retained) < config['max_evidence_per_cycle']:
+                    retained.add(item['id'])
+                    sources.add(item['source_url'])
+                    bounded.append(item)
+            self.store.save_evidence(bounded)
+            self.store.set_document(key, sorted(retained))
+            self.store.set_document('cycle_sources_' + cycle['id'], sorted(sources))
+        return bounded
+
     def _payload(self, agent, cycle, inputs):
         config = self.store.config()
         payload = {'cycle_id': cycle['id'], 'layer': agent['layer'], 'topic': agent['topic'],
-                   'as_of': timestamp(), 'inputs': inputs, 'allowed_symbols': config['symbols'],
+                   'as_of': timestamp(), 'inputs': inputs, 'allowed_symbols': self._symbols(cycle),
+                   'sector': {'id': 'ai_infrastructure', 'scope': 'Listed AI infrastructure equities: chips, memory, networking, cloud compute, data centers, power and cooling.'},
                    'max_output_tokens': config['max_output_tokens']}
         if agent['layer'] == 'analyst':
             symbols = set()
@@ -214,6 +288,51 @@ class Runtime:
         values = output.get(key, [])
         return [row for row in values[:limit] if isinstance(row, dict)] if isinstance(values, list) else []
 
+    def _gather_sources(self, cycle, generation):
+        """Finish public acquisition before model fan-out, so every scout can use the pool."""
+        agents = [row for row in cycle['roster'] if row['layer'] == 'collector']
+        def gather(agent):
+            if not self._active(generation):
+                return
+            existing = self.store.job(cycle['id'], agent['id'])
+            if existing and existing['status'] in {'collected', 'completed'}:
+                return
+            self.store.update_agent(agent['id'], status='working', task='Gathering AI-sector sources and equity charts')
+            try:
+                result = self.collector.collect(agent)
+                if not self._active(generation):
+                    return
+                self._merge_markets(result.get('markets', []))
+                result['evidence'] = self._retain_evidence(cycle, result.get('evidence', []))
+                self.store.save_job(cycle['id'], agent['id'], 'collected', {'collected': result})
+            except Exception as error:
+                self.store.save_job(cycle['id'], agent['id'], 'collected', {'collected': {
+                    'evidence': [], 'markets': [], 'errors': [type(error).__name__]}})
+                self.store.event(agent['id'], 'Source acquisition unavailable; shared sector evidence remains available.', 'warning')
+            finally:
+                self.store.update_agent(agent['id'], status='idle', task='')
+        with ThreadPoolExecutor(max_workers=min(cycle['max_concurrency'], len(agents)), thread_name_prefix='cascade-acquisition') as pool:
+            futures = [pool.submit(gather, agent) for agent in agents]
+            for future in as_completed(futures):
+                future.result()
+                if not self._active(generation):
+                    for pending in futures:
+                        pending.cancel()
+                    break
+
+    def _collector_evidence(self, agent, cycle, own):
+        retained = self.store.evidence(self.store.get_document('cycle_evidence_' + cycle['id'], []))
+        own_ids = {row['id'] for row in own}
+        keywords = set(agent.get('topic', '').lower().split())
+        def score(row):
+            return (row['id'] in own_ids, agent.get('symbol') in row.get('symbols', []),
+                    len(keywords.intersection((row.get('title', '') + ' ' + row.get('content', '')[:500]).lower().split())))
+        # Stable rotation gives different scouts access to different long-tail sources.
+        retained.sort(key=lambda row: identity([agent['id'], row['id']]))
+        retained.sort(key=score, reverse=True)
+        maximum = self.store.config()['ingestion'].get('shared_evidence_limit', 256)
+        return retained[:maximum]
+
     def _collect(self, agent, cycle, generation):
         checkpoint = self.store.job(cycle['id'], agent['id'])
         collected = (checkpoint or {}).get('value')
@@ -224,27 +343,31 @@ class Runtime:
             self.store.save_job(cycle['id'], agent['id'], 'collected', collected)
         result = collected['collected']
         self._merge_markets(result.get('markets', []))
-        evidence = result.get('evidence', [])[:self.store.config()['max_handoffs_per_agent']]
-        evidence = [row for row in evidence if isinstance(row, dict) and all(isinstance(row.get(key), str) and row[key] for key in ('id', 'source_url', 'content', 'observed_at'))]
-        with self._state_lock:
-            key = 'cycle_evidence_' + cycle['id']
-            retained = set(self.store.get_document(key, []))
-            bounded = []
-            for item in evidence:
-                if item['id'] in retained or len(retained) < self.store.config()['max_evidence_per_cycle']:
-                    retained.add(item['id'])
-                    bounded.append(item)
-            self.store.set_document(key, sorted(retained))
-            evidence = bounded
-        self.store.save_evidence(evidence)
+        own = self._retain_evidence(cycle, result.get('evidence', []))
+        evidence = self._collector_evidence(agent, cycle, own)
         if result.get('errors'):
             self.store.event(agent['id'], f'{len(result["errors"])} source fetch(es) unavailable; other sources continued.', 'warning')
         if not evidence:
             return []
         payload = self._payload(agent, cycle, [])
-        payload['evidence'] = [{**row, 'content': row['content'][:2200]} for row in evidence]
-        while len(json.dumps(payload, ensure_ascii=False).encode()) > self.store.config()['max_input_bytes'] and payload['evidence']:
+        payload['assignment'] = {key: agent.get(key) for key in ('symbol', 'topic', 'subtheme', 'source_shard')}
+        payload['coverage'] = {'shared_evidence_count': len(self.store.get_document('cycle_evidence_' + cycle['id'], [])),
+                               'assigned_evidence_count': len(own), 'supplied_evidence_count': len(evidence)}
+        payload['evidence'] = evidence
+        symbols = self._symbols(cycle)
+        assigned = set(symbols[agent.get('source_shard', 0)::max(1, agent.get('source_shard_count', 24))])
+        assigned.add(agent.get('symbol'))
+        payload['markets'] = [{key: value for key, value in row.items() if key != 'candles'} | {
+                              'candles': row.get('candles', [])[-256:], 'available_closed_bars': len(row.get('candles', []))}
+                              for row in self._markets() if row['symbol'] in assigned]
+        # Keep article evidence available even when a small operator packet cap
+        # cannot accommodate every chart. The full series stays in the journal.
+        limit = self.store.config()['max_input_bytes']
+        while len(json.dumps(payload, ensure_ascii=False).encode()) > limit and payload['markets']:
+            payload['markets'].pop()
+        while len(json.dumps(payload, ensure_ascii=False).encode()) > limit and payload['evidence']:
             payload['evidence'].pop()
+        payload['coverage']['supplied_evidence_count'] = len(payload['evidence'])
         if not self._active(generation):
             return []
         output = self._model(agent, payload)
@@ -255,9 +378,10 @@ class Runtime:
             if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) or ref not in allowed for ref in refs):
                 continue
             symbols = finding.get('symbols', [])
-            if not isinstance(symbols, list) or any(symbol not in self.store.config()['symbols'] for symbol in symbols):
+            if not isinstance(symbols, list) or any(symbol not in self._symbols(cycle) for symbol in symbols):
                 continue
-            selected = {**finding, 'symbols': symbols or [agent['symbol']],
+            inferred = list(dict.fromkeys(symbol for ref in refs for symbol in allowed[ref].get('symbols', []) if symbol in self._symbols(cycle)))
+            selected = {**finding, 'symbols': symbols or inferred,
                         'sources': [{k: allowed[ref].get(k) for k in ('id', 'source_url', 'source_kind', 'title', 'content', 'observed_at', 'published_at', 'numeric')} for ref in refs[:8]]}
             for source in selected['sources']:
                 source['content'] = (source['content'] or '')[:1800]
@@ -275,7 +399,8 @@ class Runtime:
         for row in self._objects(output, 'edges', 12):
             citations = row.get('evidence_ids')
             if isinstance(citations, list) and citations and all(isinstance(ref, str) and ref in refs for ref in citations):
-                proposals.append({**row, 'parameters': {k: v for k, v in row.get('parameters', {}).items() if v is not None}})
+                if row.get('symbol') in self._symbols(cycle):
+                    proposals.append({**row, 'parameters': {k: v for k, v in row.get('parameters', {}).items() if v is not None}})
         if not proposals:
             return []
         return [handoff(cycle['id'], 'analyst_proposal', agent['id'], proposal, proposal['evidence_ids'], [item['id'] for item in inputs]) for proposal in proposals]
@@ -351,7 +476,7 @@ class Runtime:
         # Assessments are research snapshots; retire stale approvals before paper fills.
         strategies = []
         for strategy in self.store.strategies():
-            if strategy.get('status') == 'paper':
+            if strategy.get('status') == 'paper' and strategy.get('symbol') in self._symbols():
                 try:
                     from datetime import datetime
                     age = time.time() - datetime.fromisoformat(strategy['created_at'].replace('Z', '+00:00')).timestamp()
@@ -425,25 +550,37 @@ class Runtime:
             generation = self._generation
             if not self.has_key():
                 self.status = 'needs_credentials'
-                self.last_error = 'Configure the runtime OpenAI credential to start cascade research.'
+                self.last_error = 'Configure the runtime OpenAI credential to start AI equity research.'
                 self.next_cycle_at = time.time() + 30
                 return False
             cycle = self.store.get_document('active_cycle')
             if not cycle or cycle.get('status') == 'completed':
                 config = self.store.config()
-                agents = roster(config)
                 if not self._collector_injected:
                     self.collector = SourceCollector(config)
+                self.status = 'discovery'
+                universe = self._discover(generation)
+                if universe is None:
+                    return False
+                agents = roster({**config, 'symbols': universe['symbols']})
                 self.store.seed_agents(agents)
                 cycle = {'id': uuid.uuid4().hex, 'status': 'running', 'stage': 0, 'started_at': timestamp(), 'roster': agents,
-                         'max_concurrency': config['max_concurrency']}
+                         'max_concurrency': config['max_concurrency'], 'symbols': universe['symbols']}
                 self.store.set_document('active_cycle', cycle)
+                self.store.set_document('cycle_evidence_' + cycle['id'], universe.get('evidence_ids', []))
+                discovery_evidence = self.store.evidence(universe.get('evidence_ids', []))
+                self.store.set_document('cycle_sources_' + cycle['id'], sorted({row['source_url'] for row in discovery_evidence}))
             for index in range(cycle['stage'], len(LAYER_ORDER)):
                 if not self._active(generation):
                     return False
                 layer = LAYER_ORDER[index]
+                if layer == 'collector':
+                    self.status = 'acquisition'
+                    self._gather_sources(cycle, generation)
+                    if not self._active(generation):
+                        return False
                 if layer == 'analyst' and self.store.get_document('research_snapshot_' + cycle['id']) is None:
-                    self.store.set_document('research_snapshot_' + cycle['id'], self._markets())
+                    self.store.set_document('research_snapshot_' + cycle['id'], [row for row in self._markets() if row['symbol'] in self._symbols(cycle)])
                 self.status = layer
                 cycle.update(stage=index, status='running')
                 self.store.set_document('active_cycle', cycle)
@@ -490,16 +627,25 @@ class Runtime:
             if agent:
                 roles.append({**agent, 'id': layer, 'name': layer.title(), 'researcher': layer != 'executor'})
         markets = self._markets()
-        cycle = self.store.get_document('active_cycle', {})
+        cycle = self.store.get_document('active_cycle', {}) or {}
+        self.has_key()
+        evidence_ids = self.store.get_document('cycle_evidence_' + cycle.get('id', ''), [])
+        source_urls = self.store.get_document('cycle_sources_' + cycle.get('id', ''), [])
+        universe = self.store.get_document('sector_universe', {'id': 'ai_infrastructure', 'name': 'AI infrastructure',
+                    'symbols': config['symbols'], 'companies': [], 'discovery_status': 'pending'})
         return {
             'runtime': {'status': 'paused' if self.paused else self.status, 'mode': 'paper', 'started_at': self.started_at,
-                        'next_cycle_at': None if self.paused else timestamp(self.next_cycle_at), 'openai_configured': self.has_key(),
+                        'next_cycle_at': None if self.paused else timestamp(self.next_cycle_at), **self._credentials,
+                        'credentials_ready': self._key_configured,
                         'last_error': self.last_error, 'live_trading_available': False},
             'budget': self.store.budget(), 'agents': agents, 'agent_roles': roles,
-            'strategies': self.store.strategies(), 'portfolio': self.store.get_document('portfolio'),
-            'markets': [{key: row.get(key) for key in ('symbol', 'price', 'change_24h', 'funding_rate', 'updated_at')} for row in markets],
+            'strategies': [row for row in self.store.strategies() if row.get('symbol') in self._symbols()], 'portfolio': self.store.get_document('portfolio'),
+            'markets': [{key: row.get(key) for key in ('symbol', 'price', 'change_24h', 'funding_rate', 'updated_at',
+                                                      'asset_class', 'currency', 'exchange')} for row in markets],
             'events': self.store.events(), 'config': config,
-            'cascade': {'architecture': 'reverse_cascade', 'version': 1,
+            'cascade': {'architecture': 'reverse_cascade', 'version': 2, 'sector': universe,
+                        'collection': {'evidence_count': len(evidence_ids), 'source_count': len(source_urls),
+                                       'collector_count': config['layers']['collector']['count']},
                         'layers': [{'id': layer, **config['layers'][layer]} for layer in LAYER_ORDER],
                         'cycle': {key: value for key, value in cycle.items() if key != 'roster'},
                         'handoff_counts': {layer: len(self.store.handoffs(cycle.get('id', ''), layer)) for layer in LAYER_ORDER},

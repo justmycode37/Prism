@@ -154,7 +154,7 @@ class ModelProvider:
         if model in {"gpt-6-astra", "gpt-6.1-sol"} and effort in {"none", "minimal"}:
             raise ProviderError(f"{model} does not support {effort} reasoning")
         encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        max_input_bytes = min(240_000, max(4000, int(agent.get("max_input_bytes", 48_000))))
+        max_input_bytes = min(2_000_000, max(4000, int(agent.get("max_input_bytes", 48_000))))
         if len(encoded.encode("utf-8")) > max_input_bytes:
             raise ProviderError(f"Agent input exceeds the {max_input_bytes} byte handoff limit")
         key = self.key_loader()

@@ -27,13 +27,7 @@ from urllib.robotparser import RobotFileParser
 import xml.etree.ElementTree as ET
 
 
-DEFAULT_SOURCES = [
-    {"name": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml", "kind": "rss"},
-    {"name": "ECB", "url": "https://www.ecb.europa.eu/rss/press.html", "kind": "rss"},
-    {"name": "Ethereum Foundation", "url": "https://blog.ethereum.org/en/feed.xml", "kind": "rss"},
-    {"name": "Bitcoin Core", "url": "https://bitcoincore.org/en/rss.xml", "kind": "rss"},
-    {"name": "Glassnode Insights", "url": "https://insights.glassnode.com/rss/", "kind": "rss"},
-]
+DEFAULT_SOURCES = []
 _UA = "PrismCascade/1.0"
 _TRACKERS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 
@@ -185,15 +179,59 @@ class SourceCollector:
     def __init__(self, config: dict):
         self.config = config
         self.settings = dict(config.get("ingestion", {}))
-        self.workers = min(8, max(1, int(self.settings.get("workers", 4))))
+        self.workers = min(16, max(1, int(self.settings.get("workers", 4))))
         self.timeout = min(20.0, max(1.0, float(self.settings.get("request_timeout_seconds", 8))))
         self.max_bytes = min(2_000_000, max(1024, int(self.settings.get("max_response_bytes", 1_000_000))))
-        self.max_content = min(12_000, max(256, int(self.settings.get("max_content_chars", 6000))))
+        self.max_content = min(48_000, max(256, int(self.settings.get("max_content_chars", 24_000))))
         self.host_delay = min(10.0, max(.25, float(self.settings.get("host_delay_seconds", .5))))
         self._slots = threading.BoundedSemaphore(self.workers)
         self._lock = threading.Lock()
         self._host_locks, self._host_next, self._host_delays, self._url_locks = {}, {}, {}, {}
         self._cache, self._robots, self._failures = {}, {}, {}
+        self._universe_symbols = list(config.get('symbols', []))
+
+    def discover_universe(self) -> dict:
+        """Discover listed sector peers before collector assignments are frozen."""
+        from .sector import discover_candidates, sector_sources
+        budget = _Budget(90, min(512, max(16, int(self.settings.get('max_requests', 160)))), 96)
+        evidence, errors, listings = [], [], []
+        try:
+            listings = self._json('https://www.sec.gov/files/company_tickers.json', budget)
+        except Exception as error:
+            errors.append('SEC listing catalogue unavailable: ' + type(error).__name__)
+            # The public exchange directories also identify ETFs/test issues,
+            # so fallback discovery need not guess listings from prose.
+            for filename, ticker in (('nasdaqlisted.txt', 'Symbol'), ('otherlisted.txt', 'ACT Symbol')):
+                try:
+                    url = 'https://www.nasdaqtrader.com/dynamic/SymDir/' + filename
+                    body = self._fetch(url, budget, ttl=3600)['body'].decode('utf-8', errors='replace')
+                    lines = body.splitlines()
+                    headers = lines[0].split('|')
+                    for line in lines[1:]:
+                        row = dict(zip(headers, line.split('|')))
+                        if row.get('Test Issue') == 'N' and row.get('ETF') == 'N' and row.get(ticker):
+                            name = row.get('Security Name', '').split(' - ', 1)[0]
+                            name = re.sub(r'\s+(?:Class [A-Z] )?(?:Common Stock|Ordinary Shares).*$', '', name, flags=re.I)
+                            listings.append({'symbol': row[ticker], 'name': name})
+                except Exception as fallback_error:
+                    errors.append('Exchange listing catalogue unavailable: ' + type(fallback_error).__name__)
+        sources = self.config.get('sources', sector_sources(self.config))[:24]
+        assignment = {'topic': 'AI infrastructure equities', 'symbols': self._universe_symbols}
+        with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix='prism-discovery') as pool:
+            jobs = [pool.submit(self._source, source, budget, assignment) for source in sources]
+            for job in as_completed(jobs):
+                try:
+                    result = job.result()
+                    evidence.extend(result.get('evidence', []))
+                    errors.extend(result.get('errors', []))
+                except Exception as error:
+                    errors.append('Sector discovery source unavailable: ' + type(error).__name__)
+        unique = {item['id']: item for item in evidence if item.get('content')}
+        companies = discover_candidates(list(unique.values()), listings, self.config)
+        self._universe_symbols = [row['symbol'] for row in companies]
+        if not companies:
+            errors.append('No verified sector companies discovered.')
+        return {'companies': companies, 'evidence': list(unique.values()), 'errors': list(dict.fromkeys(errors))}
 
     def collect_markets(self, symbols: list[str]) -> list[dict]:
         """Refresh quotes/charts independently; cache and pacing are shared.
@@ -201,11 +239,12 @@ class SourceCollector:
         Individual unavailable symbols are omitted. collect() also reports their
         errors to the evidence log; the market clock treats absence as stale data.
         """
-        budget = _Budget(30, 32, 0)
+        budget = _Budget(min(90, max(5, float(self.settings.get("max_seconds", 90)))),
+                         min(512, max(1, int(self.settings.get("max_requests", 512)))), 0)
         result = []
         with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="prism-quotes") as pool:
             futures = [pool.submit(self._market, str(symbol).upper(), budget, {"symbol": str(symbol).upper()})
-                       for symbol in list(dict.fromkeys(symbols))[:8]]
+                       for symbol in list(dict.fromkeys(symbols))[:256]]
             for future in as_completed(futures):
                 try:
                     result.extend(future.result().get("markets", []))
@@ -214,18 +253,43 @@ class SourceCollector:
         return result
 
     def collect(self, agent: dict) -> dict:
-        budget = _Budget(min(90, max(5, float(self.settings.get("max_seconds", 30)))),
-                         min(96, max(4, int(self.settings.get("max_requests", 48)))),
-                         min(40, max(1, int(self.settings.get("max_pages", 16)))))
+        budget = _Budget(min(90, max(5, float(self.settings.get("max_seconds", 90)))),
+                         min(512, max(4, int(self.settings.get("max_requests", 160)))),
+                         min(96, max(1, int(self.settings.get("max_pages", 48)))))
         evidence, markets, errors = [], [], []
+        explicit_agent_sources = agent.get("sources") is not None
         sources = agent.get("sources")
         if sources is None:
-            sources = self.settings.get("sources", self.config.get("sources", DEFAULT_SOURCES))
+            explicit = self.settings.get("sources", self.config.get("sources"))
+            if explicit is not None:
+                sources = explicit
+            else:
+                from .sector import sector_sources
+                sources = sector_sources(self.config)
         if isinstance(sources, str):
             sources = [sources]
-        sources = sources[:16] if isinstance(sources, list) else []
-        symbols = [agent["symbol"]] if agent.get("symbol") else agent.get("symbols", [])
-        symbols = list(dict.fromkeys(str(s).upper() for s in symbols))[:8]
+        sources = list(sources) if isinstance(sources, list) else []
+        shard_count = max(1, min(96, int(agent.get("source_shard_count", 24))))
+        shard = int(agent.get("source_shard", 0)) % shard_count
+        if explicit_agent_sources:
+            pass  # Explicit assignments are already scoped by the caller.
+        elif len(sources) > shard_count:
+            sources = sources[shard::shard_count]
+        elif sources:
+            # Rotate bounded chunks across rounds while keeping each shard distinct.
+            width = max(1, math.ceil(len(sources) / shard_count))
+            start = (shard * width) % len(sources)
+            sources = [sources[(start + offset) % len(sources)] for offset in range(min(width, len(sources)))]
+        universe = list(dict.fromkeys(str(s).upper() for s in agent.get("symbols", []) if s))[:256]
+        assigned = universe[shard::shard_count]
+        primary = str(agent.get("symbol", "")).upper()
+        symbols = list(dict.fromkeys(([primary] if primary else []) + assigned))[:256]
+        for symbol in assigned if not explicit_agent_sources and sources else []:
+            query = f'"{symbol}" AI infrastructure stock news'
+            sources.append({"name": f"Bing News: {symbol}",
+                            "url": "https://www.bing.com/news/search?" + urlencode({"q": query, "format": "rss"}),
+                            "kind": "rss", "keywords": [symbol]})
+        sources = sources[:128]
         jobs = [(self._source, source) for source in sources]
         jobs.extend((self._market, symbol) for symbol in symbols)
         with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="prism-source") as pool:
@@ -242,11 +306,11 @@ class SourceCollector:
                     errors.append(f"{label[:120]}: {type(exc).__name__}: {str(exc)[:200]}")
         unique = {}
         for item in evidence:
-            key = item["source_url"]
+            key = (item["source_url"], item.get("source_kind"))
             existing = unique.get(key)
             if existing is None or (len(item["content"]), bool(item.get("published_at"))) > (len(existing["content"]), bool(existing.get("published_at"))):
                 unique[key] = item
-        max_evidence = min(96, max(1, int(self.settings.get("max_evidence", 32))))
+        max_evidence = min(256, max(1, int(self.settings.get("max_evidence", 128))))
         return {"evidence": list(unique.values())[:max_evidence], "markets": markets,
                 "errors": list(dict.fromkeys(errors))[:32]}
 
@@ -284,12 +348,21 @@ class SourceCollector:
                 plain = _plain(content, self.max_content)
                 score = sum(str(word).lower() in (title + " " + plain).lower() for word in keywords)
                 published = fields.get("published") or fields.get("pubDate") or fields.get("updated", "")
-                ranked.append((score, self._evidence(urljoin(response["url"], link), "news", title, plain, agent, published)))
+                article_url = urljoin(response["url"], link)
+                wrapper = urlsplit(article_url)
+                if wrapper.hostname == 'www.bing.com' and wrapper.path == '/news/apiclick.aspx':
+                    # RSS advertises the publisher URL in its tracking wrapper.
+                    # Publisher acquisition still passes the normal public-HTTPS,
+                    # robots, redirect and DNS checks below.
+                    publisher = dict(parse_qsl(wrapper.query)).get('url', '')
+                    if urlsplit(publisher).scheme == 'https':
+                        article_url = publisher
+                ranked.append((score, self._evidence(article_url, "news", title, plain, agent, published)))
             ranked.sort(key=lambda row: row[0], reverse=True)
-            count = min(12, max(1, int(self.settings.get("items_per_feed", 4))))
+            count = min(32, max(1, int(self.settings.get("items_per_feed", 12))))
             evidence = [item for _, item in ranked[:count]]
             errors = []
-            article_count = min(4, max(0, int(self.settings.get("articles_per_feed", 1))))
+            article_count = min(8, max(0, int(self.settings.get("articles_per_feed", 3))))
             if self.settings.get("crawl_articles", True):
                 for index, item in enumerate(evidence[:article_count]):
                     try:
@@ -308,7 +381,7 @@ class SourceCollector:
         depth = min(2, max(0, int(self.settings.get("crawl_depth", 1))))
         frontier = [(urljoin(response["url"], link), 1) for link in parser["links"]]
         errors = []
-        crawl_count = min(8, max(0, int(self.settings.get("pages_per_site", 3))))
+        crawl_count = min(16, max(0, int(self.settings.get("pages_per_site", 6))))
         while frontier and len(evidence) < crawl_count + 1:
             candidate, level = frontier.pop(0)
             candidate = _canonical(candidate)
@@ -342,11 +415,12 @@ class SourceCollector:
         if urlsplit(url).scheme not in {"http", "https"}:
             raise CollectionError("Evidence link is not HTTP(S)")
         symbols = [agent["symbol"]] if kind in {"market", "chart"} and agent.get("symbol") else []
-        symbols.extend(re.findall(r"\b[A-Z0-9]{2,12}USDT\b", title + " " + content))
-        aliases = {"bitcoin": "BTCUSDT", "ethereum": "ETHUSDT", "solana": "SOLUSDT",
-                   "xrp": "XRPUSDT", "dogecoin": "DOGEUSDT", "cardano": "ADAUSDT"}
-        words = set(re.findall(r"[a-z]+", (title + " " + content).lower()))
-        symbols.extend(symbol for name, symbol in aliases.items() if name in words)
+        text = title + " " + content
+        known = set(agent.get('symbols', [])) | set(getattr(self, '_universe_symbols', self.config.get('symbols', [])))
+        tagged = re.findall(r'\b(?:NASDAQ|NYSE|NYSEAMERICAN)\s*:\s*([A-Z][A-Z0-9.-]{0,9})\b|\$([A-Z][A-Z0-9.-]{0,9})\b', text)
+        symbols.extend(first or second for first, second in tagged)
+        symbols.extend(symbol for symbol in known if re.search(r'(?<![A-Za-z0-9])' + re.escape(symbol) + r'(?![A-Za-z0-9])', text)
+                       and symbol not in {'AI', 'ON', 'IT', 'A', 'I'})
         item = {"source_url": url, "source_kind": kind, "title": title[:400],
                 "content": content[:self.max_content], "observed_at": _iso(),
                 "symbols": list(dict.fromkeys(symbols))[:16]}
@@ -358,70 +432,12 @@ class SourceCollector:
         return item
 
     def _market(self, symbol: str, budget: _Budget, agent: dict) -> dict:
-        if not re.fullmatch(r"[A-Z0-9]{3,24}", symbol):
-            raise CollectionError("Invalid market symbol")
-        market = self.settings.get("market", self.config.get("market", {}))
-        market = market if isinstance(market, dict) else {}
-        interval = str(market.get("interval", self.settings.get("candle_interval", "60")))
-        if interval not in {"1", "3", "5", "15", "30", "60", "120", "240", "360", "720", "D", "W"}:
-            raise CollectionError("Unsupported candle interval")
-        duration = {"D": 86_400_000, "W": 604_800_000}.get(interval, int(interval) * 60_000 if interval.isdigit() else 0)
-        limit = min(1000, max(50, int(market.get("history_bars", self.settings.get("candle_limit", 1000)))))
-        base = "https://api.bybit.com"
-        category = str(market.get("category", "spot"))
-        if category not in {"spot", "linear"}:
-            raise CollectionError("Unsupported public market category")
-        query = {"category": category, "symbol": symbol}
-        ticker_url = base + "/v5/market/tickers?" + urlencode(query)
-        candle_url = base + "/v5/market/kline?" + urlencode({**query, "interval": interval, "limit": limit})
-        ticker = self._json(ticker_url, budget)
-        data = self._json(candle_url, budget)
-        wall_ms = int(time.time() * 1000)
-        now_ms = min(wall_ms, int(data.get("time") or data["_fetched_at_ms"]), data["_fetched_at_ms"])
-        quote_ms = min(wall_ms, int(ticker.get("time") or ticker["_fetched_at_ms"]), ticker["_fetched_at_ms"])
-        rows = ticker.get("result", {}).get("list", [])
-        quote = next((row for row in rows if row.get("symbol") == symbol), None)
-        if quote is None or not _number(quote.get("lastPrice"), 0) > 0:
-            raise CollectionError(f"No valid public quote for {symbol}")
-        candles = {}
-        for row in data.get("result", {}).get("list", []):
-            if not isinstance(row, list) or len(row) < 6:
-                continue
-            try:
-                start = int(row[0])
-            except (TypeError, ValueError):
-                continue
-            if start + duration > now_ms:
-                continue
-            values = [_number(value) for value in row[1:6]]
-            if any(value is None for value in values) or min(values[:4]) <= 0 or values[4] < 0:
-                continue
-            opening, high, low, close, volume = values
-            if high < max(opening, close) or low > min(opening, close) or high < low:
-                continue
-            candles[start] = {"timestamp": _iso(start / 1000), "start_ms": start,
-                              "end_ms": start + duration, "closed": True,
-                              "open": opening, "high": high, "low": low,
-                              "close": close, "volume": volume}
-        observed = _iso(quote_ms / 1000)
-        result = {"symbol": symbol, "price": _number(quote["lastPrice"]),
-                  "change_24h": _number(quote.get("price24hPcnt"), 0),
-                  "funding_rate": _number(quote.get("fundingRate")) if category == "linear" else None,
-                  "timestamp": observed, "as_of_ms": quote_ms, "updated_at": observed,
-                  "candles": [candles[key] for key in sorted(candles)]}
-        quote_evidence = self._evidence(ticker_url, "market", symbol + " public market quote",
-                                         json.dumps({k: v for k, v in result.items() if k != "candles"}), agent)
-        quote_evidence["numeric"] = {"price": result["price"], "change_24h": result["change_24h"], "funding_rate": result["funding_rate"]}
-        quote_evidence["observed_at"] = observed
-        chart_hash = sha256(json.dumps(result["candles"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        chart_evidence = self._evidence(candle_url, "chart", symbol + " closed " + interval + " interval candles",
-                                         f"{len(candles)} chronological closed candles; incomplete candles excluded. Series SHA256: {chart_hash}.", agent)
-        chart_evidence["numeric"] = {"closed_candles": len(candles), "interval_ms": duration}
-        chart_evidence["observed_at"] = _iso(now_ms / 1000)
-        return {"markets": [result], "evidence": [quote_evidence, chart_evidence]}
+        from .equities import EquityMarketData
+        return EquityMarketData(self._json, self._evidence, self.settings).collect(
+            symbol, budget, {**agent, 'symbol': symbol})
 
     def _json(self, url: str, budget: _Budget) -> dict:
-        response = self._fetch(url, budget, ttl=30)
+        response = self._fetch(url, budget, ttl=60)
         data = json.loads(response["body"])
         if not isinstance(data, dict) or data.get("retCode", 0) != 0:
             raise CollectionError("Public market API rejected the request")

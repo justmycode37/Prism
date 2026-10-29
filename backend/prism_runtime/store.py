@@ -48,6 +48,36 @@ class Store:
         with self.connection() as db:
             db.execute("UPDATE cascade_calls SET status='unknown',charged=reserved WHERE status='reserved'")
             db.execute("UPDATE cascade_jobs SET status='interrupted' WHERE status='working'")
+        self._upgrade_sector_config()
+
+    def _upgrade_sector_config(self):
+        """Move the old crypto defaults aside without reusing their live approvals."""
+        saved = self.get_document('config')
+        if saved and 'sector' in saved:
+            return
+        defaults = default_config()
+        if 'sector' not in defaults:
+            return
+        legacy_markets = self.get_document('markets', [])
+        legacy_portfolio = self.get_document('portfolio', {}) or {}
+        if not saved and not any(str(row.get('symbol', '')).endswith('USDT') for row in legacy_markets) and legacy_portfolio.get('currency') != 'USDT':
+            return
+        saved = saved or {}
+        updated = {**defaults, **{key: saved[key] for key in (
+            'daily_limit_usd', 'max_calls_per_day', 'cycle_interval_seconds',
+            'market_refresh_seconds', 'risk') if key in saved}}
+        updated['risk'] = {**defaults['risk'], **updated.get('risk', {})}
+        records = [('config_before_ai_sector', saved), ('config', updated)]
+        for key, empty in (('active_cycle', None), ('markets', []), ('active_decisions', []), ('portfolio', None)):
+            old = self.get_document(key)
+            if old is not None:
+                records.append((key + '_before_ai_sector', old))
+            records.append((key, empty))
+        # Configuration and archived account state advance together after a crash.
+        with self.connection() as db:
+            for key, value in records:
+                db.execute('INSERT INTO cascade_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, encoded(value)))
+        self.event('configuration', 'Upgraded to the AI equity sector; prior settings and paper state archived. Research remains paused.')
 
     @contextmanager
     def connection(self):
@@ -76,7 +106,7 @@ class Store:
         result = default_config()
         saved = self.get_document('config', {})
         for key, value in saved.items():
-            result[key] = {**result[key], **value} if key in {'risk', 'ingestion'} else value
+            result[key] = {**result[key], **value} if key in {'risk', 'ingestion', 'sector', 'model_prices'} else value
         return result
 
     def update_config(self, changes):
@@ -84,7 +114,7 @@ class Store:
         with self._lock:
             result = self.config()
             for key, value in changes.items():
-                result[key] = {**result[key], **value} if key in {'risk', 'ingestion'} else value
+                result[key] = {**result[key], **value} if key in {'risk', 'ingestion', 'sector', 'model_prices'} else value
             self.set_document('config', result)
         self.event('configuration', 'Updated ' + ', '.join(sorted(changes)))
         return result
@@ -142,10 +172,14 @@ class Store:
             if ids is None:
                 rows = db.execute('SELECT value FROM cascade_evidence ORDER BY rowid DESC LIMIT ?', (limit,)).fetchall()
             else:
-                selected = list(dict.fromkeys(ids))[:2000]
+                selected = list(dict.fromkeys(ids))[:20000]
                 if not selected:
                     return []
-                rows = db.execute('SELECT value FROM cascade_evidence WHERE id IN (' + ','.join('?' for _ in selected) + ')', selected).fetchall()
+                # Keep below SQLite's variable limit on older macOS builds.
+                rows = []
+                for offset in range(0, len(selected), 500):
+                    batch = selected[offset:offset + 500]
+                    rows.extend(db.execute('SELECT value FROM cascade_evidence WHERE id IN (' + ','.join('?' for _ in batch) + ')', batch).fetchall())
         return [json.loads(row[0]) for row in rows]
 
     def save_handoff(self, item):
