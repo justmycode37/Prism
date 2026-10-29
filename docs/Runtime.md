@@ -1,76 +1,62 @@
 # Runtime
 
-The backend is a fresh reverse-cascade implementation behind the existing native console API. It uses Python 3.12+ and the standard library. No paid provider calls, service installation or real trading are required to run its automated checks.
+Prism runs a standard-library Python service behind the existing SwiftUI console. The research scope is public AI infrastructure equities. Model work is routed through the existing OpenAI credential integration; no Gemini runtime is present. The harness is paper-only.
 
-## Startup and persistence
+## Roster and lifecycle
 
-```sh
-python3 scripts/prismctl.py install
-python3 scripts/prismctl.py status
-```
+The fixed 33-agent roster is 24 GPT-6 Luna low-reasoning collectors, 6 GPT-6.1 Sol medium-reasoning analysts, 2 GPT-6 Astra high-reasoning strategists and 1 GPT-6 Astra max-reasoning executor. Default concurrency is 8, configurable up to 32. Each cycle reserves budget before provider calls. Reservations are reconciled against reported usage; uncertain remote outcomes retain their reservation. Pause and stop checkpoints must be honored between bounded units of work, including before downstream handoffs and paper actions. Starts begin paused.
 
-The macOS installer creates or reuses `.prism-runtime/control.token`, links it to the console's `studio.prism.control` Keychain entry and installs `studio.prism.runtime` as a per-user login service. It preserves an existing nonempty token. The new SQLite database is `.prism-runtime/cascade.sqlite3`; every process start begins paused, including service restarts. The previous database is not loaded into the rebuilt runtime.
+## Sector catalogue
 
-For direct launch, set `PYTHONPATH=backend` and run `python3 -m prism_runtime` after providing the private control-token file. Environment variables `PRISM_STATE_DIR` and `PRISM_CONTROL_TOKEN_FILE` select alternative locations. The launcher acquires a process lock, binds loopback HTTP, runs the scheduler and drains it on shutdown.
-
-The OpenAI credential stays outside the database and API state. `PRISM_OPENAI_KEY_FILE` selects its private file; the runtime can also use its supported environment credential. The console keeps its existing Keychain control-token connection flow. Do not put credentials in source configuration or collection URLs.
-
-## Controls
-
-The existing Start/Stop control starts or pauses the cascade. CLI controls are also available:
-
-```sh
-python3 scripts/prismctl.py start
-python3 scripts/prismctl.py stop
-python3 scripts/prismctl.py pause
-python3 scripts/prismctl.py resume
-python3 scripts/prismctl.py run
-```
-
-`run` requests an immediate cycle and leaves continuous scheduling enabled; use `pause` or `stop` to suspend it. State, persisted configuration, roster progress, strategy outcomes, budget and events are exposed through the authenticated local API. Closing the app does not stop the separately installed process. The host must remain awake and connected for continuous work.
-
-## Configuration
-
-The backend stores a validated configuration and accepts partial updates through `POST /v1/config`. The unchanged native Settings form sends its existing model, concurrency, interval and optional budget fields. Additional cascade fields can be configured with a JSON file:
-
-```sh
-python3 scripts/prismctl.py configure --config-file /path/to/cascade-settings.json
-```
-
-Defaults route 24 collectors to Luna with low reasoning, 6 analysts to Sol with medium reasoning, 2 strategists to Astra with high reasoning and 1 executor to Astra with max reasoning. A configured credential is required for provider work. Optional daily spending and call ceilings can be enabled; `null` disables a ceiling while retaining usage accounting. Spending uses conservative configured per-model reservation rates and reported token usage; it is a local estimate, not a provider invoice. A request with an unknown remote outcome consumes its reservation instead of being reported as free.
-
-## Collection and validation
-
-Default news sources are the Federal Reserve, ECB, Ethereum Foundation, Bitcoin Core and Glassnode feeds. These sources were checked with read-only fetches during the rebuild; each can still change or become unavailable. Source failures are isolated; a blocked or changed feed does not become successful coverage. A source can be an RSS URL string or an object with `url`, `kind` (`rss`, `atom` or `article`), optional `name` and optional `keywords`.
-
-For example, this partial configuration selects one feed and one HTML crawl root:
+The configured sector record uses this shape:
 
 ```json
 {
-  "sources": [
-    {"url": "https://www.federalreserve.gov/feeds/press_all.xml", "kind": "rss", "name": "Federal Reserve"},
-    {"url": "https://blog.ethereum.org/", "kind": "article", "name": "Ethereum blog"}
-  ],
-  "ingestion": {"max_pages": 16, "max_requests": 48, "crawl_depth": 1}
+  "id": "ai_infrastructure",
+  "max_symbols": 80,
+  "discovery_enabled": true,
+  "seed_symbols": ["MRVL", "NBIS", "APLD", "CRWV", "IREN", "MU"],
+  "keywords": ["AI infrastructure", "data center", "accelerator", "memory", "power", "networking"]
 }
 ```
 
-The default per-collector collection budget is 30 seconds, 48 requests and 16 pages. It reads up to four entries and one linked article per feed, follows HTML links on the same host to depth one, and caps each response at 1 MB. All collectors share fetch concurrency, caches and per-host pacing, with a minimum half-second default host delay or a longer robots delay. DNS results must be public; connections are pinned to validated addresses and redirects are rechecked. Proxies are not used.
+Seeds are examples and fallback candidates, not a symbol whitelist. Discovery can add qualifying public equities up to 80 symbols. Record discovery results, source provenance, exclusions and any seed fallback so operators can tell whether discovery succeeded or fell back.
 
-The source layer retrieves configured public web pages, feeds, news and market observations within bounded request, depth, size and pacing limits. Robots checks and public-network restrictions apply to crawl targets. Source records retain URLs, times and content identity so downstream decisions can be traced.
+## Public collection
 
-Collector batches feed analysts, then strategists. Quotes and portfolio risk checks refresh on a separate 60-second timer during active research; the default research cadence is 15 minutes after a completed cycle. Model outputs must pass host parsing and provenance checks. Strategies are declarative specifications; the backend computes validation statistics and the paper engine owns execution. Unmeasured or rejected proposals retain absent or negative metrics in the existing Test screen.
+Ingestion bounds are 48 pages, 160 requests, 90 seconds per bounded collection operation, crawl depth 2, 1 MB per response, 24,000 extracted content characters, 256 shared evidence items and 1,260 daily candles. The cycle-wide evidence handoff budget is 4,000. A collector may produce a large packet; shard article bodies, feed items and chart series into provenance-preserving records and enforce aggregate limits explicitly.
 
-The new backend contains no arbitrary Python strategy authoring or execution workbench. Public Bybit spot quotes and closed hourly candles provide reference market observations. Paper orders use long/flat cash accounting with no borrowing or funding charges; fills are simulated. Timestamped observations, validated candidates and deterministic portfolio constraints govern each paper action. There is no real exchange-order integration.
+Fetch only public data with Python standard-library networking. Do not use model calls, shell commands, browsers or credentials for acquisition. Enforce HTTPS where applicable, public-address DNS checks, address pinning, redirect revalidation, robots.txt, bounded host pacing, shared caches and per-source failure reporting. Cache freshness and failures should be observable. A failure, robots block, timeout, or truncated response must never be reported as successful coverage. Extracted article bodies are retained up to the configured content cap. Full acquired chart series stay in the research journal; collector packets include the latest 256 bars for assigned companies.
 
-## Local API
+## Market observations
 
-The listener is `127.0.0.1:8787`. Its existing `/v1/state`, `/v1/control` and `/v1/config` interfaces remain compatible with the native console. Requests require the private bearer token. The new `cascade` state object adds diagnostic layer/cycle information without changing SwiftUI rendering.
+Use Yahoo Finance's public, unofficial chart data for adjusted daily OHLCV. This source can be delayed and its interface can change. Store the source timestamp as the quote time and calculate freshness from that actual time; do not reset freshness to fetch time. Quotes older than 120 seconds cannot support a new fill. In particular, stale after-hours observations must not be presented as current executable prices.
 
-To remove the login service while keeping local data and credentials:
+Use up to 1,260 daily candles. Preserve trading-session gaps; do not synthesize weekend or holiday bars. A symbol with fewer than 300 usable observations is insufficient for statistical admission. The current exchange-local date is excluded conservatively. Missing historical adjustment metadata blocks statistical admission. Invalid and incomplete values are rejected or excluded. Weekends do not age a daily equity signal by trading sessions; holidays count conservatively as weekdays.
 
-```sh
-python3 scripts/prismctl.py uninstall
+## Evidence and validation
+
+Keep source URLs, observed and publication times, content hashes and source IDs through every handoff. Distinguish verified facts from interpretation and speculation. Deduplicate syndicated reporting by canonical identity and shared underlying event; repeated copies are not independent cross-checks. Freeze candidate rules before chronological holdout validation. Host code computes all statistics and stores rejections and insufficient-history outcomes.
+
+Paper execution uses deterministic checks and simulated fills only. The executor has no broker credentials or order-submission capability. Pausing must prevent additional provider work and execution after the current bounded operation reaches its checkpoint.
+
+## Startup, configuration and controls
+
+Install the per-user macOS service with `python3 scripts/prismctl.py install`. The control token remains private and is linked to the console's Keychain entry. `PRISM_STATE_DIR` and `PRISM_CONTROL_TOKEN_FILE` select alternate state/token locations. The listener binds `127.0.0.1:8787`; `/v1/state`, `/v1/control` and `/v1/config` require the local bearer token and reject browser origins.
+
+The existing OpenAI key is loaded from `PRISM_OPENAI_KEY_FILE`, `OPENAI_API_KEY`, the private `.prism-runtime/secrets/openai.key` file or the `studio.prism.openai` Keychain entry. Source URLs must never contain credentials. Model-call and spending ceilings are optional; null disables a ceiling while usage accounting remains active. Spend is a conservative local token estimate, not a provider invoice.
+
+Use `python3 scripts/prismctl.py start`, `pause`, `resume`, `stop` or `run`. Run requests an immediate cycle and enables continued scheduling. Quotes refresh independently every 60 seconds while active; research repeats 15 minutes after a cycle completes. The Mac must remain awake and connected.
+
+Save a partial configuration such as the following, then run `python3 scripts/prismctl.py configure --config-file /path/to/settings.json`:
+
+```json
+{
+  "sector": {"max_symbols": 100, "discovery_enabled": true},
+  "ingestion": {"shared_evidence_limit": 300, "max_content_chars": 32000}
+}
 ```
 
-The current fetcher reads RSS, Atom and ordinary HTML. It does not render JavaScript or extract PDFs. An unsupported linked document retains its available feed summary and records the fetch gap.
+Discovery tries the SEC company directory and falls back to Nasdaq's public listed-company directories when unavailable. ETF and test listings are excluded from exchange discovery. Source failures and unverified seed fallback remain visible. Upgrading archives prior crypto configuration, markets, approvals and the paper account atomically; the equity account starts with fresh USD paper cash, paused.
+
+The fetcher reads RSS, Atom and ordinary HTML. It does not render JavaScript or extract PDFs. Unsupported documents retain any available feed summary and a fetch gap. Bing News RSS links may expose a summary or redirect page instead of a complete publisher article. Default feeds also include NVIDIA announcements, HPCwire, Semiconductor Engineering and Data Center Dynamics. Google News RSS is excluded because its robots policy blocked the search feed in the live check. Public source availability and coverage can change.

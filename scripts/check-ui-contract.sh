@@ -19,9 +19,17 @@ runtime = Runtime(store, key_loader=lambda: None)
 runtime.control('start_all')
 assert not runtime.paused, 'The unchanged Overview Start action must activate the cascade.'
 runtime.control('pause')
+store.set_document('sector_universe', {
+    'id': 'ai_infrastructure', 'name': 'AI infrastructure', 'symbols': ['MRVL'],
+    'discovery_status': 'partial', 'companies': [{
+        'symbol': 'MRVL', 'name': 'Marvell Technology', 'themes': ['semiconductors', 'networking'],
+        'source_urls': ['https://example.org/fixture'], 'evidence_ids': ['contract-evidence'],
+        'discovery_reason': 'Synthetic contract fixture.'
+    }]
+})
 store.set_document('markets', [{
-    'symbol': 'BTCUSDT', 'price': 100.0, 'change_24h': .025,
-    'funding_rate': .0001, 'as_of_ms': 1793286000123,
+    'symbol': 'MRVL', 'price': 100.0, 'change_24h': .025,
+    'funding_rate': None, 'as_of_ms': 1793286000123,
     'updated_at': '2026-10-29T15:00:00.123Z',
 }])
 store.set_document('portfolio', {
@@ -31,20 +39,20 @@ store.set_document('portfolio', {
         {'timestamp': '2026-10-29T15:00:00Z', 'pnl': 0.0},
         {'timestamp': '2026-10-29T15:00:00.123Z', 'pnl': 1.0},
     ],
-    'positions': [{'symbol': 'BTCUSDT', 'side': 'long', 'quantity': 1.0,
+    'positions': [{'symbol': 'MRVL', 'side': 'long', 'quantity': 1.0,
                    'entry_price': 100.0, 'mark_price': 101.0, 'unrealized_pnl': 1.0}],
-    'trades': [{'id': 'contract-fill', 'symbol': 'BTCUSDT', 'side': 'buy',
+    'trades': [{'id': 'contract-fill', 'symbol': 'MRVL', 'side': 'buy',
                 'quantity': 1.0, 'price': 100.0, 'timestamp': '2026-10-29T15:00:00Z', 'realized_pnl': 0.0}],
 })
 for scored in (False, True):
     store.save_strategy({
         'id': 'scored' if scored else 'unscored', 'name': 'Cascade contract fixture',
-        'symbol': 'BTCUSDT', 'family': 'momentum', 'status': 'rejected',
+        'symbol': 'MRVL', 'family': 'momentum', 'status': 'rejected',
         'net_return': -.01 if scored else None, 'sharpe': -.2 if scored else None,
         'max_drawdown': .03 if scored else None, 'trades': 5 if scored else None,
         'reason': 'Synthetic contract fixture; no market-performance claim.',
         'created_at': '2026-10-29T15:00:00Z',
-        'spec': {'symbol': 'BTCUSDT', 'kind': 'momentum', 'parameters': {'lookback': 5, 'threshold': .001}},
+        'spec': {'symbol': 'MRVL', 'kind': 'momentum', 'parameters': {'lookback': 5, 'threshold': .001}},
     })
 store.event('cascade', 'Contract fixture assembled without network access.', 'info')
 state = runtime.state()

@@ -53,7 +53,7 @@ struct PrismPortfolioView: View {
                                 Spacer()
                                 Text(PrismFormat.money(market.price)).monospacedDigit()
                                 Text(PrismFormat.percent(market.change24h))
-                                    .foregroundStyle(market.change24h < 0 ? Color.orange : .mint).frame(width: 72, alignment: .trailing)
+                                    .foregroundStyle(market.change24h.map { $0 < 0 ? Color.orange : .mint } ?? .secondary).frame(width: 72, alignment: .trailing)
                             }.font(.system(size: 12))
                         }
                     } else {

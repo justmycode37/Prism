@@ -6,7 +6,8 @@ an order, choose a price, size a position, borrow, or trade a new instrument.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import math
 import time
 
@@ -33,7 +34,7 @@ def _iso(milliseconds):
 
 def initial_portfolio(capital=100000.0):
     capital = _finite(capital, "paper capital", positive=True)
-    return {"mode": "paper", "currency": "USDT", "equity": capital, "cash": capital,
+    return {"mode": "paper", "currency": "USD", "equity": capital, "cash": capital,
             "initial_equity": capital, "peak_equity": capital, "realized_pnl": 0.0,
             "unrealized_pnl": 0.0, "fees_paid": 0.0, "gross_exposure": 0.0,
             "as_of": None, "as_of_ms": None, "pnl_history": [], "positions": [], "trades": [],
@@ -233,7 +234,17 @@ def execute(portfolio: dict, strategies: list[dict], decisions: list[dict], mark
                 raise ValueError("Insufficient closed signal history")
             signal_ms = bars[-1]["end_ms"]
             interval_ms = bars[-1]["end_ms"] - bars[-1]["start_ms"]
-            if signal_ms > quote["timestamp_ms"] or now_ms - signal_ms > interval_ms * 2:
+            stale_signal = now_ms - signal_ms > interval_ms * 2
+            if quote['market'].get('asset_class') == 'equity':
+                zone = ZoneInfo(quote['market'].get('exchange_timezone', 'America/New_York'))
+                observed_day = datetime.fromtimestamp(bars[-1]['start_ms'] / 1000, zone).date()
+                current_day = datetime.fromtimestamp(now_ms / 1000, zone).date()
+                days = (current_day - observed_day).days
+                # Weekends do not age a daily stock signal by trading sessions.
+                # Holidays count conservatively as weekdays; no bars are invented.
+                sessions = sum((observed_day + timedelta(days=day)).weekday() < 5 for day in range(1, min(days, 14) + 1))
+                stale_signal = days < 0 or days > 14 or sessions > 2
+            if signal_ms > quote["timestamp_ms"] or stale_signal:
                 raise ValueError("Signal is future dated or stale")
             if signal_ms <= result.setdefault("seen_signals", {}).get(identity, 0):
                 continue

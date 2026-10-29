@@ -28,7 +28,7 @@ def market_fixture():
                      'open': price, 'high': max(price, close) * 1.0001, 'low': min(price, close) * .9999,
                      'close': close, 'volume': 10, 'closed': True})
         price = close
-    return {'symbol': 'BTCUSDT', 'price': price, 'change_24h': .01, 'funding_rate': None,
+    return {'symbol': 'MRVL', 'price': price, 'change_24h': .01, 'funding_rate': None,
             'updated_at': timestamp(), 'as_of_ms': int(time.time() * 1000), 'candles': bars}
 
 
@@ -41,7 +41,7 @@ class Collector:
         self.calls.append(agent['id'])
         return {'evidence': [{'id': 'observed-source', 'source_url': 'https://example.org/research',
                 'source_kind': 'article', 'title': 'Synthetic integration fixture', 'content': 'Synthetic closed-bar pattern.',
-                'observed_at': timestamp(), 'symbols': ['BTCUSDT']}], 'markets': [copy.deepcopy(self.market)], 'errors': []}
+                'observed_at': timestamp(), 'symbols': ['MRVL']}], 'markets': [copy.deepcopy(self.market)], 'errors': []}
 
     def collect_markets(self, symbols):
         return [copy.deepcopy(self.market)]
@@ -61,9 +61,9 @@ class Provider:
         layer = agent['layer']
         if layer == 'collector':
             output = {'findings': [{'title': 'Fixture', 'summary': 'Synthetic momentum observation',
-                      'evidence_ids': ['invented' if self.invented_refs else 'observed-source'], 'symbols': ['BTCUSDT'], 'importance': .8}]}
+                      'evidence_ids': ['invented' if self.invented_refs else 'observed-source'], 'symbols': ['MRVL'], 'importance': .8}]}
         elif layer == 'analyst':
-            output = {'edges': [{'symbol': 'BTCUSDT', 'kind': 'momentum', 'parameters': {'lookback': 3, 'threshold': .002},
+            output = {'edges': [{'symbol': 'MRVL', 'kind': 'momentum', 'parameters': {'lookback': 3, 'threshold': .002},
                        'evidence_ids': ['observed-source'], 'hypothesis': 'Synthetic momentum fixture'}]}
         elif layer == 'strategist':
             edge = payload['inputs'][0]['payload']
@@ -221,7 +221,7 @@ class StoreTests(unittest.TestCase):
                 validate_config_update(changes)
         self.store.update_config({'sources': [{'url': 'https://example.org/', 'kind': 'article', 'keywords': ['markets']}],
                                   'ingestion': {'crawl_depth': 2}, 'risk': {'kill_switch': True}})
-        self.assertEqual(self.store.config()['ingestion']['candle_limit'], 1000)
+        self.assertEqual(self.store.config()['ingestion']['candle_limit'], 1260)
         self.assertEqual(self.store.config()['ingestion']['crawl_depth'], 2)
         self.assertTrue(self.store.config()['risk']['kill_switch'])
 

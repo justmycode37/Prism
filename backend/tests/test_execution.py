@@ -28,6 +28,31 @@ def activate(item):
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_daily_equity_weekends_do_not_make_a_fresh_quote_signal_stale(self):
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo('America/New_York')
+        current = datetime(2026, 10, 26, 14, tzinfo=zone)
+        now = int(current.timestamp() * 1000)
+        quote = market('MRVL', now=now)
+        day = datetime(2026, 10, 23, tzinfo=zone)
+        dates = []
+        while len(dates) < len(quote['candles']):
+            if day.weekday() < 5:
+                dates.append(day)
+            day -= timedelta(days=1)
+        for row, day in zip(quote['candles'], reversed(dates)):
+            row['start_ms'] = int(day.timestamp() * 1000)
+            row['end_ms'] = row['start_ms'] + 86400000
+        quote.update(asset_class='equity', interval_ms=86400000, exchange_timezone='America/New_York')
+        rule = strategy('MRVL')
+        result = execute(initial_portfolio(), [rule], [activate(rule)], [quote], {}, now=now)
+        self.assertEqual(len(result['trades']), 1)
+        later = now + 7 * 86400000
+        quote['as_of_ms'] = later
+        stale = execute(initial_portfolio(), [rule], [activate(rule)], [quote], {}, now=later)
+        self.assertEqual(stale['trades'], [])
+
     def test_paper_entry_costs_accounting_and_no_input_mutation(self):
         portfolio, rule = initial_portfolio(), strategy()
         original = copy.deepcopy(portfolio)

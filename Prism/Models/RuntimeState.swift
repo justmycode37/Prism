@@ -10,6 +10,59 @@ struct RuntimeState: Decodable, Sendable {
     let markets: [MarketQuote]
     let events: [RuntimeEvent]
     let config: RuntimeConfiguration
+    /// Additive cascade metadata; nil when the backend omits the key (legacy / offline fixture).
+    let cascade: CascadeMetadata?
+}
+
+// MARK: - Cascade metadata (additive; all fields optional for backward compatibility)
+
+struct CascadeMetadata: Decodable, Sendable {
+    let layers: [CascadeLayer]?
+    /// Discovered sector universe. Nil when the backend has not yet run sector discovery.
+    let sector: CascadeSector?
+    /// Evidence-collection counters. Nil when no collection cycle has completed.
+    let collection: CascadeCollection?
+}
+
+struct CascadeLayer: Decodable, Sendable {
+    let id: String
+    let name: String?
+    let count: Int
+    let reasoningEffort: String
+    let model: String?
+}
+
+/// A discovered sector: its identity, constituent companies, and discovery provenance.
+struct CascadeSector: Decodable, Sendable {
+    let id: String
+    let name: String
+    let companies: [CascadeCompany]
+    /// Ticker symbols for quick lookup (may overlap with companies[].symbol).
+    let symbols: [String]
+    /// "complete", "partial", "pending", or nil when unknown.
+    let discoveryStatus: String?
+}
+
+/// A single equity discovered within a sector.
+struct CascadeCompany: Decodable, Identifiable, Sendable {
+    let symbol: String
+    let name: String
+    let themes: [String]
+    /// Primary source URLs that surfaced this company.
+    let sourceUrls: [String]
+    /// Evidence document IDs supporting the inclusion decision.
+    let evidenceIds: [String]
+    /// Human-readable explanation of why this company was included.
+    let discoveryReason: String
+
+    var id: String { symbol }
+}
+
+/// Aggregate counters from the most recent evidence-collection cycle.
+struct CascadeCollection: Decodable, Sendable {
+    let evidenceCount: Int
+    let sourceCount: Int
+    let collectorCount: Int
 }
 
 struct RuntimeStatus: Decodable, Sendable {
@@ -19,6 +72,8 @@ struct RuntimeStatus: Decodable, Sendable {
     let nextCycleAt: String?
     let openaiConfigured: Bool
     let lastError: String?
+    /// Whether any provider API key is ready for inference. Nil when the backend does not report this field.
+    let credentialsReady: Bool?
 }
 
 struct RuntimeBudget: Decodable, Sendable {
@@ -212,7 +267,7 @@ struct MarketQuote: Decodable, Identifiable, Sendable {
     var id: String { symbol }
     let symbol: String
     let price: Double
-    let change24h: Double
+    let change24h: Double?
     let fundingRate: Double?
     let updatedAt: String
 

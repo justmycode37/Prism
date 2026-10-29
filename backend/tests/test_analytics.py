@@ -132,5 +132,47 @@ class AnalyticsTests(unittest.TestCase):
         self.assertIsNone(result["spec"])
 
 
+
+class EquityCalendarTests(unittest.TestCase):
+    def equity_history(self, count=400):
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        source = history(count, symbol='MRVL')['candles']
+        day = datetime(2024, 1, 2, tzinfo=ZoneInfo('America/New_York'))
+        bars = []
+        for row in source:
+            while day.weekday() >= 5 or (day.month, day.day) in {(1, 1), (7, 4), (12, 25)}:
+                day += timedelta(days=1)
+            start = int(day.timestamp() * 1000)
+            bars.append({**row, 'start_ms': start, 'end_ms': start + 86400000})
+            day += timedelta(days=1)
+        return {'symbol': 'MRVL', 'asset_class': 'equity', 'interval_ms': 86400000,
+                'exchange_timezone': 'America/New_York', 'candles': bars}
+
+    def test_weekend_holiday_and_dst_gaps_preserve_observed_sessions(self):
+        market = self.equity_history()
+        bars = closed_candles(market)
+        self.assertEqual(len(bars), 400)
+        self.assertTrue(all(row['asset_class'] == 'equity' for row in bars))
+        self.assertTrue(any(b['start_ms'] - a['start_ms'] > 86400000 for a, b in zip(bars, bars[1:])))
+        spec = canonical_spec(hypothesis(symbol='MRVL'))
+        equity = _run_segment(spec, bars, 4, len(bars))
+        calendar = _run_segment(spec, [{**row, 'asset_class': None} for row in bars], 4, len(bars))
+        self.assertAlmostEqual(equity['sharpe'] / calendar['sharpe'], (252 / 365.25) ** .5)
+
+    def test_malformed_equity_and_recent_listing_do_not_pass_admission(self):
+        for mutate in (lambda m: m['candles'].reverse(),
+                       lambda m: m['candles'].insert(3, copy.deepcopy(m['candles'][3])),
+                       lambda m: m['candles'][3].update(end_ms=m['candles'][3]['start_ms'] + 3600000),
+                       lambda m: m.update(interval_ms=3600000)):
+            market = self.equity_history()
+            mutate(market)
+            with self.assertRaises(ValueError):
+                closed_candles(market)
+        result = validate_edges([hypothesis(symbol='MRVL')], [self.equity_history(40)])[0]
+        self.assertEqual(result['status'], 'rejected')
+        self.assertIn('Insufficient closed history', result['reason'])
+
+
 if __name__ == "__main__":
     unittest.main()
