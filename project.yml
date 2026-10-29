@@ -1,0 +1,50 @@
+name: Prism
+fileGroups:
+  - backend/agent_roles
+  - docs
+  - README.md
+options:
+  bundleIdPrefix: studio.prism
+  deploymentTarget:
+    macOS: "26.0"
+  xcodeVersion: "26.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) PRISM_EXPERIMENTAL_GLASS"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Automatic
+targets:
+  Prism:
+    type: application
+    platform: macOS
+    sources:
+      - path: Prism
+        excludes:
+          - Resources/**
+      - path: Prism/Resources/Fonts
+        type: folder
+        buildPhase: resources
+      - path: ThirdParty
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: studio.prism.mac
+        PRODUCT_NAME: Prism
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Prism
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.finance
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: 1
+        CODE_SIGN_ENTITLEMENTS: Prism/Prism.entitlements
+schemes:
+  Prism:
+    build:
+      targets:
+        Prism: all
+    run:
+      config: Debug

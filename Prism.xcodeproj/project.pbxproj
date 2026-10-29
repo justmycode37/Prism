@@ -1,0 +1,490 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		00BD75096970AE5D9D3E31BE /* RuntimeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE037A08DE64FED547B14F1C /* RuntimeClient.swift */; };
+		0661D97A537CF9772B42C8ED /* PrismPortfolioView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AAFDA4A18F495A24D04D262 /* PrismPortfolioView.swift */; };
+		12697DCE464329B11D53E848 /* RuntimeState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EB3DE19ADE079823AE081C2 /* RuntimeState.swift */; };
+		167BD0955643F335AD9D9458 /* PrismHomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C93E7851E4582B72B445CFFB /* PrismHomeView.swift */; };
+		1CC5E7D5EB543C225F7668F0 /* PrismExecutionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E030161A94899A8679D105D /* PrismExecutionView.swift */; };
+		222A7925E6724D3CD4339F22 /* AppearancePreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = D786FB56AF5910FBD7B97555 /* AppearancePreferences.swift */; };
+		42732DF4391D985DCB6F1660 /* WholeWindowLiquidGlass.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB615CED1E35352A3A215E0F /* WholeWindowLiquidGlass.swift */; };
+		476011015EE04F48BEAD1BE8 /* PrismActivityView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 483885B7D9174B17B88AB021 /* PrismActivityView.swift */; };
+		56AAEDD9FE843E3823115A54 /* PrismOverviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1200B309AA5FD96418A676A2 /* PrismOverviewView.swift */; };
+		632379F6DA3D0E11711871E1 /* PrismApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E0FE572AD856E190D4583B1 /* PrismApp.swift */; };
+		6D5626B9C15FD48E772EA12D /* Fonts in Resources */ = {isa = PBXBuildFile; fileRef = D37095D4DD1F58C193E7FDCF /* Fonts */; };
+		6F27720170A33A3E7F3538FC /* ThirdParty in Resources */ = {isa = PBXBuildFile; fileRef = F889CE9710FF7AB5E4EDB1C5 /* ThirdParty */; };
+		79FC79E90F241038DEF97174 /* PrismTestView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE7182E95B358550F5AD451C /* PrismTestView.swift */; };
+		85929DAF5B34677551CF397D /* PrismSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2ECB91BE21D8A6798D7924 /* PrismSettingsView.swift */; };
+		877E3DCDD9E6DBF8E7481800 /* PrismAgentsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80E83016713E3983F2D13071 /* PrismAgentsView.swift */; };
+		A71FF9D3945766BFF70F8F61 /* PrismWordmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FE83F4915F2C2C259A566D5 /* PrismWordmark.swift */; };
+		A83F06B92CBB37E26C7E677F /* PrismTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73CEBBF10B244267B9585620 /* PrismTheme.swift */; };
+		B1487A293CA470603C1CBD89 /* PrismResearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70F1AD85828EF75CA326B0DD /* PrismResearchView.swift */; };
+		B509437308F1B6DC32C00525 /* ConsoleComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = D56F32808AB31E985DD8B115 /* ConsoleComponents.swift */; };
+		D3E89859AE8B723377CD5AFC /* PrismTypography.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD62AE30EFCECFFAF35689E7 /* PrismTypography.swift */; };
+		D93CD6DC1B5F554ABE48B425 /* GlassSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02A514F53C1F08B12D229372 /* GlassSurface.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		02A514F53C1F08B12D229372 /* GlassSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassSurface.swift; sourceTree = "<group>"; };
+		1200B309AA5FD96418A676A2 /* PrismOverviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismOverviewView.swift; sourceTree = "<group>"; };
+		1AAFDA4A18F495A24D04D262 /* PrismPortfolioView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismPortfolioView.swift; sourceTree = "<group>"; };
+		1E030161A94899A8679D105D /* PrismExecutionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismExecutionView.swift; sourceTree = "<group>"; };
+		1E0FE572AD856E190D4583B1 /* PrismApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismApp.swift; sourceTree = "<group>"; };
+		2264823EDAFFC1F12B274231 /* Validation.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = Validation.md; sourceTree = "<group>"; };
+		3CBECDC40DB2F7D8BF88B956 /* Prism.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Prism.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		435074CAE8161E8812C34048 /* Architecture.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = Architecture.md; sourceTree = "<group>"; };
+		47D317039C6445D78FF7240E /* analyst.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = analyst.md; sourceTree = "<group>"; };
+		483885B7D9174B17B88AB021 /* PrismActivityView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismActivityView.swift; sourceTree = "<group>"; };
+		4EB3DE19ADE079823AE081C2 /* RuntimeState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeState.swift; sourceTree = "<group>"; };
+		70F1AD85828EF75CA326B0DD /* PrismResearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismResearchView.swift; sourceTree = "<group>"; };
+		73CEBBF10B244267B9585620 /* PrismTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismTheme.swift; sourceTree = "<group>"; };
+		7FE83F4915F2C2C259A566D5 /* PrismWordmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismWordmark.swift; sourceTree = "<group>"; };
+		80E83016713E3983F2D13071 /* PrismAgentsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismAgentsView.swift; sourceTree = "<group>"; };
+		89DBF83D4726AC6D2672592F /* collector.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = collector.md; sourceTree = "<group>"; };
+		90DC4394E39BDEAF13B59F30 /* ThirdParty.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = ThirdParty.md; sourceTree = "<group>"; };
+		9429D28EEC4A345155AA6947 /* strategist.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = strategist.md; sourceTree = "<group>"; };
+		B47F0910A183BEA3E9C104B9 /* Agents.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = Agents.md; sourceTree = "<group>"; };
+		C13D1DCB58DA7A8B2C7B3803 /* Prism.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Prism.entitlements; sourceTree = "<group>"; };
+		C2E93CBA259AA08C0E4ACF69 /* Runtime.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = Runtime.md; sourceTree = "<group>"; };
+		C93E7851E4582B72B445CFFB /* PrismHomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismHomeView.swift; sourceTree = "<group>"; };
+		CB615CED1E35352A3A215E0F /* WholeWindowLiquidGlass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WholeWindowLiquidGlass.swift; sourceTree = "<group>"; };
+		D0EC7580D4FDBD51AC6ACF8C /* executor.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = executor.md; sourceTree = "<group>"; };
+		D37095D4DD1F58C193E7FDCF /* Fonts */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Fonts; path = Prism/Resources/Fonts; sourceTree = SOURCE_ROOT; };
+		D56F32808AB31E985DD8B115 /* ConsoleComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsoleComponents.swift; sourceTree = "<group>"; };
+		D786FB56AF5910FBD7B97555 /* AppearancePreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearancePreferences.swift; sourceTree = "<group>"; };
+		DD62AE30EFCECFFAF35689E7 /* PrismTypography.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismTypography.swift; sourceTree = "<group>"; };
+		DE7182E95B358550F5AD451C /* PrismTestView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismTestView.swift; sourceTree = "<group>"; };
+		EB712E4F2C4CE997633EE3DF /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		EE2ECB91BE21D8A6798D7924 /* PrismSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismSettingsView.swift; sourceTree = "<group>"; };
+		F7A24ABC54147B5494034D9A /* Design.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = Design.md; sourceTree = "<group>"; };
+		F889CE9710FF7AB5E4EDB1C5 /* ThirdParty */ = {isa = PBXFileReference; lastKnownFileType = folder; path = ThirdParty; sourceTree = SOURCE_ROOT; };
+		FE037A08DE64FED547B14F1C /* RuntimeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeClient.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		081163646A4A620D92B0DCA2 = {
+			isa = PBXGroup;
+			children = (
+				D37095D4DD1F58C193E7FDCF /* Fonts */,
+				EB712E4F2C4CE997633EE3DF /* README.md */,
+				F889CE9710FF7AB5E4EDB1C5 /* ThirdParty */,
+				7F426B9A3DC769D5BC6CF62A /* agent_roles */,
+				118F8BBFD66CF7A07E21B6F9 /* docs */,
+				8C82A9A9E1294F24F80AF4F6 /* Prism */,
+				82EA743558BFD02527A88470 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		118F8BBFD66CF7A07E21B6F9 /* docs */ = {
+			isa = PBXGroup;
+			children = (
+				B47F0910A183BEA3E9C104B9 /* Agents.md */,
+				435074CAE8161E8812C34048 /* Architecture.md */,
+				F7A24ABC54147B5494034D9A /* Design.md */,
+				C2E93CBA259AA08C0E4ACF69 /* Runtime.md */,
+				90DC4394E39BDEAF13B59F30 /* ThirdParty.md */,
+				2264823EDAFFC1F12B274231 /* Validation.md */,
+			);
+			path = docs;
+			sourceTree = "<group>";
+		};
+		267AD0BCAF191AE43BBE0D17 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				FE037A08DE64FED547B14F1C /* RuntimeClient.swift */,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
+		3B97E81A803DEECFE9F77986 /* Appearance */ = {
+			isa = PBXGroup;
+			children = (
+				D786FB56AF5910FBD7B97555 /* AppearancePreferences.swift */,
+			);
+			path = Appearance;
+			sourceTree = "<group>";
+		};
+		7F426B9A3DC769D5BC6CF62A /* agent_roles */ = {
+			isa = PBXGroup;
+			children = (
+				47D317039C6445D78FF7240E /* analyst.md */,
+				89DBF83D4726AC6D2672592F /* collector.md */,
+				D0EC7580D4FDBD51AC6ACF8C /* executor.md */,
+				9429D28EEC4A345155AA6947 /* strategist.md */,
+			);
+			name = agent_roles;
+			path = backend/agent_roles;
+			sourceTree = "<group>";
+		};
+		82EA743558BFD02527A88470 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				3CBECDC40DB2F7D8BF88B956 /* Prism.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		8C82A9A9E1294F24F80AF4F6 /* Prism */ = {
+			isa = PBXGroup;
+			children = (
+				C13D1DCB58DA7A8B2C7B3803 /* Prism.entitlements */,
+				B83B6F8D79F29BE49FCE641F /* App */,
+				3B97E81A803DEECFE9F77986 /* Appearance */,
+				D927EB57E06142B7F047F337 /* Design */,
+				FAEB5DB5CD24B173A5C2D359 /* Models */,
+				267AD0BCAF191AE43BBE0D17 /* Services */,
+				D1BDBE941F1D85DF18C3075C /* Vendor */,
+				FDDD2319C18B03CA3673D4CC /* Views */,
+			);
+			path = Prism;
+			sourceTree = "<group>";
+		};
+		B83B6F8D79F29BE49FCE641F /* App */ = {
+			isa = PBXGroup;
+			children = (
+				1E0FE572AD856E190D4583B1 /* PrismApp.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		D1BDBE941F1D85DF18C3075C /* Vendor */ = {
+			isa = PBXGroup;
+			children = (
+				CB615CED1E35352A3A215E0F /* WholeWindowLiquidGlass.swift */,
+			);
+			path = Vendor;
+			sourceTree = "<group>";
+		};
+		D927EB57E06142B7F047F337 /* Design */ = {
+			isa = PBXGroup;
+			children = (
+				02A514F53C1F08B12D229372 /* GlassSurface.swift */,
+				73CEBBF10B244267B9585620 /* PrismTheme.swift */,
+				DD62AE30EFCECFFAF35689E7 /* PrismTypography.swift */,
+				7FE83F4915F2C2C259A566D5 /* PrismWordmark.swift */,
+			);
+			path = Design;
+			sourceTree = "<group>";
+		};
+		FAEB5DB5CD24B173A5C2D359 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				4EB3DE19ADE079823AE081C2 /* RuntimeState.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		FDDD2319C18B03CA3673D4CC /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				D56F32808AB31E985DD8B115 /* ConsoleComponents.swift */,
+				483885B7D9174B17B88AB021 /* PrismActivityView.swift */,
+				80E83016713E3983F2D13071 /* PrismAgentsView.swift */,
+				1E030161A94899A8679D105D /* PrismExecutionView.swift */,
+				C93E7851E4582B72B445CFFB /* PrismHomeView.swift */,
+				1200B309AA5FD96418A676A2 /* PrismOverviewView.swift */,
+				1AAFDA4A18F495A24D04D262 /* PrismPortfolioView.swift */,
+				70F1AD85828EF75CA326B0DD /* PrismResearchView.swift */,
+				EE2ECB91BE21D8A6798D7924 /* PrismSettingsView.swift */,
+				DE7182E95B358550F5AD451C /* PrismTestView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		CDFC0F00FA9F3945D4407FE1 /* Prism */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C25105F88BA2397C1CC00D97 /* Build configuration list for PBXNativeTarget "Prism" */;
+			buildPhases = (
+				7560C300E64021D8BADEC8B6 /* Sources */,
+				3E3DEC94F2D9C4F6FCCD8F48 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Prism;
+			packageProductDependencies = (
+			);
+			productName = Prism;
+			productReference = 3CBECDC40DB2F7D8BF88B956 /* Prism.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		F89E62DC5A2CEA3C9FF3EC43 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+					CDFC0F00FA9F3945D4407FE1 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 0DA5A059EA94E37BB1AE7D8F /* Build configuration list for PBXProject "Prism" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 081163646A4A620D92B0DCA2;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 82EA743558BFD02527A88470 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				CDFC0F00FA9F3945D4407FE1 /* Prism */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		3E3DEC94F2D9C4F6FCCD8F48 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6D5626B9C15FD48E772EA12D /* Fonts in Resources */,
+				6F27720170A33A3E7F3538FC /* ThirdParty in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		7560C300E64021D8BADEC8B6 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				222A7925E6724D3CD4339F22 /* AppearancePreferences.swift in Sources */,
+				B509437308F1B6DC32C00525 /* ConsoleComponents.swift in Sources */,
+				D93CD6DC1B5F554ABE48B425 /* GlassSurface.swift in Sources */,
+				476011015EE04F48BEAD1BE8 /* PrismActivityView.swift in Sources */,
+				877E3DCDD9E6DBF8E7481800 /* PrismAgentsView.swift in Sources */,
+				632379F6DA3D0E11711871E1 /* PrismApp.swift in Sources */,
+				1CC5E7D5EB543C225F7668F0 /* PrismExecutionView.swift in Sources */,
+				167BD0955643F335AD9D9458 /* PrismHomeView.swift in Sources */,
+				56AAEDD9FE843E3823115A54 /* PrismOverviewView.swift in Sources */,
+				0661D97A537CF9772B42C8ED /* PrismPortfolioView.swift in Sources */,
+				B1487A293CA470603C1CBD89 /* PrismResearchView.swift in Sources */,
+				85929DAF5B34677551CF397D /* PrismSettingsView.swift in Sources */,
+				79FC79E90F241038DEF97174 /* PrismTestView.swift in Sources */,
+				A83F06B92CBB37E26C7E677F /* PrismTheme.swift in Sources */,
+				D3E89859AE8B723377CD5AFC /* PrismTypography.swift in Sources */,
+				A71FF9D3945766BFF70F8F61 /* PrismWordmark.swift in Sources */,
+				00BD75096970AE5D9D3E31BE /* RuntimeClient.swift in Sources */,
+				12697DCE464329B11D53E848 /* RuntimeState.swift in Sources */,
+				42732DF4391D985DCB6F1660 /* WholeWindowLiquidGlass.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		4E8AB6C50D8E6B5B2BBD9220 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Prism/Prism.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Prism;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.finance";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = studio.prism.mac;
+				PRODUCT_NAME = Prism;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		982D6354F7A0E5E91097D64D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) PRISM_EXPERIMENTAL_GLASS";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		F77B2C4C002B81D994EADF5F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) PRISM_EXPERIMENTAL_GLASS";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		FD67B5E1F87349514CB2796D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Prism/Prism.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Prism;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.finance";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = studio.prism.mac;
+				PRODUCT_NAME = Prism;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0DA5A059EA94E37BB1AE7D8F /* Build configuration list for PBXProject "Prism" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				982D6354F7A0E5E91097D64D /* Debug */,
+				F77B2C4C002B81D994EADF5F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C25105F88BA2397C1CC00D97 /* Build configuration list for PBXNativeTarget "Prism" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FD67B5E1F87349514CB2796D /* Debug */,
+				4E8AB6C50D8E6B5B2BBD9220 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = F89E62DC5A2CEA3C9FF3EC43 /* Project object */;
+}
