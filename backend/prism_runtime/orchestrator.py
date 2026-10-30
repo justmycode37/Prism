@@ -46,7 +46,7 @@ class Runtime:
         self._market_thread = None
         self._key_configured = False
         self._credentials = {'openai_configured': False}
-        self._key_checked = 0.0
+        self._key_checked = None
         self._research_state_cache = None
         self._research_state_cache_at = 0.
         self._research_market_cache_id = None
@@ -70,7 +70,7 @@ class Runtime:
 
     def has_key(self):
         with self._state_lock:
-            if time.monotonic() - self._key_checked > 30:
+            if self._key_checked is None or time.monotonic() - self._key_checked >= 30:
                 try:
                     self._credentials['openai_configured'] = bool(self.key_loader())
                 except Exception:
