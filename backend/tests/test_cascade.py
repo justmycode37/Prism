@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from prism_runtime.config import default_config, validate_config_update
 from prism_runtime.domain import roster, timestamp
@@ -169,6 +169,37 @@ class CascadeTests(unittest.TestCase):
         self.assertFalse(self.provider.calls)
         self.assertFalse(self.collector.calls)
         self.assertEqual(self.runtime.status, 'needs_credentials')
+
+    def test_credential_check_runs_at_clock_zero_and_refreshes_after_cache_expiry(self):
+        self.runtime.key_loader = Mock(return_value='test-only')
+        with patch('prism_runtime.orchestrator.time.monotonic', return_value=0.0) as clock:
+            self.assertTrue(self.runtime.has_key())
+            self.runtime.key_loader.assert_called_once_with()
+            self.runtime.key_loader.return_value = None
+            clock.return_value = 29.999
+            self.assertTrue(self.runtime.has_key())
+            self.runtime.key_loader.assert_called_once_with()
+            clock.return_value = 30.0
+            self.assertFalse(self.runtime.has_key())
+            self.assertEqual(self.runtime.key_loader.call_count, 2)
+            self.runtime.key_loader.return_value = 'test-only'
+            clock.return_value = 59.999
+            self.assertFalse(self.runtime.has_key())
+            self.assertEqual(self.runtime.key_loader.call_count, 2)
+            clock.return_value = 60.0
+            self.assertTrue(self.runtime.has_key())
+            self.assertEqual(self.runtime.key_loader.call_count, 3)
+
+    def test_failed_initial_credential_check_is_cached_then_retried(self):
+        self.runtime.key_loader = Mock(side_effect=[RuntimeError('unavailable'), 'test-only'])
+        with patch('prism_runtime.orchestrator.time.monotonic', return_value=0.0) as clock:
+            self.assertFalse(self.runtime.has_key())
+            clock.return_value = 29.999
+            self.assertFalse(self.runtime.has_key())
+            self.runtime.key_loader.assert_called_once_with()
+            clock.return_value = 30.0
+            self.assertTrue(self.runtime.has_key())
+            self.assertEqual(self.runtime.key_loader.call_count, 2)
 
     def test_frozen_validation_retry_is_idempotent(self):
         self.runtime.control('start')
