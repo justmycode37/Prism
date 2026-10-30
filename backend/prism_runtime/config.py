@@ -7,12 +7,14 @@ import os
 from pathlib import Path
 from urllib.parse import urlsplit
 from .operations_config import OPERATION_DEFAULTS, validate_operations_section
+from .trading_modes import MODE_DEFAULTS, validate_mode_update
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 ARCHITECTURE_VERSION = 1
 LAYER_ORDER = ('collector', 'analyst', 'strategist', 'executor')
 DEFAULT_CONFIG = {
     **OPERATION_DEFAULTS,
+    'trading_mode': MODE_DEFAULTS,
     'model': 'gpt-6-luna',  # Existing UI configuration field: collector model.
     'max_concurrency': 8,
     'cycle_interval_seconds': 3600,  # Legacy UI field; never drives continuous research.
@@ -96,7 +98,9 @@ def validate_config_update(changes: dict) -> dict:
                       'max_output_tokens': (1024, 32768), 'max_input_bytes': (4000, 2000000),
                       'max_evidence_per_cycle': (24, 20000), 'max_handoffs_per_agent': (4, 256)}
     for key, value in changes.items():
-        if key in OPERATION_DEFAULTS:
+        if key == 'trading_mode':
+            result[key] = validate_mode_update(value)
+        elif key in OPERATION_DEFAULTS:
             result[key] = validate_operations_section(key, value)
         elif key in {'daily_limit_usd', 'max_calls_per_day'} and value is None:
             result[key] = None

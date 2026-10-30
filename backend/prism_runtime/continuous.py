@@ -25,6 +25,8 @@ from .research_service import ResearchWorker
 from .research_tape import ResearchTape
 from .risk_controls import ACTIVE_ORDERS
 from .store import BudgetExceeded
+from .support_swarm import SupportSwarm
+from .trading_modes import is_sol_mode, mode_settings
 
 
 def epoch(value):
@@ -70,6 +72,10 @@ class ContinuousServices:
         # boundary. Never hold it while waiting for a model response.
         self.execution._mutation_lock = runtime._execution_lock
         self.execution.permission_check = self.enabled
+        self.support = None
+        self._retired_support = []
+        self._configure_trading_mode()
+        self.execution.support_context_provider = self.support_context
         if scheduler is None:
             from .scheduling import Scheduler
             scheduler = Scheduler(self.store, clock=self.clock, config=self._config)
@@ -101,7 +107,70 @@ class ContinuousServices:
         self.adapter.live_config = copy.deepcopy(config['live_execution'])
         self.scheduler.config.update(config['scheduler'])
         self.scheduler.config['calendar_required_coverage'] = config['operations']['calendar_required_coverage']
+        self._configure_trading_mode()
         self.wake()
+
+    def _configure_trading_mode(self):
+        config = self.store.config()
+        if self.support is not None:
+            self.support.close(wait=False)
+            self._retired_support.append(self.support)
+            self.support = None
+        if is_sol_mode(config):
+            sid = self.runtime.ensure_sol_strategy()
+            strategy = next(x for x in self.live.strategies() if x['id'] == sid)
+            self.market.register_strategy(strategy)
+            settings = mode_settings(config)
+            self.support = SupportSwarm(self.store, self.agents, clock=self.clock,
+                swarm_size=settings['swarm_size'], timeout_seconds=settings['support_timeout_seconds'],
+                permission_check=lambda: self.enabled() and is_sol_mode(self.store.config()))
+
+    def selected_strategies(self):
+        selected = is_sol_mode(self.store.config())
+        sid = self.store.get_document('sol_mode_strategy_id')
+        return [x for x in self.live.strategies()
+                if (x['id'] == sid if selected else x.get('trading_mode') != 'sol_perpetual')]
+
+    def support_context(self, strategy_id, snapshot):
+        if not self.support or not is_sol_mode(self.store.config()):
+            return {'status': 'inactive', 'reports': []}
+        result = self.support.context(strategy_id, snapshot,
+            max_age_seconds=mode_settings(self.store.config())['support_max_age_seconds'])
+        verifier = getattr(self.market, 'snapshot_status', None)
+        if callable(verifier):
+            result['reports'] = [report for report in result.get('reports', [])
+                if verifier(report['source_snapshot_id']).get('valid') is True]
+            if not result['reports']:
+                result['status'] = 'unavailable'
+        return result
+
+    def support_step(self):
+        event = self.events.claim(['support'])
+        if not event:
+            return None
+        try:
+            if (not self.support or not is_sol_mode(self.store.config()) or
+                    event['target'] != self.store.get_document('sol_mode_strategy_id')):
+                self.events.finish(event['id'], {'reason': 'Trading mode changed'}, status='superseded')
+                return None
+            current = self.market.sample(event['target'])
+            frozen = self.store.snapshot(event['payload'].get('snapshot_id'))
+            source = frozen['value'] if frozen else {}
+            if (not current.get('ready') or not source.get('candles') or not current.get('candles') or
+                    source['candles'][-1]['end_ms'] != current['candles'][-1]['end_ms']):
+                self.events.finish(event['id'], {'reason': 'Minute observation superseded or unavailable'}, status='superseded')
+                return None
+            snapshot = {**source, 'snapshot_id': frozen['id']}
+            report = self.support.refresh(event['target'], snapshot)
+            if self.enabled() and is_sol_mode(self.store.config()):
+                self.events.publish('candle_closed', event['target'], event['payload'],
+                    key='supported-' + event['id'], priority=60)
+            self.events.finish(event['id'], {'report_count': len(report.get('reports', []))})
+            return report
+        except Exception as error:
+            self.events.finish(event['id'], {'reason': type(error).__name__}, status='blocked')
+            self._error('support', error)
+            return {'status': 'blocked'}
 
     def enabled(self):
         return not self.runtime.paused and not self.stop.is_set()
@@ -163,12 +232,16 @@ class ContinuousServices:
             return None
         payload, sid = event['payload'], event['target']
         try:
+            if sid not in {x['id'] for x in self.selected_strategies()}:
+                self.events.finish(event['id'], {'reason': 'Inactive trading mode'}, status='superseded')
+                return None
             snapshot = self.market.snapshot(sid)
             self.tape.record(snapshot)
             if payload['kind'] in {'candle_closed', 'signal', 'intrabar'}:
                 self.live.observe(sid, snapshot)
             key = payload.get('id') or payload.get('key') or event['id']
-            self.events.publish(payload['kind'], sid, {**payload, 'snapshot_id': snapshot.get('snapshot_id')},
+            kind = 'support' if is_sol_mode(self.store.config()) and payload['kind'] == 'candle_closed' else payload['kind']
+            self.events.publish(kind, sid, {**payload, 'snapshot_id': snapshot.get('snapshot_id')},
                 key='execute-' + key, priority=payload.get('priority', 50),
                 delay=min(self.store.config()['operations']['event_coalesce_seconds'],
                           max(0., (snapshot.get('attention_deadline_ms', 0) / 1000 - self.clock()) / 4)))
@@ -181,7 +254,7 @@ class ContinuousServices:
 
     def research_observation_step(self):
         """Measured quote accounting and tape capture; this never calls a model."""
-        for strategy in self.live.strategies():
+        for strategy in self.selected_strategies():
             sample = self.market.sample(strategy['id'])
             self.tape.record(sample)
             with self.store.connection() as db:
@@ -197,7 +270,9 @@ class ContinuousServices:
     def research_step(self):
         if self.clock() - self._last_initial_evaluation >= self._config['operations']['watchdog_seconds']:
             self._last_initial_evaluation = self.clock()
-            self.research.evaluate_initial()
+            self.research.evaluate_initial(strategy_ids={x['id'] for x in self.selected_strategies()})
+        if is_sol_mode(self.store.config()):
+            return None
         return self.research.step()
 
     def on_private(self, message, changed=True):
@@ -231,6 +306,15 @@ class ContinuousServices:
         if not event:
             return None
         try:
+            if is_sol_mode(self.store.config()) and event['kind'] in {'candle_closed', 'signal', 'intrabar'}:
+                frozen = self.store.snapshot(event['payload'].get('snapshot_id'))
+                source = frozen['value'] if frozen else {}
+                current = self.market.sample(event['target'])
+                if (not source.get('candles') or not current.get('candles') or
+                        source['candles'][-1]['end_ms'] != current['candles'][-1]['end_ms'] or
+                        self.clock() * 1000 > source.get('attention_deadline_ms', 0)):
+                    self.events.finish(event['id'], {'reason': 'Minute decision expired or superseded'}, status='superseded')
+                    return {'status': 'superseded'}
             result = self.execution.handle_event({**event['payload'], 'id': event['id'],
                 'kind': event['kind'], 'strategy_id': event['target']})
             self.events.finish(event['id'], result)
@@ -243,6 +327,8 @@ class ContinuousServices:
             return {'status': 'blocked'}
 
     def discovery_step(self):
+        if is_sol_mode(self.store.config()):
+            return None
         event = self.events.claim(['discovery'])
         if not event:
             return None
@@ -313,6 +399,7 @@ class ContinuousServices:
             ('research_observation', lambda: self._loop('research_observation', self.research_observation_step,
                 predicate=self.monitoring_enabled, interval=1)),
             ('execution', lambda: self._loop('execution', self.execution_step)),
+            ('support', lambda: self._loop('support', self.support_step)),
             ('discovery', lambda: self._loop('discovery', self.discovery_step)),
             ('review', lambda: self._loop('review', self.research_step)),
             ('protection', lambda: self._loop('protection', self.protection_step,
@@ -346,10 +433,16 @@ class ContinuousServices:
                 # in-flight I/O has settled; a successor must not replay a call
                 # while an old worker can still commit its result.
                 thread.join()
+            for swarm in [self.support, *self._retired_support]:
+                if swarm is not None:
+                    swarm.close(wait=True)
 
     # Scheduler-specific methods below execute only validated durable plans;
     # the planner's model call runs exclusively in its own worker.
     def coordinator_step(self):
+        if is_sol_mode(self.store.config()):
+            self.runtime.next_cycle_at = (int(self.clock()) // 60 + 1) * 60
+            return {'mode': 'sol_perpetual', 'next_boundary_at': self.runtime.next_cycle_at}
         if self.clock() - self._last_scan >= self.store.config()['operations']['watchdog_seconds']:
             self._last_scan = self.clock()
             self.research.scan()
@@ -514,7 +607,7 @@ class ContinuousServices:
 
     def planner_step(self):
         from .scheduling import scheduler_output_schema
-        if not self.enabled() or not self._planner_requested:
+        if not self.enabled() or is_sol_mode(self.store.config()) or not self._planner_requested:
             return None
         with self._planner_lock:
             context = copy.deepcopy(self._planner_context)
@@ -575,7 +668,7 @@ class ContinuousServices:
 
     def _calendar_loop(self):
         while not self.stop.is_set():
-            if self.enabled():
+            if self.enabled() and not is_sol_mode(self.store.config()):
                 try:
                     self.refresh_calendar()
                 except Exception as error:

@@ -76,11 +76,37 @@ struct ConsoleCard<Content: View>: View {
 struct ConsoleMetricGrid<Content: View>: View {
     @ViewBuilder let content: Content
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: 12) { content }
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible())], spacing: 12) {
-                content
-            }
+        ConsoleMetricLayout { content }
+    }
+}
+
+/// Uses the available width, rather than the ideal width of long currency labels.
+/// A single layout also preserves each metric's identity when the window resizes.
+private struct ConsoleMetricLayout: Layout {
+    private let spacing: CGFloat = 12
+
+    private func measurements(width: CGFloat, subviews: Subviews) -> (columns: Int, cellWidth: CGFloat, cellHeight: CGFloat) {
+        let columns = max(1, min(subviews.count, Int((width + spacing) / (130 + spacing))))
+        let cellWidth = max(0, (width - CGFloat(columns - 1) * spacing) / CGFloat(columns))
+        let cellHeight = subviews.map { $0.sizeThatFits(.init(width: cellWidth, height: nil)).height }.max() ?? 0
+        return (columns, cellWidth, cellHeight)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard !subviews.isEmpty else { return .zero }
+        let width = proposal.width.flatMap { $0.isFinite ? max(0, $0) : nil } ?? 640
+        let layout = measurements(width: width, subviews: subviews)
+        let rows = (subviews.count + layout.columns - 1) / layout.columns
+        return CGSize(width: width, height: CGFloat(rows) * layout.cellHeight + CGFloat(rows - 1) * spacing)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let layout = measurements(width: bounds.width, subviews: subviews)
+        for (index, subview) in subviews.enumerated() {
+            subview.place(at: CGPoint(x: bounds.minX + CGFloat(index % layout.columns) * (layout.cellWidth + spacing),
+                                      y: bounds.minY + CGFloat(index / layout.columns) * (layout.cellHeight + spacing)),
+                          anchor: .topLeading,
+                          proposal: .init(width: layout.cellWidth, height: layout.cellHeight))
         }
     }
 }
@@ -98,9 +124,8 @@ struct ConsoleMetric: View {
                 Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
                     .lineLimit(2, reservesSpace: true)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(minWidth: 130)
         .accessibilityElement(children: .combine)
     }
 }
@@ -110,7 +135,7 @@ struct ConsoleIcon: View {
     var body: some View {
         Image(systemName: symbol)
             .font(.system(size: 16, weight: .regular))
-            .symbolRenderingMode(.hierarchical)
+            .symbolRenderingMode(.monochrome)
             .foregroundStyle(.secondary)
             .frame(width: 32, height: 32)
             .background(.primary.opacity(0.045), in: .circle)

@@ -4,12 +4,41 @@ import Foundation
 @main
 struct RuntimeContractCheck {
     static func main() throws {
-        guard CommandLine.arguments.count == 3 else { throw Failure.invalid("Pass state and leaderboard fixture paths.") }
+        guard CommandLine.arguments.count == 4 else { throw Failure.invalid("Pass research state, leaderboard and Sol state fixture paths.") }
         let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
         let leaderboardData = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let state = try decoder.decode(RuntimeState.self, from: data)
+        let solData = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[3]))
+        let sol = try decoder.decode(RuntimeState.self, from: solData)
+        try require(state.tradingMode?.selected == "research" && sol.tradingMode?.isSolPerpetual == true,
+                    "Both selectable mode states must decode without replacing Research.")
+        try require(sol.tradingMode?.traderModel == "gpt-6.1-sol" && sol.tradingMode?.traderReasoningEffort == "xhigh" &&
+                    sol.tradingMode?.supportModel == "gpt-6-luna" && sol.tradingMode?.supportReasoningEffort == "max" &&
+                    sol.tradingMode?.swarmSize == 4,
+                    "The Sol trader and Luna swarm must retain exact model routing.")
+        try require(sol.tradingMode?.reviewerModel == "gpt-6-luna" &&
+                    sol.tradingMode?.reviewerReasoningEffort == "max" && sol.tradingMode?.tradeReviewRequired == true,
+                    "A dedicated Luna max reviewer must be mandatory in SOL mode.")
+        var reviewedSol = try JSONSerialization.jsonObject(with: solData) as! [String: Any]
+        var reviewedMode = reviewedSol["trading_mode"] as! [String: Any]
+        reviewedMode["latest_trade_review"] = ["status": "rejected", "decision": "reject",
+            "rationale": "Fixture proposal has expired.", "review_id": "fixture-review",
+            "tool_name": "submit_order_intent", "created_at_ms": 1_793_347_200_000] as [String: Any]
+        reviewedSol["trading_mode"] = reviewedMode
+        let reviewed = try decoder.decode(RuntimeState.self, from: JSONSerialization.data(withJSONObject: reviewedSol))
+        try require(reviewed.tradingMode?.latestTradeReview?.status == "rejected" &&
+                    reviewed.tradingMode?.latestTradeReview?.rationale == "Fixture proposal has expired." &&
+                    reviewed.tradingMode?.latestTradeReview?.createdAtMs == 1_793_347_200_000,
+                    "The console must decode the recorded review decision independently of execution readiness.")
+        try require(sol.tradingMode?.tradingPnl == 2 && sol.tradingMode?.tradingReturn == 0.02 &&
+                    sol.tradingMode?.accountEquity == 102 && sol.tradingMode?.leverage == 5 &&
+                    sol.tradingMode?.apiSpentUsd == 0 && sol.tradingMode?.lifetimeModelBudgetUsd == 400,
+                    "Actual account trading P&L and lifetime API costs must decode separately.")
+        try require(sol.tradingMode?.leveragePolicy == "agent_with_venue_ceiling" &&
+                    sol.tradingMode?.venueMaxLeverage == nil && sol.tradingMode?.maxPositionRiskFraction == 0.01,
+                    "Unknown venue leverage is absent and modeled dollar-risk controls are explicit.")
         try require(state.runtime.mode == "paper", "Paper execution must be explicit.")
         try require(state.runtime.status == "paused", "A new cascade must start paused.")
         try require(state.research?.historicalResultsAreDevelopment == true && state.research?.experimentCount == 0,
@@ -46,6 +75,7 @@ struct RuntimeContractCheck {
         legacy.removeValue(forKey: "cascade")
         legacy.removeValue(forKey: "research")
         legacy.removeValue(forKey: "operations")
+        legacy.removeValue(forKey: "trading_mode")
         var legacyMarkets = legacy["markets"] as! [[String: Any]]
         legacyMarkets[0]["change_24h"] = NSNull()
         legacy["markets"] = legacyMarkets
@@ -76,7 +106,7 @@ struct RuntimeContractCheck {
         try checkRouting(data)
         try checkConfiguration(state.config, decoder: decoder)
         try checkPnl(data, decoder: decoder)
-        print("PASS: four cascade layers, 33 agents, model routing, development leaderboard decoding and ranking, nullable strategy metrics, paper records, P&L, configuration encoding.")
+        print("PASS: Research and Sol modes, model routing, separate trading/API metrics, leverage controls, four cascade layers, 33 research agents, leaderboard, paper records and configuration encoding.")
     }
 
     private static func checkLeaderboard(_ leaderboardData: Data, stateData: Data, decoder: JSONDecoder) throws {

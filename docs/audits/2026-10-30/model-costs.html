@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Prism model cost scenarios</title>
+<style>
+html,body{margin:0;padding:0;font-family:var(--font-sans);color:var(--foreground)}
+figure{margin:0}
+figcaption{font-weight:500;margin:0 0 18px}
+.chart{height:200px;display:grid;grid-template-rows:auto auto auto;gap:15px;align-content:start}
+.label{display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px;margin-bottom:9px}
+.amount{font-variant-numeric:tabular-nums}
+.track{height:25px;background:var(--muted)}
+.bar{height:25px;background:var(--chart-1)}
+.axis{display:flex;justify-content:space-between;gap:8px;color:var(--muted-foreground)}
+.caption{color:var(--muted-foreground);margin:0;line-height:1.5}
+</style>
+</head>
+<body>
+<figure id="prism-model-cost-scenarios">
+<figcaption>Model cost per 30 days · assumed workloads</figcaption>
+<div class="chart" role="img" aria-label="Prism's repository scenarios estimate 338 dollars and 54 cents for thirty quiet days, and 2,131 dollars and 36 cents for thirty busy days. These are assumptions, not measured bills. Bars use a common zero to 2,500 US dollar scale.">
+<div>
+<div class="label"><span>Quiet workload</span><span class="amount">$338.54</span></div>
+<div class="track"><div class="bar" style="width:13.541424%"></div></div>
+</div>
+<div>
+<div class="label"><span>Busy workload</span><span class="amount">$2,131.36</span></div>
+<div class="track"><div class="bar" style="width:85.254528%"></div></div>
+</div>
+<div class="axis" aria-hidden="true"><span>$0</span><span>$1,250</span><span>$2,500 USD</span></div>
+</div>
+<p class="caption">Repository rate and usage assumptions. Excludes data, infrastructure, and trading costs. No return forecast.</p>
+</figure>
+</body>
+</html>

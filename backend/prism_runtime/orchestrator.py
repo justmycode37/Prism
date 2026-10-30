@@ -23,6 +23,8 @@ from . import temporal, simulation, experiments
 from .search import expand_hypothesis
 from .agent_runtime import ComponentBudget
 from .research_memory import ResearchMemory
+from .trading_modes import describe as describe_mode, is_sol_mode, mode_settings, sol_market_policy, sol_mode_strategy_spec
+from .market_data import sol_chart_projection
 
 
 class Runtime:
@@ -73,6 +75,107 @@ class Runtime:
                 self.store.event('research', 'Archived the legacy simulated account; prospective paper accounting starts separately.')
             self.store.set_document('research_protocol_version', 1)
         self.store.event('runtime', 'Event-driven research and trading runtime loaded; paused until Start. Exchange execution requires explicit operator configuration.')
+        if is_sol_mode(self.store.config()):
+            self.ensure_sol_strategy()
+
+    def ensure_sol_strategy(self, config=None):
+        """Register the selected mandate locally; never grant order authority."""
+        from .live_research import LiveResearch
+        config = config or self.store.config()
+        settings = mode_settings(config)
+        eid = 'operator-sol-perpetual-mandate-v1'
+        self.store.save_evidence([{'id': eid, 'source_url': 'operator://prism/sol-perpetual',
+            'title': 'Operator-selected SOLUSDT one-minute agent mandate',
+            'content': 'Observe SOLUSDT linear perpetual closed one-minute candles with Sol xhigh and Luna max support. '
+                       'This operator mandate is not market evidence or prospective qualification.',
+            'observed_at': timestamp(self.store._clock()), 'symbols': ['SOLUSDT']}])
+        experiment = LiveResearch(self.store, clock=self.store._clock).register(
+            sol_mode_strategy_spec(), sol_market_policy(), hypothesis='SOLUSDT one-minute Sol trader with bounded Luna support',
+            evidence_ids=[eid], initial_equity=100., performance_basis='trading',
+            execution_identity={'mode': 'sol_perpetual', 'trader_model': 'gpt-6.1-sol',
+                'trader_reasoning_effort': 'xhigh', 'support_profile': 'gpt-6-luna:max',
+                'swarm_size': settings['swarm_size'],
+                'support_timing_seconds': str(settings['support_timeout_seconds']) + ':' + str(settings['support_max_age_seconds']),
+                'max_position_risk_fraction': settings['max_position_risk_fraction'],
+                'leverage_policy': 'agent_with_venue_ceiling', 'review_protocol_version': 2,
+                'reviewer_model': 'gpt-6-luna', 'reviewer_reasoning_effort': 'max',
+                'trade_review_required': True})
+        strategy = next(x for x in self.store.strategies() if x['id'] == experiment['id'])
+        self.store.save_strategy({**strategy, 'trading_mode': 'sol_perpetual'})
+        self.store.set_document('sol_mode_strategy_id', experiment['id'])
+        return experiment['id']
+
+    def trading_mode_state(self):
+        config = self.store.config()
+        value = describe_mode(config)
+        value['latest_trade_review'] = None
+        value['enabled'] = not self.paused and not self._stop.is_set()
+        costs = self.component_budget.mode_budget()
+        value.update(api_spent_usd=costs['spent_usd'], api_reserved_usd=costs['reserved_usd'])
+        if is_sol_mode(config):
+            strategy_id = self.store.get_document('sol_mode_strategy_id')
+            value['strategy_id'] = strategy_id
+            value['latest_trade_review'] = self._latest_trade_review(strategy_id)
+            account = (self.store.get_document('live_execution_state', {}) or {}).get('account', {})
+            # Daily venue account equity changes include fees/funding, never provider charges.
+            pnl = account.get('daily_pnl') if account.get('daily_pnl_verified') else None
+            initial = account.get('daily_baseline_equity')
+            value.update(trading_pnl=pnl, trading_return=(pnl / initial if pnl is not None and initial else None),
+                account_equity=account.get('equity'), gross_exposure=account.get('portfolio_notional'),
+                leverage=account.get('leverage'),
+                pending=not (config['bybit']['enabled'] and config['live_execution']['enabled'] and
+                    strategy_id in config['live_execution']['eligible_strategy_versions']),
+                unsupported_reason='Exchange execution requires the exact qualified version, account, instrument and risk approvals.')
+            with self.store.connection() as db:
+                exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bybit_instruments'").fetchone()
+                row = db.execute('SELECT value,updated_at_ms FROM bybit_instruments WHERE mode=? AND category=? AND symbol=?',
+                    (config['bybit']['mode'], 'linear', 'SOLUSDT')).fetchone() if exists else None
+            if row and 0 <= self.store._now_ms() - row['updated_at_ms'] <= 60_000:
+                try:
+                    maximum = float(json.loads(row['value']).get('max_leverage'))
+                    value['venue_max_leverage'] = maximum if math.isfinite(maximum) and maximum >= 1 else None
+                except (ValueError, TypeError):
+                    value['venue_max_leverage'] = None
+        return value
+
+    def _latest_trade_review(self, strategy_id):
+        """Project only the active SOL version's safe reviewer decision fields."""
+        if not isinstance(strategy_id, str) or not strategy_id:
+            return None
+        with self.store.connection() as db:
+            exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trade_reviews'").fetchone()
+            if not exists:
+                return None
+            rows = db.execute('''SELECT review_id,tool_name,status,decision,rationale,value,created_at_ms
+                FROM trade_reviews ORDER BY created_at_ms DESC LIMIT 100''').fetchall()
+        for row in rows:
+            try:
+                recorded = json.loads(row['value'])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(recorded, dict) or recorded.get('strategy_id') != strategy_id:
+                continue
+            approval = recorded.get('_approval')
+            if not isinstance(approval, dict):
+                approval = {}
+            decision = row['decision'] or recorded.get('decision', approval.get('decision'))
+            rationale = row['rationale'] or recorded.get('rationale', recorded.get('reason',
+                        approval.get('rationale', approval.get('reason'))))
+            def bounded_text(item, limit):
+                return item[:limit] if isinstance(item, str) else None
+
+            result = {
+                'review_id': bounded_text(row['review_id'], 128),
+                'tool_name': bounded_text(row['tool_name'], 64),
+                'status': bounded_text(row['status'], 32),
+                'decision': bounded_text(decision, 32),
+                'rationale': bounded_text(rationale, 500),
+                'created_at_ms': row['created_at_ms'] if type(row['created_at_ms']) is int else None,
+            }
+            # These fields are display-only. Never expose the journal's proposal,
+            # state binding, or digest values through the runtime state API.
+            return result
+        return None
 
     def has_key(self):
         with self._state_lock:
@@ -121,17 +224,20 @@ class Runtime:
         validated = validate_config_update(changes)
         old = self.store.config()
         updated = merge_settings(old, validated)
+        mode_changed = old['trading_mode'] != updated['trading_mode']
         critical = any(old['bybit'][key] != updated['bybit'][key]
                        for key in ('mode', 'account_id', 'account_type', 'position_mode'))
         narrowing = (old['bybit']['enabled'] and not updated['bybit']['enabled'] or
                      old['bybit']['mainnet_enabled'] and not updated['bybit']['mainnet_enabled'] or
                      any(x not in updated['bybit']['allowed_instruments'] for x in old['bybit']['allowed_instruments']))
         with self._execution_lock, self._state_lock:
+            if mode_changed and not self.paused:
+                raise ValueError('Pause before changing trading mode or swarm settings')
             if critical and not self.paused:
                 raise ValueError('Pause before changing the account/environment; a process restart applies the new binding')
-            if self.continuous and (critical or narrowing) and self.continuous.has_exposure():
+            if self.continuous and (critical or narrowing or mode_changed) and self.continuous.has_exposure():
                 raise ValueError('Close exposure and reconcile outstanding orders before changing the exchange envelope')
-            if critical or narrowing:
+            if critical or narrowing or mode_changed:
                 with self.store.connection() as db:
                     exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bybit_orders'").fetchone()
                     if exists:
@@ -148,7 +254,16 @@ class Runtime:
                 paper = self.store.get_document('bybit_paper_exchange_v1', {})
                 if any(float(x.get('quantity', 0)) > 0 for x in paper.get('positions', {}).values()):
                     raise ValueError('Paper positions must be closed before switching their execution environment')
+                if mode_changed and self.store.get_document('portfolio', {}).get('positions'):
+                    raise ValueError('Close research paper positions before switching trading mode')
+            # Local registration may fail (for example, exhausted shadow capacity).
+            # Prepare it before committing the selected mode; failure must leave
+            # the previously selected workflow intact.
+            if mode_changed and is_sol_mode(updated):
+                self.ensure_sol_strategy(updated)
             result = self.store.update_config(validated)
+            if mode_changed:
+                self._generation += 1
             if self.continuous:
                 self.continuous.configuration_changed(result)
         self.configuration_changed()
@@ -254,7 +369,7 @@ class Runtime:
     def _market_loop(self):
         while not self._stop.is_set():
             try:
-                if not self.paused:
+                if not self.paused and not is_sol_mode(self.store.config()):
                     self.refresh_markets()
             except Exception:
                 self.store.event('market', 'Public market refresh failed; stale prices cannot authorize fills.', 'warning')
@@ -1105,7 +1220,7 @@ class Runtime:
         if not self._cycle_lock.acquire(blocking=False):
             return False
         try:
-            if self.paused or self._stop.is_set():
+            if self.paused or self._stop.is_set() or is_sol_mode(self.store.config()):
                 return False
             generation = self._generation
             if not self.has_key():
@@ -1235,12 +1350,20 @@ class Runtime:
             self._research_state_cache = summary
             research_summary = summary
             self._research_state_cache_at = time.monotonic()
+        try:
+            market = getattr(self.continuous, 'market', None) if self.continuous else None
+            sol_chart = sol_chart_projection(self.store, market)
+        except Exception:
+            # A chart projection is optional UI context and must not break the
+            # existing runtime state contract if market data is unavailable.
+            sol_chart = None
         return {
             'runtime': {'status': 'paused' if self.paused else self.status, 'mode': config['bybit']['mode'], 'started_at': self.started_at,
                         'next_cycle_at': None if self.paused or not self.next_cycle_at else timestamp(self.next_cycle_at), **self._credentials,
                         'credentials_ready': self._key_configured,
                         'last_error': self.last_error, 'live_trading_available': True},
             'operations': self.operations_state(),
+            'trading_mode': self.trading_mode_state(),
             'budget': self.store.budget(), 'agents': agents, 'agent_roles': roles,
             'research': {**research_summary,
                 'protocol': config['research'], 'phase': 'prospective_shadow',
@@ -1249,6 +1372,7 @@ class Runtime:
             'strategies': [row for row in self.store.strategies() if row.get('symbol') in self._symbols() or row.get('policy_version') == 2], 'portfolio': self.store.get_document('portfolio'),
             'markets': [{key: row.get(key) for key in ('symbol', 'price', 'change_24h', 'funding_rate', 'updated_at',
                                                       'asset_class', 'currency', 'exchange')} for row in markets],
+            'sol_chart': sol_chart,
             'events': self.store.events(), 'config': config,
             'cascade': {'architecture': 'reverse_cascade', 'version': 2, 'sector': universe,
                         'collection': {'evidence_count': len(evidence_ids), 'source_count': len(source_urls),

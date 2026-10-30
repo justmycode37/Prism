@@ -100,6 +100,75 @@ def _bar_values(row):
     return [row.get(name) for name in ('start_ms', 'end_ms', *OHLC, 'volume', 'turnover', 'closed')]
 
 
+def _sol_chart_candle(row):
+    """Return the small, validated candle shape used by the SOL UI."""
+    if not isinstance(row, dict) or type(row.get('closed')) is not bool:
+        return None
+    try:
+        start = _milliseconds(row.get('start_ms'))
+        values = {name: _number(row.get(name), positive=True) for name in OHLC}
+        if (_floor(start, '1') != start or
+                _milliseconds(row.get('end_ms')) != start + INTERVAL_MS['1']):
+            return None
+        if values['high'] < max(values['open'], values['close']) or values['low'] > min(values['open'], values['close']):
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return {'start_ms': start, **values, 'closed': row['closed']}
+
+
+def sol_chart_projection(store, market=None):
+    """Read up to 120 validated SOLUSDT linear one-minute bars without recovery.
+
+    A running service is the authoritative source for its forming candle. When
+    the service is absent, this reads only the matching environment's durable
+    series and closed bars; it never creates a service or contacts Bybit.
+    """
+    environment = 'testnet' if store.config().get('bybit', {}).get('mode') == 'testnet' else 'mainnet'
+    key = ('linear', 'SOLUSDT', '1')
+    rows = None
+    if market is not None and getattr(market, 'environment', None) == environment:
+        try:
+            with market._lock:
+                series = market._series.get(key)
+                if (series and series.get('environment') == environment and
+                        series.get('key') == list(key)):
+                    rows = list(series.get('bars', {}).values())
+                    forming = series.get('forming')
+                    if forming is not None:
+                        rows.append(forming)
+        except Exception:
+            rows = None
+    if rows is None:
+        try:
+            with store.connection() as db:
+                series_row = db.execute('SELECT value FROM md_series WHERE id=?',
+                                        (':'.join((environment, *key)),)).fetchone()
+                if series_row is None:
+                    return None
+                series = json.loads(series_row['value'])
+                if (series.get('environment') != environment or
+                        series.get('key') != list(key)):
+                    return None
+                history_limit = series.get('history_bars', 5000)
+                if type(history_limit) is not int or not 1 <= history_limit <= 5000:
+                    history_limit = 5000
+                rows = [json.loads(row['value']) for row in db.execute(
+                    'SELECT value FROM md_bars WHERE series_id=? ORDER BY start_ms DESC LIMIT ?',
+                    (':'.join((environment, *key)), history_limit))]
+        except Exception:
+            return None
+    candles = [candle for row in rows if (candle := _sol_chart_candle(row)) is not None]
+    candles.sort(key=lambda candle: candle['start_ms'])
+    # A malformed duplicate cannot cause the chart to emit two values for one minute.
+    unique = {candle['start_ms']: candle for candle in candles}
+    candles = [unique[start] for start in sorted(unique)[-120:]]
+    if not candles:
+        return None
+    return {'symbol': 'SOLUSDT', 'category': 'linear', 'timeframe': '1',
+            'environment': environment, 'candles': candles}
+
+
 def _indicators(bars, declarations):
     """Bounded deterministic indicators: Wilder RSI/ATR, seeded EMA, return sigma."""
     result = {}

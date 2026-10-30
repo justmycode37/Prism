@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prism trading and learning loop</title>
+  <style>
+    html, body { margin: 0; background: transparent; }
+    #prism-loop { color: var(--foreground); font-family: var(--font-sans); }
+    #prism-loop * { box-sizing: border-box; }
+    #prism-loop strong { font-weight: 500; }
+    #prism-loop p { margin: 0; }
+    #prism-loop .caption { color: var(--muted-foreground); margin-bottom: 16px; }
+    #prism-loop .label { margin: 0 0 12px; font-weight: 500; }
+    #prism-loop .flow { display: grid; grid-template-columns: minmax(0, 1fr) 20px minmax(0, 1fr) 20px minmax(0, 1fr) 20px minmax(0, 1fr); align-items: stretch; }
+    #prism-loop .node { padding: 16px; border-radius: var(--radius); background: var(--secondary); color: var(--secondary-foreground); min-width: 0; }
+    #prism-loop .node.sol { background: var(--accent); color: var(--accent-foreground); }
+    #prism-loop .node strong { display: block; margin-bottom: 8px; }
+    #prism-loop .arrow { display: flex; align-items: center; justify-content: center; color: var(--muted-foreground); }
+    #prism-loop .feedback { text-align: center; padding: 14px 0 0; }
+    #prism-loop .protection { margin-top: 16px; padding: 16px; border-radius: var(--radius); background: var(--secondary); color: var(--secondary-foreground); }
+    #prism-loop .protection strong { display: block; margin-bottom: 4px; }
+    #prism-loop .learning { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--border); }
+    #prism-loop .learning-flow { display: grid; grid-template-columns: minmax(0,1fr) 20px minmax(0,1fr) 20px minmax(0,1fr); align-items: stretch; }
+    #prism-loop .outcomes { margin-top: 14px; display: grid; gap: 8px; }
+    #prism-loop .outcome { display: flex; align-items: baseline; gap: 10px; }
+    #prism-loop .outcome strong { flex: 0 0 55px; }
+    #prism-loop .footer { color: var(--muted-foreground); margin-top: 20px; }
+    @media (max-width: 560px) {
+      #prism-loop .flow, #prism-loop .learning-flow { grid-template-columns: 1fr; }
+      #prism-loop .arrow { min-height: 28px; }
+      #prism-loop .arrow span { transform: rotate(90deg); }
+      #prism-loop .node strong { margin-bottom: 4px; }
+      #prism-loop .feedback { text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <main id="prism-loop" aria-label="Proposed Prism architecture: repeated trading decisions with durable memory and separately tested lessons">
+    <p class="caption">Proposed design · SOLUSDT</p>
+    <p class="label">The trading loop — repeats when new information arrives</p>
+    <div class="flow" role="group" aria-label="Market data flows to Sol, then risk-checked execution, then saved memory">
+      <div class="node"><strong>1. Watch</strong><p>Prism receives new market and account data.</p></div>
+      <div class="arrow" aria-hidden="true"><span>→</span></div>
+      <div class="node sol"><strong>2. Decide</strong><p>Sol reads saved memory and Luna advice. Trade or wait?</p></div>
+      <div class="arrow" aria-hidden="true"><span>→</span></div>
+      <div class="node"><strong>3. Act</strong><p>Prism checks risk limits and handles orders.</p></div>
+      <div class="arrow" aria-hidden="true"><span>→</span></div>
+      <div class="node"><strong>4. Remember</strong><p>Save decisions, fills and results. Refresh the notes.</p></div>
+    </div>
+    <p class="feedback">↶ The next Sol call reads this saved memory. The loop repeats.</p>
+    <div class="protection"><strong>Protection runs independently</strong><p>Position monitoring and protective order handling continue while Sol is thinking.</p></div>
+
+    <section class="learning" aria-label="Slower learning loop">
+      <p class="label">The learning loop — runs after outcomes are known</p>
+      <div class="learning-flow">
+        <div class="node"><strong>Review trades</strong><p>What happened? Was there a repeatable problem?</p></div>
+        <div class="arrow" aria-hidden="true"><span>→</span></div>
+        <div class="node"><strong>Suggest a change</strong><p>Write a possible lesson, linked to the evidence.</p></div>
+        <div class="arrow" aria-hidden="true"><span>→</span></div>
+        <div class="node"><strong>Paper-test it</strong><p>Compare the change with the current playbook.</p></div>
+      </div>
+      <div class="outcomes">
+        <p class="outcome"><strong>Pass →</strong><span>Adopt under the approved rules; future Sol calls read the updated playbook.</span></p>
+        <p class="outcome"><strong>Fail →</strong><span>Keep the current playbook and record what failed.</span></p>
+      </div>
+    </section>
+    <p class="footer">Database = factual history. Markdown = readable notes. A proposed lesson needs evidence before it changes trading.</p>
+  </main>
+</body>
+</html>

@@ -120,7 +120,8 @@ class LiveResearch:
             raise ValueError('Research clock must return a finite nonnegative epoch time')
         return round(value * 1000)
 
-    def register(self, spec, market_policy, *, hypothesis, evidence_ids, parent_id=None, rationale=None):
+    def register(self, spec, market_policy, *, hypothesis, evidence_ids, parent_id=None, rationale=None,
+                 initial_equity=10_000., performance_basis='operating', execution_identity=None):
         market_policy = validate_market_policy(market_policy)
         spec = analytics.canonical_spec(spec)
         if spec['symbol'] != market_policy['symbol'] or market_policy['venue'] != 'bybit':
@@ -129,6 +130,24 @@ class LiveResearch:
             raise ValueError('Bybit event-surprise rules require a separately implemented numeric event policy')
         if not isinstance(hypothesis, str) or not hypothesis.strip():
             raise ValueError('A falsifiable hypothesis is required')
+        if not _finite(initial_equity, positive=True):
+            raise ValueError('Initial equity must be finite and positive.')
+        if not isinstance(performance_basis, str) or performance_basis not in {'trading', 'operating'}:
+            raise ValueError('Unsupported performance basis.')
+        if execution_identity is not None:
+            if (not isinstance(execution_identity, dict) or not 1 <= len(execution_identity) <= 12
+                    or any(not isinstance(key, str) or not key or len(key) > 64 for key in execution_identity)):
+                raise ValueError('Execution identity must be a bounded object.')
+            for value in execution_identity.values():
+                if isinstance(value, str):
+                    if len(value) > 128:
+                        raise ValueError('Execution identity values must be bounded.')
+                elif isinstance(value, bool):
+                    continue
+                elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                    continue
+                else:
+                    raise ValueError('Execution identity values must be finite scalar values.')
         sources = self.store.evidence(evidence_ids)
         from .temporal import evidence_as_of
         sources = evidence_as_of(sources, self._now_ms())
@@ -146,7 +165,7 @@ class LiveResearch:
             'version': PROTOCOL_VERSION, 'venue': 'bybit', 'frequency': 'explicit_strategy_timeframe',
             'market_policy': market_policy, 'observation_unit': 'UTC_calendar_day',
             **_policy_protocol(mode),
-            'initial_equity': 10_000., 'allocation_fraction': .1,
+            'initial_equity': float(initial_equity), 'allocation_fraction': .1,
             'fee_bps': max(6., risk['fee_bps']), 'slippage_bps': max(3., risk['slippage_bps']),
             'funding_bps_per_day': 10. if market_policy['category'] == 'linear' else 0.,
             'stop_loss_fraction': .03, 'max_holding_days': 1,
@@ -163,6 +182,12 @@ class LiveResearch:
                 'min_excess_return': 0.,
             },
         }
+        # Keep the historical policy hash and exact key set unchanged for
+        # callers using the legacy defaults. New mode-scoped experiments freeze
+        # both accounting basis and execution routing as part of their identity.
+        if initial_equity != 10_000. or performance_basis != 'operating' or execution_identity is not None:
+            policy['performance_basis'] = performance_basis
+            policy['execution_identity'] = copy.deepcopy(execution_identity)
         if parent_id:
             parent = self.store.experiment(parent_id)
             if not parent or parent['policy'].get('version') != PROTOCOL_VERSION:
@@ -213,8 +238,10 @@ class LiveResearch:
             'fee_bps', 'slippage_bps', 'funding_bps_per_day', 'stop_loss_fraction',
             'max_holding_days', 'operating_costs', 'review_protocol',
         }
+        legacy_policy_keys = expected_policy_keys
+        explicit_policy_keys = expected_policy_keys | {'performance_basis', 'execution_identity'}
         if (policy.get('version') != PROTOCOL_VERSION or policy.get('venue') != 'bybit'
-                or set(policy) != expected_policy_keys
+                or set(policy) not in (legacy_policy_keys, explicit_policy_keys)
                 or policy.get('frequency') != 'explicit_strategy_timeframe'
                 or policy.get('observation_unit') != 'UTC_calendar_day'
                 or {key: policy.get(key) for key in _policy_protocol(mode)} != _policy_protocol(mode)
@@ -226,6 +253,17 @@ class LiveResearch:
                        for name in ('data_cost_usd_per_day', 'infrastructure_cost_usd_per_day', 'source_cost_usd'))
                 or type(costs.get('source_cost_complete')) is not bool):
             return False
+        if set(policy) == explicit_policy_keys:
+            execution_identity = policy.get('execution_identity')
+            if (policy.get('performance_basis') not in {'trading', 'operating'}
+                    or execution_identity is not None and (
+                        not isinstance(execution_identity, dict) or not 1 <= len(execution_identity) <= 12
+                        or any(not isinstance(key, str) or not key or len(key) > 64 for key in execution_identity)
+                        or any(not ((isinstance(value, str) and len(value) <= 128)
+                                    or isinstance(value, bool)
+                                    or (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)))
+                               for value in execution_identity.values()))):
+                return False
         required_review = {
             'min_forward_sessions': (int, 60), 'min_forward_trades': (int, 8),
             'forward_block_sessions': (int, 5), 'min_forward_blocks': (int, 12),
@@ -243,13 +281,14 @@ class LiveResearch:
                            'max_forward_drawdown', 'min_excess_return'}:
             return False
         ranges = {
-            'initial_equity': (100., 1e9), 'allocation_fraction': (.001, .1),
+            'initial_equity': (0. if set(policy) == explicit_policy_keys else 100., 1e9),
+            'allocation_fraction': (.001, .1),
             'fee_bps': (6., 100.), 'slippage_bps': (3., 100.),
             'stop_loss_fraction': (.001, .05),
         }
         for name, (low, high) in ranges.items():
             value = policy.get(name)
-            if not _finite(value) or not low <= value <= high:
+            if not _finite(value, positive=name == 'initial_equity') or not low <= value <= high:
                 return False
         max_days = policy.get('max_holding_days')
         if type(max_days) is not int or not 1 <= max_days <= 20:
@@ -1045,7 +1084,8 @@ class LiveResearch:
             return {'eligible': False, 'reasons': ['Frozen policy does not match implemented v2 accounting semantics']}
         verified, invalid = self._verified_observations(experiment)
         settings = {**experiment['policy']['review_protocol'], 'alpha_budget': experiment['alpha_budget']}
-        report = forward_report(verified, {'research': settings})
+        performance_basis = experiment['policy'].get('performance_basis', 'operating')
+        report = forward_report(verified, {'research': settings}, performance_basis=performance_basis)
         development = [row for row in experiment.get('evaluations', []) if row.get('phase') == 'development']
         reasons = list(report['reasons'])
         if not development or not development[-1].get('supported'):
@@ -1061,6 +1101,7 @@ class LiveResearch:
             'reasons': list(dict.fromkeys(reasons)), 'policy_version': PROTOCOL_VERSION,
             'observation_unit': 'UTC_calendar_day',
             'accounting_semantics': experiment['policy']['accounting_semantics'],
+            'performance_basis': performance_basis,
             'benchmarks': ['same_instrument_buy_hold', 'same_instrument_market', 'cash'],
             'funding_basis': 'frozen_elapsed_millisecond_mark_reserve',
             'verified_observations': len(verified), 'invalid_observations': invalid,

@@ -30,14 +30,16 @@ class ResearchWorker:
         # The dedicated scheduler chooses timed reviews. Automatic scans react
         # to results/evidence and explicit prior continuation conditions.
         config = self.store.config()['operations']
-        return self.memory.scan_triggers(include_elapsed=False, thresholds={
+        return self.memory.scan_triggers(include_elapsed=False, exclude_execution_mode='sol_perpetual', thresholds={
             'session_interval': config['review_sessions'], 'trade_interval': config['review_trades']})
 
     def step(self):
         # A crash between result persistence and application cannot lose work or
         # repeat a completed model invocation.
         with self.store.connection() as db:
-            completed = db.execute("SELECT id FROM research_memory_reviews WHERE status='completed' ORDER BY completed_at,id LIMIT 1").fetchone()
+            completed = db.execute("""SELECT id FROM research_memory_reviews WHERE status='completed'
+                AND experiment_id NOT IN (SELECT id FROM experiments WHERE json_extract(policy,'$.execution_identity.mode')='sol_perpetual')
+                ORDER BY completed_at,id LIMIT 1""").fetchone()
         if completed:
             result = self.memory.apply_review(completed['id'], markets=self.store.markets(), config=self.store.config())
             self._transition(result)
@@ -46,11 +48,14 @@ class ResearchWorker:
             transitions = db.execute("SELECT value FROM cascade_meta WHERE key LIKE 'revision_transition_%' LIMIT 128").fetchall()
         for row in transitions:
             pending = json.loads(row['value'])
+            target = self.store.experiment((pending.get('application') or {}).get('experiment_id'))
+            if target and (target['policy'].get('execution_identity') or {}).get('mode') == 'sol_perpetual':
+                continue
             if (pending.get('status') == 'blocked' and pending.get('application')
                     and self.clock() >= pending.get('retry_at', 0)):
                 self._transition(pending['application'])
                 return {'status': 'transition_rechecked', 'experiment_id': pending['application']['experiment_id']}
-        review = self.memory.claim_review()
+        review = self.memory.claim_review(exclude_execution_mode='sol_perpetual')
         if not review:
             return None
         try:
@@ -127,11 +132,13 @@ class ResearchWorker:
                 'application': {key: application.get(key) for key in ('outcome', 'status', 'experiment_id')}})
             self.store.event('review', 'Revision transition blocked: ' + str(error)[:250], 'warning')
 
-    def evaluate_initial(self):
+    def evaluate_initial(self, strategy_ids=None):
         if not self.market:
             return []
         evaluated = []
         for strategy in self.live.strategies():
+            if strategy_ids is not None and strategy['id'] not in strategy_ids:
+                continue
             exp = self.store.experiment(strategy['id'])
             if any(x.get('phase') == 'development' for x in exp.get('evaluations', [])):
                 continue
@@ -166,6 +173,8 @@ class ResearchWorker:
             if len(bars) < 300:
                 raise ValueError('Insufficient pre-registration development history')
             result = self.live.evaluate_development(sid, bars)
-        self.memory.enqueue_review(sid, trigger='initial_evaluation', material={'development': result})
+        managed = next((x for x in self.live.strategies() if x['id'] == sid), {})
+        if managed.get('trading_mode') != 'sol_perpetual':
+            self.memory.enqueue_review(sid, trigger='initial_evaluation', material={'development': result})
         self.store.set_document('development_attempt_' + sid, {'status': 'completed', 'at': self.clock()})
         return result

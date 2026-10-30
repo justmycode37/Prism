@@ -21,6 +21,8 @@ OPERATION_DEFAULTS = {
         'discovery': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium', 'daily_calls': 96, 'daily_usd': 100., 'concurrency': 8, 'max_output_tokens': 8192},
         'review': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium', 'daily_calls': 32, 'daily_usd': 40., 'concurrency': 1, 'max_output_tokens': 8192},
         'execution': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'high', 'daily_calls': 240, 'daily_usd': 150., 'concurrency': 1, 'max_output_tokens': 4096},
+        'support': {'model': 'gpt-6-luna', 'reasoning_effort': 'max', 'daily_calls': 10000, 'daily_usd': 400., 'concurrency': 4, 'max_output_tokens': 4096},
+        'trade_review': {'model': 'gpt-6-luna', 'reasoning_effort': 'max', 'daily_calls': 5760, 'daily_usd': 400., 'concurrency': 1, 'max_output_tokens': 2048},
     },
     'bybit': {
         'mode': 'paper', 'enabled': False, 'mainnet_enabled': False,
@@ -61,7 +63,7 @@ def validate_operations_section(section, changes):
             for name in ('daily_calls', 'concurrency', 'max_output_tokens'):
                 if type(row[name]) is not int or not 1 <= row[name] <= (32768 if name == 'max_output_tokens' else 10000):
                     raise ValueError('Invalid resource count')
-            if row['concurrency'] > 32 or component in {'execution', 'scheduler', 'review'} and row['concurrency'] != 1:
+            if row['concurrency'] > 32 or component in {'execution', 'scheduler', 'review', 'trade_review'} and row['concurrency'] != 1:
                 raise ValueError('Agent lane must remain serial')
             _positive(row['daily_usd'])
     elif section == 'bybit':

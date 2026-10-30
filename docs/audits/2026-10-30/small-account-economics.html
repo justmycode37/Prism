@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent spending against a 100 dollar trading account</title>
+<style>
+html,body{margin:0;padding:0;color:var(--foreground);font-family:var(--font-sans)}
+figure{margin:0}
+figcaption{font-weight:500;margin-bottom:20px}
+.chart{height:265px;display:grid;gap:18px;align-content:start}
+.label{display:flex;flex-wrap:wrap;gap:6px;justify-content:space-between;margin-bottom:8px}
+.number{font-variant-numeric:tabular-nums}
+.track{height:24px;background:var(--muted)}
+.bar{height:24px;background:var(--chart-1)}
+.axis{display:flex;justify-content:space-between;gap:10px;color:var(--muted-foreground)}
+.note{margin:0;color:var(--muted-foreground);line-height:1.5}
+</style>
+</head>
+<body>
+<figure>
+<figcaption>Trading profit needed to cover AI costs · $100 account</figcaption>
+<div class="chart" role="img" aria-label="Spending ten dollars on agents requires ten dollars of trading profit, or ten percent of the initial account. Spending fifty dollars requires fifty percent. Spending four hundred dollars requires four hundred percent. Trading profit is after exchange costs, before agent spending. These are break-even calculations, not forecasts.">
+<div>
+<div class="label"><span>$10 spent on agents</span><span class="number">+$10 trading profit · 10%</span></div>
+<div class="track"><div class="bar" style="width:2.5%"></div></div>
+</div>
+<div>
+<div class="label"><span>$50 spent on agents</span><span class="number">+$50 trading profit · 50%</span></div>
+<div class="track"><div class="bar" style="width:12.5%"></div></div>
+</div>
+<div>
+<div class="label"><span>$400 spent on agents</span><span class="number">+$400 trading profit · 400%</span></div>
+<div class="track"><div class="bar" style="width:100%"></div></div>
+</div>
+<div class="axis" aria-hidden="true"><span>$0</span><span>$200</span><span>$400 USD</span></div>
+</div>
+<p class="note">Break-even only. Trading profit is after exchange costs; other operating expenses are excluded. No time period or return forecast.</p>
+</figure>
+</body>
+</html>

@@ -15,6 +15,54 @@ struct RuntimeState: Decodable, Sendable {
     let research: ResearchStatus?
     /// Continuous runtime projection; absent in older journals and fixtures.
     let operations: OperationalStatus?
+    /// Selected trading workflow; absent in older runtimes and offline fixtures.
+    let tradingMode: TradingModeStatus?
+    /// Optional bounded venue OHLC history for the dedicated SOL workspace.
+    let solChart: SOLChartSnapshot?
+}
+
+struct TradingModeStatus: Decodable, Sendable {
+    let selected: String
+    let traderModel: String?
+    let traderReasoningEffort: String?
+    let supportModel: String?
+    let supportReasoningEffort: String?
+    let reviewerModel: String?
+    let reviewerReasoningEffort: String?
+    let tradeReviewRequired: Bool?
+    let latestTradeReview: TradeReviewStatus?
+    let symbol: String?
+    let category: String?
+    let primaryTimeframe: String?
+    let swarmSize: Int?
+    let continuous: Bool?
+    let pnlBasis: String?
+    let lifetimeModelBudgetUsd: Double?
+    let tradingPnl: Double?
+    let tradingReturn: Double?
+    let accountEquity: Double?
+    let grossExposure: Double?
+    let leverage: Double?
+    let leveragePolicy: String?
+    let venueMaxLeverage: Double?
+    let maxPositionRiskFraction: Double?
+    let enabled: Bool?
+    let apiSpentUsd: Double?
+    let apiReservedUsd: Double?
+    let pending: Bool?
+    let unsupportedReason: String?
+
+    var isSolPerpetual: Bool { selected == "sol_perpetual" }
+}
+
+struct TradeReviewStatus: Decodable, Sendable {
+    let status: String
+    let decision: String?
+    let rationale: String?
+    let reason: String?
+    let reviewId: String?
+    let toolName: String?
+    let createdAtMs: Int64?
 }
 
 struct OperationalStatus: Decodable, Sendable {

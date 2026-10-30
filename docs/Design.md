@@ -6,6 +6,10 @@
 
 The existing floating glass window and inset icon rail remain the visual foundation. Every page now uses a shared family of restrained frosted widgets: 22-point corners, 20-point content padding, 16-point page spacing, quiet outline symbols, and rounded numeric typography. Native clear glass remains on navigation and controls; translucent material keeps data widgets readable over the window backdrop.
 
+Prism opens with two matching glass choices: Single SOL Trader and Agent Swarm. The swarm retains the five-section rail. The single trader opens a separate, rail-free workspace centered on SOLUSDT, followed by account metrics, an explicitly labeled paper ledger, and the trader's latest output. The grid control returns to the chooser. Both workspaces share appearance settings. Opening a workspace changes navigation; selecting its runtime mode is a separate explicit action, available while paused and subject to the existing flat-position checks.
+
+The SOL chart displays up to 120 actual one-minute SOLUSDT linear OHLC candles from the runtime market-data service or its persisted history. Monochrome frosted bodies use filled and hollow treatment to distinguish direction, with thin wicks on an inset glass surface. The wider price and time viewport keeps price action and individual candles compact while the chart frame remains the same size; the current forming candle stays visually lighter. Venue environments remain isolated, and the chart stays empty until real candle history is available. Account trading P&L and API costs stay separate. Pending SOL execution eligibility is shown independently from mode selection. Start can enable observation while eligibility is pending; backend execution approvals remain authoritative, and Pause stays visible in the header.
+
 Results, agent roles, performance and estimated running costs take priority. Details such as role manuals, source versions, operational journals, and failure reasons stay reachable through disclosure controls. There is no decorative animation or saturated dashboard background.
 
 ## Dimensions and behavior
@@ -59,7 +63,7 @@ Xcode previews show the SwiftUI composition. Judge desktop refraction in the run
 
 ## Operational boundaries
 
-Keep Overview as the resting state. Cost labels distinguish today’s estimated model spend, reported research totals, and operation component budgets. Missing figures remain unavailable; costs are not allocated to individual agents without reported data. Historical returns are development evidence and remain separate from prospective qualification.
+Keep the workspace chooser as the launch state, with Overview as the swarm's resting state. Cost labels distinguish today’s estimated model spend, reported research totals, and operation component budgets. Missing figures remain unavailable; costs are not allocated to individual agents without reported data. Historical returns are development evidence and remain separate from prospective qualification.
 
 Operational pages show actual backend state, failed experiments, role outputs, market observations, and ledger-derived simulated P&L. Detailed findings stay behind disclosure controls. Offline state is explicit; previous snapshots are identified as stale.
 
@@ -71,4 +75,4 @@ Validate window dragging/resizing on the actual Mac, keyboard focus, VoiceOver, 
 
 ## Offline layout checks
 
-`scripts/check-ui-rendering.sh` builds a separate fixture renderer with an inert runtime client. It excludes the production app and client, so it cannot start the installed service, read control credentials, or call a provider. It renders the six pages at 840 × 560 and 600 × 420 in both appearances, plus empty offline states. Outputs go to `/tmp/prism-ui-redesign/`. These images check content layout; desktop refraction still requires an explicitly authorized running-app check.
+`scripts/check-ui-rendering.sh` builds a separate fixture renderer with an inert runtime client. It excludes the production app and client, so it cannot start the installed service, read control credentials, or call a provider. It renders the chooser, both workspaces and six swarm pages at 840 × 560 and 600 × 420 in both appearances, plus offline, single-candle, mode-mismatch and eligibility-pending states. Outputs go to `/tmp/prism-ui-redesign/`. `scripts/check-workspace-contract.sh` verifies workspace matching and bounded OHLC candle validation entirely offline. These images check content layout; desktop refraction still requires an explicitly authorized running-app check.

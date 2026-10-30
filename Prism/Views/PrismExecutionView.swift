@@ -6,14 +6,45 @@ struct PrismExecutionView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            if let mode = runtime.state?.tradingMode, mode.isSolPerpetual {
+                ConsoleCard("SOL Perpetual account", caption: "Bybit account · today") {
+                    HStack(spacing: 8) {
+                        Text("SOLUSDT perpetual")
+                            .font(.system(size: 13, weight: .medium))
+                        Spacer(minLength: 4)
+                        Text("1m · \(mode.enabled == true ? "running" : "paused")")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                    ConsoleMetricGrid {
+                        ConsoleMetric(title: "Account equity", value: money(mode.accountEquity), detail: "Bybit")
+                        ConsoleMetric(title: "Trading P&L today", value: money(mode.tradingPnl), detail: PrismFormat.percent(mode.tradingReturn))
+                        ConsoleMetric(title: "Gross exposure", value: money(mode.grossExposure), detail: mode.maxPositionRiskFraction.map { "Stop risk up to \(PrismFormat.percent($0)) of equity" } ?? "Stop risk limit unavailable")
+                        ConsoleMetric(title: "Agent-selected leverage", value: leverage(mode.leverage), detail: "Venue ceiling · \(leverage(mode.venueMaxLeverage))")
+                        ConsoleMetric(title: "API model costs · total", value: money(mode.apiSpentUsd), detail: "Reserved \(money(mode.apiReservedUsd))")
+                    }
+                    Text("Trading P&L includes fees and funding. API model costs are excluded and shown separately.")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             if let operations = runtime.state?.operations {
                 PrismOperationsView(operations: operations)
             }
-            PrismPortfolioView(runtime: runtime)
+            if runtime.state?.tradingMode?.isSolPerpetual != true {
+                PrismPortfolioView(runtime: runtime)
+            }
             DisclosureGroup("Activity", isExpanded: $activityExpanded) {
                 PrismActivityView(runtime: runtime).padding(.top, 10)
             }
         }
+    }
+
+    private func money(_ value: Double?) -> String {
+        value.map { PrismFormat.money($0) } ?? "—"
+    }
+
+    private func leverage(_ value: Double?) -> String {
+        value.map { String(format: "%.2fx", $0) } ?? "Unavailable"
     }
 }
 

@@ -831,7 +831,8 @@ class ResearchMemory:
             'application': json.loads(row['application']) if row['application'] else None,
         }
 
-    def scan_triggers(self, strategy_or_experiment_id=None, *, thresholds=None, task='review', evidence_ids=None, include_elapsed=True):
+    def scan_triggers(self, strategy_or_experiment_id=None, *, thresholds=None, task='review', evidence_ids=None, include_elapsed=True,
+                      exclude_execution_mode=None):
         """Discover reviews from registry state, captured sessions, risk, and raw evidence."""
         limits = self._thresholds(thresholds)
         if strategy_or_experiment_id:
@@ -848,6 +849,8 @@ class ResearchMemory:
         for experiment_id in candidates:
             experiment = self.store.experiment(experiment_id)
             if not experiment:
+                continue
+            if exclude_execution_mode and (experiment['policy'].get('execution_identity') or {}).get('mode') == exclude_execution_mode:
                 continue
             spec = experiment['spec']
             context = experiment.get('context') or {}
@@ -996,14 +999,17 @@ class ResearchMemory:
                     material={'evidence': material, 'target_symbol': symbol}, thresholds=limits))
         return queued
 
-    def claim_review(self):
+    def claim_review(self, *, exclude_execution_mode=None):
         """Atomically claim the highest-priority queued review, if any."""
         now = self._now()
         with self.store.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute("SELECT id FROM research_memory_reviews WHERE status='queued' OR "
-                             "(status='deferred' AND json_extract(request,'$.retry_at')<=?) "
-                             'ORDER BY priority DESC,created_at,id LIMIT 1', (now,)).fetchone()
+            query = "SELECT id FROM research_memory_reviews WHERE (status='queued' OR (status='deferred' AND json_extract(request,'$.retry_at')<=?))"
+            params = [now]
+            if exclude_execution_mode:
+                query += " AND experiment_id NOT IN (SELECT id FROM experiments WHERE json_extract(policy,'$.execution_identity.mode')=?)"
+                params.append(exclude_execution_mode)
+            row = db.execute(query + ' ORDER BY priority DESC,created_at,id LIMIT 1', params).fetchone()
             if row is None:
                 return None
             db.execute("UPDATE research_memory_reviews SET status='claimed',claimed_at=? WHERE id=? AND status IN ('queued','deferred')",

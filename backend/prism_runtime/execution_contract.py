@@ -37,3 +37,11 @@ EXECUTION_TOOLS = [
     _tool('hold', 'Record a hold or refusal with its reason; deterministic protective controls remain active.',
           {'strategy_id': ID, 'rationale': REASON}),
 ]
+
+# Only the dedicated SOL mode receives this account mutation tool. Research
+# retains its existing tool surface and operator-selected leverage envelope.
+SOL_EXECUTION_TOOLS = [*EXECUTION_TOOLS,
+    _tool('set_leverage', 'Choose leverage for the exact SOLUSDT linear instrument while flat. Host eligibility, live permissions, venue limits and readback verification are mandatory.',
+          {'strategy_id': ID, 'snapshot_id': ID, 'leverage': {'type': 'number', 'minimum': 1},
+           'expires_at_ms': EXPIRY, 'rationale': REASON}),
+]

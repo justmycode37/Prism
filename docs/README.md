@@ -6,6 +6,7 @@ Use the root [README](../README.md) for the project summary and first commands. 
 
 - [Runtime](Runtime.md): install and control the local service, configure daily-equity v1 research, and understand its data, paper policy, storage, and credentials.
 - [Continuous runtime](ContinuousRuntime.md): event-driven worker lanes, source-backed scheduling, durable research memory, Bybit identity, execution controls, credentials, and offline cost measurements.
+- [SOL Perpetual mode](SOLPerpetualMode.md): in-app mode selection, Sol xhigh one-minute execution, Luna max support, separate trading performance, and guarded agent leverage choices.
 - [Scheduling](Scheduling.md): durable task contracts, timezone-aware source calendars, explicit coverage, and deterministic fallback behavior.
 - [Operational costs](OperationalCosts.json): generated offline request-size, component-cap, and workload estimates.
 - [Safe operator configuration](../examples/operator-config.json) and [historical calendar fixture](../examples/calendar.json): disabled defaults and a visibly expired synthetic schema example.

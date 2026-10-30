@@ -6,8 +6,12 @@ import statistics
 from .analytics import _sign_test
 
 
-def forward_report(observations, config=None):
+def forward_report(observations, config=None, *, performance_basis=None):
     settings = (config or {}).get('research', config or {})
+    if performance_basis is None:
+        performance_basis = settings.get('performance_basis', 'operating')
+    if not isinstance(performance_basis, str) or performance_basis not in {'operating', 'trading'}:
+        raise ValueError('Unsupported performance basis')
     minimum = max(60, settings.get('min_forward_sessions', 60))
     minimum_trades = max(8, settings.get('min_forward_trades', 8))
     block = max(5, settings.get('forward_block_sessions', 5))
@@ -16,6 +20,8 @@ def forward_report(observations, config=None):
     alpha = min(.05, settings.get('alpha_budget', .05))
     result = {'status': 'inconclusive', 'sessions': len(observations), 'reasons': [],
               'net_return': None, 'excess_return': None, 'operating_pnl_usd': None,
+              'trading_pnl_usd': None, 'operating_cost_usd': None,
+              'performance_basis': performance_basis,
               'assumptions': 'Disjoint block signs must be approximately independent and stationary. No profit probability is reported.'}
     if not observations:
         result['reasons'] = ['Awaiting registered future sessions']
@@ -26,7 +32,7 @@ def forward_report(observations, config=None):
     if any(not row.get('valuation_complete', False) for row in observations):
         result['reasons'] = ['Incomplete valuations cannot support promotion']
         return result
-    if any(row.get('source_cost_complete') is False for row in observations):
+    if performance_basis == 'operating' and any(row.get('source_cost_complete') is False for row in observations):
         result['reasons'] = ['Imported source costs are incomplete; promotion requires known operating costs']
         return result
     dates = [row.get('session_ms', 0) for row in observations]
@@ -35,9 +41,9 @@ def forward_report(observations, config=None):
     initial = observations[0].get('initial_equity', 100000.)
     if not isinstance(initial, (int,float)) or isinstance(initial,bool) or not math.isfinite(initial) or initial <= 0:
         raise ValueError('Positive forward capital required')
-    previous, peak, drawdown, costs = initial, initial, 0., 0.
+    previous, operating_previous, peak, drawdown, costs = initial, initial, initial, 0., 0.
     net_returns = []
-    operating_curve = []
+    insolvent = False
     baseline_returns = {name: [] for name in ('benchmark_return','market_return','sector_return')}
     missing = set()
     previous_trade_count = 0
@@ -61,14 +67,22 @@ def forward_report(observations, config=None):
             raise ValueError('Forward capital basis cannot change within an experiment')
         costs += daily_cost
         operating = equity-costs
-        if operating <= 0:
-            result.update(status='retired', reasons=['Operating capital exhausted'])
-            return result
-        net_returns.append(operating/previous-1)
-        previous = operating
-        operating_curve.append(operating)
-        peak = max(peak,operating)
-        drawdown = max(drawdown,1-operating/peak)
+        if operating <= 0 and not insolvent:
+            insolvent = True
+            if performance_basis == 'operating':
+                result.update(status='retired', reasons=['Operating capital exhausted'],
+                              trading_pnl_usd=equity-initial,
+                              operating_pnl_usd=operating-initial, operating_cost_usd=costs)
+                return result
+        metric_equity = equity if performance_basis == 'trading' else operating
+        metric_previous = previous if performance_basis == 'trading' else operating_previous
+        net_returns.append(metric_equity/metric_previous-1)
+        if performance_basis == 'trading':
+            previous = equity
+        else:
+            operating_previous = operating
+        peak = max(peak, metric_equity)
+        drawdown = max(drawdown,1-metric_equity/peak)
         for name in baseline_returns:
             value = row.get(name)
             if not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or value <= -1:
@@ -79,8 +93,11 @@ def forward_report(observations, config=None):
     benchmark_wealth = {name: math.prod(1+r for r in values) for name,values in baseline_returns.items()}
     if any(not math.isfinite(value) for value in benchmark_wealth.values()):
         raise ValueError('Benchmark compounding exceeds finite accounting bounds')
-    total = previous/initial-1
-    result.update(net_return=total, operating_pnl_usd=previous-initial, trading_pnl_usd=observations[-1]['equity']-initial,
+    final_trading_equity = observations[-1]['equity']
+    final_operating_equity = final_trading_equity-costs
+    final_metric_equity = final_trading_equity if performance_basis == 'trading' else final_operating_equity
+    total = final_metric_equity/initial-1
+    result.update(net_return=total, operating_pnl_usd=final_operating_equity-initial, trading_pnl_usd=final_trading_equity-initial,
         operating_cost_usd=costs, max_drawdown=drawdown, volatility=statistics.stdev(net_returns) if len(net_returns)>1 else 0.,
         completed_trades=observations[-1].get('completed_trades',0), missing_baselines=sorted(missing),
         excess_return=None if 'benchmark_return' in missing else total-(benchmark_wealth['benchmark_return']-1),
@@ -109,7 +126,7 @@ def forward_report(observations, config=None):
         if count < min_blocks or abs(correlation) > .5 or p > threshold:
             reasons.append('Insufficient independent search-adjusted excess-return evidence versus '+name)
     if total <= 0 or any(total-(value-1) <= settings.get('min_excess_return',0.) for value in benchmark_wealth.values()):
-        reasons.append('Operating return must be positive and exceed every declared benchmark')
+        reasons.append(('Trading' if performance_basis == 'trading' else 'Operating') + ' return must be positive and exceed every declared benchmark')
     result.update(reasons=list(dict.fromkeys(reasons)), statistics=statistics_by_benchmark,
                   review_number=look, alpha_budget=alpha, per_comparison_threshold=threshold,
                   status='inconclusive' if reasons else 'promoted')

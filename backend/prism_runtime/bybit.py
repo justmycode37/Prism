@@ -485,6 +485,12 @@ class BybitAdapter:
             "verified_at_ms": self._now_ms(),
             "raw": match,
         }
+        leverage_filter = match.get("leverageFilter", {})
+        if isinstance(leverage_filter, dict):
+            if leverage_filter.get("minLeverage") not in (None, ""):
+                normalized["min_leverage"] = leverage_filter["minLeverage"]
+            if leverage_filter.get("leverageStep") not in (None, ""):
+                normalized["leverage_step"] = leverage_filter["leverageStep"]
         if normalized["status"] != "Trading":
             raise ValueError(f"Bybit instrument status is {normalized['status']!r}; only Trading instruments are accepted")
         if normalized['market_region']:
@@ -1301,6 +1307,96 @@ class BybitAdapter:
         if indices != {0}:
             raise BybitError("Only verified one-way linear position mode is supported")
         return True
+
+    def set_leverage(self, category, symbol, leverage):
+        """Set exact linear leverage only while the instrument is reconciled flat.
+
+        The exchange acknowledgment is never treated as proof: the resulting
+        one-way flat position row is read back and checked before success.
+        """
+        if category != 'linear':
+            raise ValueError('Leverage changes are supported only for linear contracts')
+        self._check_category_symbol(category, symbol)
+        self._check_instrument_allowlist(category, symbol)
+        if self.config.get('enabled') is not True or self.live_config.get('enabled') is not True:
+            raise BybitError('Leverage changes require explicitly enabled Bybit and live execution settings')
+        self._guard_environment()
+        self._verify_account_identity(category='linear', write=True, position=True)
+
+        info = self.refresh_metadata('linear', symbol)
+        if len(str(leverage)) > 64:
+            raise ValueError('Leverage precision is outside the supported bound')
+        requested = _number(leverage, 'leverage')
+        if requested.as_tuple().exponent < -12:
+            raise ValueError('Leverage precision is outside the supported bound')
+        maximum = _number(info.get('max_leverage'), 'venue maximum leverage', positive=True)
+        minimum = _number(info.get('min_leverage', '1'), 'venue minimum leverage', positive=True)
+        step_value = info.get('leverage_step')
+        step = _number(step_value, 'venue leverage step', positive=True) if step_value not in (None, '') else None
+        if requested < max(Decimal('1'), minimum) or requested > maximum:
+            raise ValueError('Leverage is outside the exact instrument metadata limits')
+        if step is not None and (requested - minimum) % step != 0:
+            raise ValueError('Leverage does not match the venue leverage step')
+
+        # Reconcile existing exchange state first. This recovers ambiguous local
+        # orders and includes orders created outside Prism in the direct query.
+        self._reconcile_trades_and_orders()
+        active_local = {'unknown', 'submitting', 'cancel_pending', 'acknowledged', 'open', 'partially_filled'}
+        if any(row['status'] in active_local for row in self.orders(category='linear', symbol=symbol, limit=5000)):
+            raise BybitError('Unresolved local linear orders prevent leverage changes')
+
+        # No orderFilter includes active and conditional futures orders, while
+        # avoiding Spot-only filter values on a linear request. Any nonempty or
+        # incomplete open-only result prevents a leverage mutation.
+        result = self._request('GET', '/v5/order/realtime', params={
+            'category': 'linear', 'symbol': symbol, 'openOnly': 0, 'limit': 50,
+        }, private=self.mode != 'paper')
+        if not isinstance(result.get('list'), list) or result['list'] or result.get('nextPageCursor'):
+            raise BybitError('Exchange open orders or incomplete order coverage prevent leverage changes')
+
+        self._assert_linear_one_way(symbol)
+        before = self._request('GET', '/v5/position/list',
+            params={'category': 'linear', 'symbol': symbol}, private=self.mode != 'paper')
+        rows = [row for row in before.get('list', []) if isinstance(row, dict)]
+        if not rows or any(row.get('symbol') != symbol or int(row.get('positionIdx', -1)) != 0 for row in rows):
+            raise BybitError('Exact one-way linear position state could not be verified')
+        if any(_number(row.get('size', '0'), 'linear position size') != 0 for row in rows):
+            raise BybitError('Close the exact linear position before changing leverage')
+        flat = next((row for row in rows if int(row.get('positionIdx', -1)) == 0), None)
+        if flat is None or flat.get('leverage') in (None, ''):
+            raise BybitError('Current linear leverage could not be read from the exchange')
+        current = _number(flat['leverage'], 'current linear leverage', positive=True)
+        if current == requested:
+            return {'status': 'verified', 'leverage': float(requested), 'venue_max_leverage': float(maximum),
+                    'symbol': symbol, 'category': 'linear', 'verification': {'source': 'position_list',
+                    'position_idx': 0, 'size': 0, 'changed': False}}
+
+        payload = {'category': 'linear', 'symbol': symbol,
+                   'buyLeverage': _decimal_string(requested), 'sellLeverage': _decimal_string(requested)}
+        try:
+            self._request('POST', '/v5/position/set-leverage', payload=payload, private=self.mode != 'paper')
+        except BybitAPIError:
+            raise BybitError('Bybit rejected the leverage update; no retry was attempted') from None
+        except Exception:
+            # Never blindly retry a mutation whose transport outcome is unclear.
+            raise BybitError('Leverage update outcome is uncertain; read back state before retrying') from None
+
+        try:
+            after = self._request('GET', '/v5/position/list',
+                params={'category': 'linear', 'symbol': symbol}, private=self.mode != 'paper')
+        except Exception:
+            raise BybitError('Leverage update was sent but exchange readback failed; state is unverified') from None
+        verified_rows = [row for row in after.get('list', []) if isinstance(row, dict)]
+        actual = next((row for row in verified_rows if int(row.get('positionIdx', -1)) == 0), None)
+        verified = (len(verified_rows) > 0 and all(row.get('symbol') == symbol and int(row.get('positionIdx', -1)) == 0 for row in verified_rows)
+                    and all(_number(row.get('size', '0'), 'linear position size') == 0 for row in verified_rows)
+                    and actual is not None and actual.get('leverage') not in (None, '')
+                    and _number(actual['leverage'], 'verified linear leverage', positive=True) == requested)
+        if not verified:
+            raise BybitError('Leverage mutation was not verified by the exact flat position readback')
+        return {'status': 'verified', 'leverage': float(requested), 'venue_max_leverage': float(maximum),
+                'symbol': symbol, 'category': 'linear', 'verification': {'source': 'position_list',
+                'position_idx': 0, 'size': 0, 'changed': True}}
 
     def reconcile_order(self, order_link_id):
         """Reconcile one durable order by the same link ID after timeout/restart."""

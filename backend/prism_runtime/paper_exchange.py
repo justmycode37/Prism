@@ -11,6 +11,7 @@ import copy
 import json
 import math
 import threading
+from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl, urlsplit
 
 from .domain import identity
@@ -29,10 +30,12 @@ class PaperExchange:
         if store.get_document(self._key) is None:
             store.set_document(self._key, {'cash': initial_equity, 'initial_equity': initial_equity,
                 'orders': {}, 'executions': [], 'transactions': [], 'positions': {},
-                'quotes': {}, 'quote_ids': {}, 'counter': 0})
+                'quotes': {}, 'quote_ids': {}, 'leverages': {}, 'counter': 0})
 
     def _load(self):
-        return self.store.get_document(self._key)
+        state = self.store.get_document(self._key)
+        state.setdefault('leverages', {})
+        return state
 
     def _save(self, state):
         self.store.set_document(self._key, state)
@@ -114,15 +117,41 @@ class PaperExchange:
             if path == '/v5/account/wallet-balance':
                 return self._ok({'list': [self._wallet(state)]})
             if path == '/v5/position/symbol-info':
+                leverage = state['leverages'].get('linear:' + args['symbol'], '1')
                 return self._ok({'list': [{'symbol': args['symbol'], 'positionIdx': 0,
-                                          'leverage': '1', 'side': 'Buy'}]})
+                                          'leverage': str(leverage), 'side': 'Buy'}]})
             if path == '/v5/position/list':
                 rows = [self._position(state, p) for p in state['positions'].values() if p['category'] == 'linear']
                 if args.get('symbol') and not any(x['symbol'] == args['symbol'] for x in rows):
                     rows.append({'symbol': args['symbol'], 'side': '', 'positionIdx': 0, 'size': '0',
                                  'avgPrice': '0', 'markPrice': '0', 'unrealisedPnl': '0',
-                                 'leverage': '1', 'stopLoss': '', 'liqPrice': ''})
+                                 'leverage': str(state['leverages'].get('linear:' + args['symbol'], '1')),
+                                 'stopLoss': '', 'liqPrice': ''})
                 return self._page(self._filter(rows, args, ('symbol',)), args)
+            if path == '/v5/position/set-leverage' and method == 'POST':
+                if args.get('category') != 'linear' or not isinstance(args.get('symbol'), str):
+                    return self._ok(code=10001, message='Paper leverage is linear-only')
+                try:
+                    if max(len(str(args.get('buyLeverage', ''))), len(str(args.get('sellLeverage', '')))) > 64:
+                        return self._ok(code=10001, message='Paper leverage precision is outside the supported bound')
+                    buy, sell = Decimal(str(args['buyLeverage'])), Decimal(str(args['sellLeverage']))
+                except (KeyError, InvalidOperation, ValueError):
+                    return self._ok(code=10001, message='Invalid paper leverage')
+                if (not buy.is_finite() or not sell.is_finite() or buy < 1 or buy != sell
+                        or buy.as_tuple().exponent < -12 or sell.as_tuple().exponent < -12):
+                    return self._ok(code=10001, message='Paper leverage must be finite, paired, and at least 1x')
+                symbol = args['symbol']
+                position = state['positions'].get('linear:' + symbol)
+                if position and position.get('quantity', 0) > 0:
+                    return self._ok(code=110043, message='Close paper position before leverage change')
+                active = {'Created', 'New', 'PartiallyFilled', 'Untriggered', 'Triggered'}
+                if any(row.get('category') == 'linear' and row.get('symbol') == symbol
+                       and row.get('orderStatus') in active for row in state['orders'].values()):
+                    return self._ok(code=110043, message='Cancel paper orders before leverage change')
+                state['leverages']['linear:' + symbol] = format(buy.normalize(), 'f')
+                self._save(state)
+                return self._ok({'buyLeverage': str(state['leverages']['linear:' + symbol]),
+                                 'sellLeverage': str(state['leverages']['linear:' + symbol])})
             if path == '/v5/position/trading-stop' and method == 'POST':
                 position = state['positions'].get('linear:' + args['symbol'])
                 if not position or not position['quantity']:
@@ -150,7 +179,8 @@ class PaperExchange:
         return {'symbol': position['symbol'], 'side': 'Buy', 'positionIdx': 0,
             'size': str(position['quantity']), 'avgPrice': str(position['entry_price']),
             'markPrice': str(mark), 'unrealisedPnl': str(position['quantity'] * (mark - position['entry_price'])),
-            'leverage': '1', 'stopLoss': str(position.get('stop_loss', 0)), 'liqPrice': ''}
+            'leverage': str(state.get('leverages', {}).get(key, '1')),
+            'stopLoss': str(position.get('stop_loss', 0)), 'liqPrice': ''}
 
     def _wallet(self, state):
         spot_value, linear_margin, upl, coins = 0., 0., 0., []
@@ -171,7 +201,8 @@ class PaperExchange:
                 coins.append({'coin': base, 'walletBalance': str(position['quantity']),
                               'equity': str(position['quantity']), 'usdValue': str(value), 'spotBorrow': '0'})
             else:
-                linear_margin += position['quantity'] * position['entry_price']
+                leverage = float(state.get('leverages', {}).get(key, '1'))
+                linear_margin += position['quantity'] * position['entry_price'] / leverage
                 upl += position['quantity'] * (mark - position['entry_price'])
         equity = state['cash'] + spot_value + upl
         return {'accountType': 'UNIFIED', 'totalEquity': str(equity),
@@ -240,7 +271,8 @@ class PaperExchange:
                         quantity = min(quantity, (position or {}).get('quantity', 0.))
                     else:
                         available = float(self._wallet(state)['totalAvailableBalance'])
-                        quantity = min(quantity, available / (price * (1 + self.fee)))
+                        leverage = float(state.get('leverages', {}).get(key, '1')) if category == 'linear' else 1.
+                        quantity = min(quantity, available / (price / leverage + price * self.fee))
                     if quantity > 1e-12:
                         execution = self._fill(state, order, quantity, price, now)
                         messages.append({'topic': 'execution', 'data': [execution]})

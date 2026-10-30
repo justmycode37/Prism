@@ -33,9 +33,9 @@ final class RuntimeClient: ObservableObject {
     @Published var selectedPage: PrismPage = .overview
     @Published var pnlSamples: [PaperPnlSample] = []
 
-    init(includeSnapshot: Bool) {
+    init(includeSnapshot: Bool, singleTraderFixture: Bool = false, solSampleCount: Int = 0) {
         if includeSnapshot {
-            let json = Self.fixture
+            let json = singleTraderFixture ? Self.singleTraderFixture(solSampleCount: solSampleCount) : Self.fixture
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             do {
@@ -54,6 +54,15 @@ final class RuntimeClient: ObservableObject {
                   snapshot.operations?.componentCosts.count ?? 0 >= 4 else {
                 fatalError("Offline fixture decoded but is missing representative visual content")
             }
+            if singleTraderFixture {
+                guard snapshot.tradingMode?.isSolPerpetual == true,
+                      snapshot.markets.contains(where: { $0.symbol == "SOLUSDT" }),
+                      snapshot.portfolio.positions.contains(where: { $0.symbol == "SOLUSDT" }),
+                      snapshot.portfolio.trades.contains(where: { $0.symbol == "SOLUSDT" }),
+                      snapshot.agents.contains(where: { $0.roleId == "sol_trader" }) else {
+                    fatalError("SOL trader fixture is missing its quote, paper activity, mode, or agent projection")
+                }
+            }
             isConnected = true
             errorMessage = nil
             pnlSamples = state?.portfolio.pnlSamples ?? []
@@ -63,8 +72,87 @@ final class RuntimeClient: ObservableObject {
     func monitor() async { /* Deliberately inert: never contacts the service. */ }
     func control(_ action: String) async { /* Test-only no-op. */ }
     func updateDailySpendCeiling(_ amount: Double?) async -> Bool { false }
+    func selectTradingMode(_ mode: String) async -> Bool { false }
 
-    private static let fixture = #"""
+    fileprivate static func singleTraderFixture(solSampleCount: Int) -> String {
+        let data = Data(fixture.utf8)
+        guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              var portfolio = root["portfolio"] as? [String: Any],
+              var positions = portfolio["positions"] as? [[String: Any]],
+              var trades = portfolio["trades"] as? [[String: Any]],
+              var agents = root["agents"] as? [[String: Any]],
+              var markets = root["markets"] as? [[String: Any]] else {
+            fatalError("Could not prepare local SOL trader rendering fixture")
+        }
+        root["trading_mode"] = [
+            "selected": "sol_perpetual", "trader_model": "offline-fixture",
+            "trader_reasoning_effort": "medium", "support_model": "offline-fixture",
+            "reviewer_model": "gpt-6-luna", "reviewer_reasoning_effort": "max", "trade_review_required": true,
+            "support_reasoning_effort": "low", "symbol": "SOLUSDT", "category": "linear",
+            "primary_timeframe": "5m", "continuous": true, "pnl_basis": "realized_plus_unrealized",
+            "lifetime_model_budget_usd": 12.0, "trading_pnl": 38.6, "trading_return": 0.0386,
+            "account_equity": 1_038.6, "gross_exposure": 720.0, "leverage": 0.72,
+            "leverage_policy": "capped", "venue_max_leverage": 20.0,
+            "max_position_risk_fraction": 0.02, "enabled": true,
+            "api_spent_usd": 1.18, "api_reserved_usd": 0.22, "pending": false
+        ]
+        positions.append(["symbol": "SOLUSDT", "side": "long", "quantity": 4.0,
+                          "entry_price": 174.25, "mark_price": 179.8, "unrealized_pnl": 22.2])
+        trades.append(["id": "sol-trade-1", "symbol": "SOLUSDT", "side": "buy", "quantity": 4.0,
+                       "price": 174.25, "timestamp": "2026-10-30T09:15:00Z", "realized_pnl": 16.4])
+        portfolio["positions"] = positions
+        portfolio["trades"] = trades
+        root["portfolio"] = portfolio
+        markets.append(["symbol": "SOLUSDT", "price": 179.8, "change_24h": 0.027,
+                        "funding_rate": 0.0001, "updated_at": "2026-10-30T10:00:00Z"])
+        root["markets"] = markets
+        if solSampleCount > 0 {
+            let candles = syntheticSOLCandles()
+            root["sol_chart"] = [
+                "symbol": "SOLUSDT", "category": "linear", "timeframe": "1",
+                "environment": "mainnet", "candles": Array(candles.suffix(min(solSampleCount, candles.count)))
+            ]
+        } else {
+            root.removeValue(forKey: "sol_chart")
+        }
+        agents.append(["id": "agent-sol-trader", "name": "SOL Perpetual Trader", "team": "Trading",
+                       "status": "working", "task": "Manage paper SOLUSDT position", "last_run_at": "2026-10-30T09:58:00Z",
+                       "summary": "Paper trader is monitoring the 5 minute SOLUSDT setup; no live orders are enabled.",
+                       "role_id": "sol_trader", "parent_id": "orchestrator", "kind": "worker",
+                       "mandate": "Trade SOL perpetuals in paper mode with bounded risk.", "model": "offline-fixture",
+                       "reasoning_effort": "medium"])
+        root["agents"] = agents
+        guard let encoded = try? JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]),
+              let json = String(data: encoded, encoding: .utf8) else {
+            fatalError("Could not encode local SOL trader rendering fixture")
+        }
+        return json
+    }
+
+    private static func syntheticSOLCandles() -> [[String: Any]] {
+        let formatter = ISO8601DateFormatter()
+        let quoteTime = formatter.date(from: "2026-10-30T10:00:00Z")!.timeIntervalSince1970 * 1_000
+        var previousClose = 178.65
+        return (0..<120).map { index in
+            let open = previousClose
+            var close = 179.0 + sin(Double(index) * 0.47) * 0.72 + cos(Double(index) * 0.21) * 0.28
+            if [9, 23, 37].contains(index) { close = open }
+            if index == 119 { close = 179.8 }
+            let upperWick = 0.08 + Double(index % 4) * 0.025
+            let lowerWick = 0.07 + Double(index % 3) * 0.03
+            let start = quoteTime - Double(120 - index) * 60_000
+            let candle: [String: Any] = [
+                "start_ms": Int64(start), "open": open,
+                "high": max(open, close) + upperWick,
+                "low": min(open, close) - lowerWick,
+                "close": close, "closed": index < 119
+            ]
+            previousClose = close
+            return candle
+        }
+    }
+
+    fileprivate static let fixture = #"""
     {
       "runtime": {"status":"running","mode":"paper","started_at":"2026-10-30T08:00:00Z","next_cycle_at":"2026-10-30T10:05:00Z","openai_configured":false,"last_error":null,"credentials_ready":false},
       "budget": {"daily_limit_usd":25,"spent_today_usd":2.45,"reserved_usd":0.8,"calls_today":8,"max_calls_per_day":120},
@@ -153,6 +241,7 @@ enum UIRenderingCheck {
                     do {
                         try render(page: page, appearance: appearance.1, colorScheme: appearance.2,
                                    size: NSSize(width: size.0, height: size.1), includeSnapshot: true,
+                                   initialWorkspace: .agentSwarm,
                                    destination: output.appendingPathComponent(name))
                         rendered += 1
                     } catch { failures.append("\(name): \(error)") }
@@ -162,10 +251,64 @@ enum UIRenderingCheck {
             do {
                 try render(page: page, appearance: .aqua, colorScheme: .light,
                            size: NSSize(width: 840, height: 560), includeSnapshot: false,
+                           initialWorkspace: .agentSwarm,
                            destination: output.appendingPathComponent(name))
                 rendered += 1
             } catch { failures.append("\(name): \(error)") }
         }
+        for appearance in [("light", NSAppearance.Name.aqua, ColorScheme.light), ("dark", NSAppearance.Name.darkAqua, ColorScheme.dark)] {
+            for size in [(840, 560, "large"), (600, 420, "minimum")] {
+                let name = "workspace-chooser-\(appearance.0)-\(size.2).png"
+                do {
+                    try render(appearance: appearance.1, colorScheme: appearance.2,
+                               size: NSSize(width: size.0, height: size.1), includeSnapshot: false,
+                               initialWorkspace: nil, destination: output.appendingPathComponent(name))
+                    rendered += 1
+                } catch { failures.append("\(name): \(error)") }
+                let traderName = "single-trader-\(appearance.0)-\(size.2).png"
+                do {
+                    try render(appearance: appearance.1, colorScheme: appearance.2,
+                               size: NSSize(width: size.0, height: size.1), includeSnapshot: true,
+                                   singleTraderFixture: true, solSampleCount: 120,
+                               initialWorkspace: .singleTrader, destination: output.appendingPathComponent(traderName))
+                    rendered += 1
+                } catch { failures.append("\(traderName): \(error)") }
+            }
+        }
+        for (name, snapshot, samples) in [("single-trader-offline-empty", false, 0),
+                                          ("single-trader-single-candle", true, 1),
+                                          ("single-trader-populated-chart", true, 120)] {
+            do {
+                try render(appearance: .aqua, colorScheme: .light, size: NSSize(width: 840, height: 560),
+                           includeSnapshot: snapshot, singleTraderFixture: snapshot, solSampleCount: samples,
+                           initialWorkspace: .singleTrader, destination: output.appendingPathComponent("\(name).png"))
+                rendered += 1
+            } catch { failures.append("\(name): \(error)") }
+        }
+        for (name, workspace, snapshot, traderFixture, pending, paused, page) in [
+            ("single-trader-offline-minimum", PrismWorkspace.singleTrader, false, false, false, false, PrismPage.overview),
+            ("single-trader-chart-absent", .singleTrader, true, true, false, false, .overview),
+            ("single-trader-mode-mismatch", .singleTrader, true, false, false, false, .overview),
+            ("single-trader-mode-selection", .singleTrader, true, false, false, true, .overview),
+            ("single-trader-eligibility-pending", .singleTrader, true, true, true, true, .overview),
+            ("single-trader-pause-pending", .singleTrader, true, true, true, false, .overview),
+            ("single-trader-settings", .singleTrader, true, true, false, false, .settings)
+        ] {
+            do {
+                try render(page: page, appearance: .darkAqua, colorScheme: .dark, size: NSSize(width: 600, height: 420),
+                           includeSnapshot: snapshot, singleTraderFixture: traderFixture, solSampleCount: traderFixture ? 120 : 0,
+                           initialWorkspace: workspace, eligibilityPending: pending, paused: paused,
+                           destination: output.appendingPathComponent("\(name).png"))
+                rendered += 1
+            } catch { failures.append("\(name): \(error)") }
+        }
+        do {
+            try render(appearance: .aqua, colorScheme: .light, size: NSSize(width: 600, height: 420),
+                       includeSnapshot: true, singleTraderFixture: true, solSampleCount: 120,
+                       initialWorkspace: .singleTrader, tradeReviewStatus: "rejected",
+                       destination: output.appendingPathComponent("single-trader-review-rejected.png"))
+            rendered += 1
+        } catch { failures.append("single-trader-review-rejected: \(error)") }
         print("Rendered \(rendered) screenshots in \(output.path)")
         if !failures.isEmpty {
             failures.forEach { print("FAIL: \($0)") }
@@ -175,13 +318,41 @@ enum UIRenderingCheck {
         files.forEach { print(output.appendingPathComponent($0).path) }
     }
 
-    private static func render(page: PrismPage, appearance: NSAppearance.Name, colorScheme: ColorScheme,
-                               size: NSSize, includeSnapshot: Bool, destination: URL) throws {
+    private static func render(page: PrismPage? = nil, appearance: NSAppearance.Name, colorScheme: ColorScheme,
+                               size: NSSize, includeSnapshot: Bool, singleTraderFixture: Bool = false,
+                               solSampleCount: Int = 0, initialWorkspace: PrismWorkspace?,
+                               eligibilityPending: Bool = false, paused: Bool = false,
+                               tradeReviewStatus: String? = nil, destination: URL) throws {
         NSApp.appearance = NSAppearance(named: appearance)
-        let runtime = RuntimeClient(includeSnapshot: includeSnapshot)
-        runtime.selectedPage = page
+        let runtime = RuntimeClient(includeSnapshot: includeSnapshot, singleTraderFixture: singleTraderFixture,
+                                    solSampleCount: solSampleCount)
+        if includeSnapshot && (eligibilityPending || paused || tradeReviewStatus != nil) {
+            let json = singleTraderFixture ? RuntimeClient.singleTraderFixture(solSampleCount: solSampleCount) : RuntimeClient.fixture
+            var object = try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+            if paused {
+                var status = object["runtime"] as! [String: Any]
+                status["status"] = "paused"
+                object["runtime"] = status
+            }
+            if var mode = object["trading_mode"] as? [String: Any] {
+                mode["pending"] = eligibilityPending
+                mode["enabled"] = !paused
+                if eligibilityPending { mode["unsupported_reason"] = "Synthetic fixture: qualified strategy and account approvals pending." }
+                if let tradeReviewStatus {
+                    mode["latest_trade_review"] = ["status": tradeReviewStatus, "decision": "reject",
+                        "rationale": "Offline fixture: the proposed trade has expired.",
+                        "review_id": "fixture-review", "tool_name": "submit_order_intent",
+                        "created_at_ms": 1_793_347_200_000] as [String: Any]
+                }
+                object["trading_mode"] = mode
+            }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            runtime.state = try decoder.decode(RuntimeState.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        if let page { runtime.selectedPage = page }
         let preferences = AppearancePreferences()
-        let root = PrismHomeView(runtime: runtime, preferences: preferences)
+        let root = PrismHomeView(runtime: runtime, preferences: preferences, initialWorkspace: initialWorkspace)
             .frame(width: size.width, height: size.height)
             .environment(\.colorScheme, colorScheme)
         let host = NSHostingView(rootView: root)
@@ -198,6 +369,9 @@ enum UIRenderingCheck {
         host.cacheDisplay(in: host.bounds, to: bitmap)
         guard let data = bitmap.representation(using: .png, properties: [:]) else {
             throw NSError(domain: "UIRenderingCheck", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not encode PNG"])
+        }
+        guard data.starts(with: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) else {
+            throw NSError(domain: "UIRenderingCheck", code: 2, userInfo: [NSLocalizedDescriptionKey: "Encoded screenshot has an invalid PNG signature"])
         }
         try data.write(to: destination)
     }

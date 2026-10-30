@@ -170,12 +170,12 @@ struct PrismOverviewView: View {
                     Task { await runtime.control(agentsAreRunning ? "pause" : "start_all") }
                 } label: {
                     Label(agentsAreRunning ? "Stop" : "Start", systemImage: agentsAreRunning ? "pause" : "play")
-                        .font(.system(size: 12, weight: .medium)).frame(minWidth: 82, minHeight: 36)
+                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.primary).frame(minWidth: 82, minHeight: 36)
                 }
                 .buttonStyle(.plain).glassEffect(.clear.interactive(), in: .capsule)
                 .help(agentsAreRunning ? "Stop all agents" : "Start all agents")
                 .accessibilityLabel(agentsAreRunning ? "Stop all agents" : "Start all agents")
-                .disabled(!runtime.isConnected || runtime.isBusy)
+                .disabled(!runtime.isConnected || runtime.isBusy || !PrismWorkspace.agentSwarm.matches(selectedMode: runtime.state?.tradingMode?.selected))
             }
             if let issue = runtime.state?.runtime.lastError, !issue.isEmpty {
                 Text(issue).font(.system(size: 11)).foregroundStyle(.orange).textSelection(.enabled)

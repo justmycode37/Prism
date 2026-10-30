@@ -1,0 +1,10 @@
+{
+  "trading_mode": {
+    "selected": "sol_perpetual",
+    "swarm_size": 4,
+    "support_timeout_seconds": 15,
+    "support_max_age_seconds": 45,
+    "lifetime_model_budget_usd": 400.0,
+    "max_position_risk_fraction": 0.01
+  }
+}

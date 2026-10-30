@@ -19,7 +19,7 @@ class EventBus:
             db.execute("UPDATE attention_events SET status='pending' WHERE status='working'")
 
     def publish(self, kind, target, payload, *, key=None, priority=50, delay=0):
-        if kind not in {'market_observation', 'candle_closed', 'intrabar', 'signal', 'fill', 'order', 'position', 'risk', 'scheduled_event', 'decision_deadline', 'data_health', 'review', 'discovery'}:
+        if kind not in {'market_observation', 'support', 'candle_closed', 'intrabar', 'signal', 'fill', 'order', 'position', 'risk', 'scheduled_event', 'decision_deadline', 'data_health', 'review', 'discovery'}:
             raise ValueError('Unsupported attention event')
         ident = key or identity([kind, target, payload])
         now = self.clock()

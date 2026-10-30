@@ -94,9 +94,21 @@ leaderboard['rows'][0].update(test_start='2025-01-01', test_end='2025-12-31')
 (root / 'leaderboard.json').write_text(json.dumps(leaderboard, allow_nan=False))
 runtime.shutdown()
 store.close()
+sol_store = Store(root / 'sol.sqlite3')
+sol_runtime = Runtime(sol_store, key_loader=lambda: None)
+sol_runtime.update_configuration({'trading_mode': {'selected': 'sol_perpetual'}})
+sol_store.set_document('live_execution_state', {'account': {
+    'equity': 102., 'daily_pnl': 2., 'daily_pnl_verified': True,
+    'daily_baseline_equity': 100., 'portfolio_notional': 20., 'leverage': 5.,
+    'reconciliation_required': False,
+}})
+(root / 'sol-state.json').write_text(json.dumps(sol_runtime.state(), allow_nan=False))
+sol_runtime.shutdown()
+sol_store.close()
 PY
 swiftc -module-cache-path "$contract_dir/module-cache" \
     "$repo_root/Prism/Models/RuntimeState.swift" \
+    "$repo_root/Prism/Models/PrismWorkspace.swift" \
     "$repo_root/Tests/RuntimeContractCheck.swift" \
     -o "$contract_dir/check"
-"$contract_dir/check" "$contract_dir/state.json" "$contract_dir/leaderboard.json"
+"$contract_dir/check" "$contract_dir/state.json" "$contract_dir/leaderboard.json" "$contract_dir/sol-state.json"

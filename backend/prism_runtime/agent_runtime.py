@@ -14,6 +14,7 @@ from pathlib import Path
 from .domain import identity, timestamp
 from .provider import ModelProvider, ProviderError, _validate
 from .store import BudgetExceeded, encoded
+from .trading_modes import is_sol_mode, mode_settings, resource_limits
 
 
 DEFAULT_RESOURCES = {
@@ -21,6 +22,8 @@ DEFAULT_RESOURCES = {
     'discovery': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium', 'daily_calls': 96, 'daily_usd': 100., 'concurrency': 4, 'max_output_tokens': 8192},
     'review': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium', 'daily_calls': 32, 'daily_usd': 40., 'concurrency': 1, 'max_output_tokens': 8192},
     'execution': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'high', 'daily_calls': 240, 'daily_usd': 150., 'concurrency': 1, 'max_output_tokens': 4096},
+    'support': {'model': 'gpt-6-luna', 'reasoning_effort': 'max', 'daily_calls': 10000, 'daily_usd': 400., 'concurrency': 4, 'max_output_tokens': 4096},
+    'trade_review': {'model': 'gpt-6-luna', 'reasoning_effort': 'max', 'daily_calls': 5760, 'daily_usd': 400., 'concurrency': 1, 'max_output_tokens': 2048},
 }
 
 
@@ -29,9 +32,21 @@ class ComponentBudget:
         self.store, self.clock = store, clock or time.time
         with store.connection() as db:
             db.execute('CREATE TABLE IF NOT EXISTS component_calls (call_id TEXT PRIMARY KEY, component TEXT NOT NULL, task_id TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS trading_mode_calls (call_id TEXT PRIMARY KEY, mode TEXT NOT NULL)')
 
     def limits(self, component):
-        return {**DEFAULT_RESOURCES[component], **self.store.config().get('resources', {}).get(component, {})}
+        config = self.store.config()
+        return resource_limits(config, component,
+            {**DEFAULT_RESOURCES[component], **config.get('resources', {}).get(component, {})})
+
+    def mode_budget(self):
+        with self.store.connection() as db:
+            row = db.execute("""SELECT COALESCE(SUM(c.charged),0) spent,
+                COALESCE(SUM(CASE WHEN c.status='reserved' THEN c.reserved ELSE 0 END),0) reserved
+                FROM trading_mode_calls m JOIN cascade_calls c ON c.id=m.call_id
+                WHERE m.mode='sol_perpetual'""").fetchone()
+        return {'spent_usd': row['spent'], 'reserved_usd': row['reserved'],
+                'limit_usd': mode_settings(self.store.config())['lifetime_model_budget_usd']}
 
     def state(self):
         day = timestamp(self.clock())[:10]
@@ -44,12 +59,17 @@ class ComponentBudget:
                 WHERE a.day=? GROUP BY c.component''', (day,)).fetchall()
         found = {r['component']: dict(r) for r in rows}
         return {name: {**self.limits(name), **found.get(name, {'calls': 0, 'spent': 0., 'reserved': 0., 'running': 0})}
-                for name in DEFAULT_RESOURCES}
+                for name in DEFAULT_RESOURCES if name not in {'support', 'trade_review'} or is_sol_mode(self.store.config())}
 
     def available(self, component):
+        if component in {'support', 'trade_review'} and not is_sol_mode(self.store.config()):
+            return False
         row = self.state()[component]
         global_budget = self.store.budget(self.clock())
-        return (row['calls'] < row['daily_calls'] and row['spent'] + row['reserved'] < row['daily_usd']
+        lifetime = self.mode_budget()
+        mode_available = (not is_sol_mode(self.store.config()) or
+                          lifetime['spent_usd'] + lifetime['reserved_usd'] < lifetime['limit_usd'])
+        return (mode_available and row['calls'] < row['daily_calls'] and row['spent'] + row['reserved'] < row['daily_usd']
                 and (global_budget['max_calls_per_day'] is None or global_budget['calls_today'] < global_budget['max_calls_per_day'])
                 and (global_budget['daily_limit_usd'] is None or global_budget['spent_today_usd'] + global_budget['reserved_usd'] < global_budget['daily_limit_usd']))
 
@@ -57,9 +77,16 @@ class ComponentBudget:
         # Store's reentrant lock makes per-component and global reservation one
         # serial operation, including calls from the legacy discovery workers.
         with self.store._lock:
+            if component in {'support', 'trade_review'} and not is_sol_mode(self.store.config()):
+                raise BudgetExceeded('SOL-only agent component is inactive in Research mode')
             row = self.state()[component]
             rates = self.store.config()['model_prices'][model]
             amount = ((input_bytes + 12000) * rates['input'] + output_tokens * rates['output']) / 1_000_000
+            selected = is_sol_mode(self.store.config())
+            if selected:
+                lifetime = self.mode_budget()
+                if lifetime['spent_usd'] + lifetime['reserved_usd'] + amount > lifetime['limit_usd']:
+                    raise BudgetExceeded('SOL mode lifetime model budget exhausted')
             if row['running'] >= row['concurrency']:
                 raise BudgetExceeded(component + ' concurrency is occupied', temporary=True)
             if row['calls'] >= row['daily_calls'] or row['spent'] + row['reserved'] + amount > row['daily_usd']:
@@ -67,6 +94,8 @@ class ComponentBudget:
             call = self.store.reserve(model, input_bytes, output_tokens, now=self.clock(), context=context)
             with self.store.connection() as db:
                 db.execute('INSERT INTO component_calls VALUES (?,?,?)', (call, component, task_id))
+                if selected:
+                    db.execute('INSERT INTO trading_mode_calls VALUES (?,?)', (call, 'sol_perpetual'))
             return call
 
 
@@ -181,7 +210,7 @@ class ResponsesAgent:
         cached = self._cached(task_id)
         if cached is not None:
             return cached
-        body = self._base('execution', payload, 'executor')
+        body = self._base('execution', payload, 'sol_trader' if is_sol_mode(self.store.config()) else 'executor')
         body.update(tools=copy.deepcopy(definitions), parallel_tool_calls=False)
         schemas = {tool['name']: tool['parameters'] for tool in definitions}
         results, count = [], 0

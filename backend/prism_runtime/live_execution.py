@@ -16,10 +16,12 @@ from datetime import datetime, timezone
 
 from .bybit import BybitError, OrderOutcomeUnknown
 from .domain import identity
-from .execution_contract import EXECUTION_TOOLS
+from .execution_contract import EXECUTION_TOOLS, SOL_EXECUTION_TOOLS
 from .live_research import LiveResearch
 from .risk_controls import ACTIVE_ORDERS, IntentRejected, protective_reasons, validate_intent
 from .store import BudgetExceeded, encoded
+from .trade_review import TradeReviewer
+from .trading_modes import is_sol_mode, mode_settings
 
 
 _TERMINAL = {"filled", "cancelled", "rejected"}
@@ -57,7 +59,8 @@ class ExecutionController:
     immediately before every exposure-increasing submit or amendment.
     """
 
-    def __init__(self, store, adapter, market, memory, agents, *, eligibility=None, clock=None):
+    def __init__(self, store, adapter, market, memory, agents, *, eligibility=None, clock=None,
+                 trade_reviewer=None):
         if store is None or not hasattr(store, "connection"):
             raise ValueError("ExecutionController requires a Prism Store")
         if adapter is None or not hasattr(adapter, "submit_order") or not hasattr(adapter, "reconcile"):
@@ -70,6 +73,8 @@ class ExecutionController:
         self.clock = clock or getattr(store, "_clock", None) or time.time
         self.eligibility = eligibility or LiveResearch(store, clock=self.clock).eligibility
         self.permission_check = lambda: True
+        self.support_context_provider = None
+        self.trade_reviewer = trade_reviewer or TradeReviewer(agents, store, clock=self.clock)
         self._mutation_lock = threading.RLock()
         self._schema()
 
@@ -132,7 +137,14 @@ class ExecutionController:
     def _strategy(self, strategy_id):
         if not isinstance(strategy_id, str) or not strategy_id:
             return None
-        return self._strategy_map(self.store).get(strategy_id)
+        strategy = self._strategy_map(self.store).get(strategy_id)
+        from .trading_modes import is_sol_mode
+        if strategy:
+            selected = is_sol_mode(self._config())
+            managed = strategy.get('trading_mode') == 'sol_perpetual'
+            if selected != managed or selected and strategy_id != self.store.get_document('sol_mode_strategy_id'):
+                return None
+        return strategy
 
     def _permission_allowed(self):
         try:
@@ -669,6 +681,156 @@ class ExecutionController:
         except Exception:
             return False
 
+    @staticmethod
+    def _review_world_binding(world):
+        account = world.get("account", {})
+        raw = world.get("raw", {})
+        # Bind wallet quantities and host safety state. Equity, available margin,
+        # daily P&L, and marks move with quotes; the full current values still go
+        # to the reviewer and are revalidated by risk_controls immediately before
+        # mutation. Wallet coin quantities catch actual balance changes.
+        safety = {key: copy.deepcopy(account.get(key)) for key in (
+            "venue", "mode", "account_type", "reconciliation_required", "risk_halted",
+            "halt_reasons", "external_cashflow_detected", "daily_pnl_verified",
+            "account_binding_verified", "position_mode", "leverage", "protection_supported",
+            "protection_verified")}
+        currencies = [{key: copy.deepcopy(row.get(key)) for key in
+            ("currency", "wallet_balance", "spot_borrow")} for row in raw.get("currencies", [])
+            if isinstance(row, dict)]
+        stable_positions = [{key: copy.deepcopy(row.get(key)) for key in (
+            "strategy_id", "category", "symbol", "quantity", "entry_price", "leverage",
+            "stop_loss", "ownership_uncertain")} for row in world.get("positions", [])]
+        return {"account_safety": safety,
+                "wallet_balances": {key: raw.get(key) for key in
+                    ("usdt_wallet_balance", "usdt_available_balance")},
+                "currencies": currencies, "positions": stable_positions,
+                "orders": [ExecutionController._summary_order(row) for row in world.get("orders", [])]}
+
+    def _trade_review_binding(self, *, strategy_id, snapshot_id, world, config, permission):
+        return identity({"mode": "sol_perpetual" if is_sol_mode(config) else "research",
+            "environment": self._environment(), "strategy_id": strategy_id,
+            "snapshot_id": snapshot_id, "permission": bool(permission),
+            "bybit": {key: config["bybit"].get(key) for key in
+                ("mode", "enabled", "mainnet_enabled", "allowed_categories", "allowed_instruments")},
+            "live_execution": config["live_execution"],
+            "world": self._review_world_binding(world),
+            "eligibility": self._eligibility_projection(strategy_id),
+            "constraints": self._constraints(strategy_id)})
+
+    def _prepare_trade_review(self, name, args, tool_id, *, strategy_id, decision_snapshot):
+        """Call the reviewer with immutable measured evidence, outside the mutation lock."""
+        config = self._config()
+        if not is_sol_mode(config):
+            return None
+        reviewer = self.trade_reviewer
+        review_task = "trade-review-" + identity(tool_id)
+        base_evidence = {"tool_id": tool_id, "tool_name": name, "arguments": copy.deepcopy(args),
+                         "strategy_id": strategy_id, "mode": "sol_perpetual"}
+        def block(reason, evidence=None):
+            return reviewer.record_block(evidence or base_evidence, task_id=review_task, reason=reason)
+        try:
+            if not self._permission_allowed():
+                return block("Execution permission is paused")
+            # Populate the read-only venue limit cache before both the reviewer
+            # packet and the later locked recheck. Exposure-increasing host
+            # validation still fetches and enforces the live venue ceiling.
+            try:
+                self._venue_leverage_limit()
+            except Exception:
+                pass
+            # Refresh current state before presenting the exact proposal. This is
+            # deliberately outside _mutation_lock; the locked check below detects
+            # any state change while the model was reviewing.
+            review_world = self._world()
+            strategy = self._strategy(strategy_id)
+            if not strategy:
+                return block("Strategy version is unavailable")
+            snapshot_id = args.get("snapshot_id")
+            snapshot = self._approve_snapshot(strategy_id, snapshot_id, {snapshot_id})
+            now = self._now_ms()
+            expiry = args.get("expires_at_ms")
+            lifetime = min(config["live_execution"]["max_decision_age_seconds"],
+                           strategy["market_policy"]["max_decision_latency_seconds"]) * 1000
+            bounds = [snapshot["captured_at_ms"] + lifetime]
+            attention = snapshot.get("attention_deadline_ms")
+            if type(attention) is int:
+                bounds.append(attention)
+            if type(expiry) is int:
+                bounds.append(expiry)
+            valid_until = min(bounds)
+            if type(expiry) is not int or now >= valid_until or now < snapshot["captured_at_ms"]:
+                return block("Trade proposal snapshot or expiry is stale")
+            binding = self._trade_review_binding(strategy_id=strategy_id, snapshot_id=snapshot_id,
+                world=review_world, config=config, permission=True)
+            evidence = {"tool_id": tool_id, "tool_name": name, "arguments": copy.deepcopy(args),
+                "strategy_id": strategy_id, "mode": "sol_perpetual", "config": {"bybit": {
+                    key: copy.deepcopy(config["bybit"].get(key)) for key in
+                    ("mode", "enabled", "mainnet_enabled", "allowed_categories", "allowed_instruments")},
+                    "live_execution": copy.deepcopy(config["live_execution"])},
+                "strategy": self._strategy_projection(strategy),
+                "decision_snapshot": self._market_projection(snapshot),
+                "account": self._account_projection(review_world["account"]),
+                "positions": copy.deepcopy(review_world["positions"]),
+                "orders": [self._summary_order(row) for row in review_world["orders"]],
+                "constraints": self._constraints(strategy_id),
+                "eligibility": self._eligibility_projection(strategy_id),
+                "runtime_permission": True, "state_binding": binding,
+                "approval_expires_at_ms": valid_until}
+            if callable(self.support_context_provider):
+                try:
+                    evidence["support_reports"] = self.support_context_provider(strategy_id, snapshot)
+                except Exception:
+                    evidence["support_reports"] = {"status": "unavailable", "reports": []}
+            # One durable review slot per model tool identity. An exact replay
+            # reuses the record; changed arguments or evidence hit the same slot
+            # and are rejected without another paid request.
+            result = reviewer.review(evidence, task_id=review_task)
+            if not isinstance(result, dict):
+                return {"status": "blocked", "reason": "Trade reviewer returned no decision"}
+            result = copy.deepcopy(result)
+            result.update(_approval={"state_binding": binding, "valid_until_ms": valid_until,
+                                     "snapshot_id": snapshot_id, "tool_id": tool_id,
+                                     "tool_name": name, "arguments_hash": identity(args),
+                                     "proposal_hash": reviewer.proposal_hash(tool_id, name, args)})
+            return result
+        except Exception as error:
+            return block("Trade review unavailable (" + type(error).__name__ + ")")
+
+    def _verify_trade_approval(self, approval, name, args, tool_id, strategy_id):
+        """Rebind the reviewer decision to live state under the mutation lock."""
+        config = self._config()
+        if not is_sol_mode(config):
+            return  # Research mode retains its existing behavior.
+        if not isinstance(approval, dict):
+            raise IntentRejected("Dedicated SOL trade approval is missing")
+        binding = approval.get("_approval") if isinstance(approval, dict) else None
+        if (approval.get("status") != "approved" or not isinstance(binding, dict) or
+                binding.get("tool_id") != tool_id or binding.get("tool_name") != name or
+                binding.get("arguments_hash") != identity(args) or
+                binding.get("proposal_hash") != self.trade_reviewer.proposal_hash(tool_id, name, args)):
+            raise IntentRejected("Dedicated trade approval is missing or does not match this proposal")
+        durable = self.trade_reviewer.approval_for_tool(tool_id, name, args) if self.trade_reviewer else None
+        if not isinstance(durable, dict) or durable.get("review_id") != approval.get("review_id") or \
+                durable.get("_approval") != binding:
+            raise IntentRejected("Dedicated trade approval has no matching durable reviewer record")
+        now = self._now_ms()
+        if now >= binding.get("valid_until_ms", 0) or not self._permission_allowed():
+            raise IntentRejected("Trade approval expired or execution permission changed")
+        if not self.market.snapshot_status(binding["snapshot_id"]).get("valid"):
+            raise IntentRejected("Reviewed market snapshot is no longer current")
+        world = self._world()
+        current = self._trade_review_binding(strategy_id=strategy_id, snapshot_id=binding["snapshot_id"],
+            world=world, config=config, permission=True)
+        if current != binding.get("state_binding"):
+            raise IntentRejected("Account, orders, positions, config, or eligibility changed after trade review")
+        # New primary observations supersede an approval even when the earlier
+        # snapshot has not yet aged out of the market service's validity window.
+        latest = self._fresh_market(strategy_id)
+        reviewed = self.store.snapshot(binding["snapshot_id"])
+        reviewed_value = reviewed.get("value", {}) if reviewed else {}
+        if latest.get("signal_input_id") != reviewed_value.get("signal_input_id"):
+            raise IntentRejected("A newer primary market observation superseded trade approval")
+
     def _eligibility(self, strategy_id):
         try:
             result = self.eligibility(strategy_id)
@@ -695,10 +857,115 @@ class ExecutionController:
         now = self._now_ms()
         recent = sum(1 for order in world["orders"] if
                      isinstance(order.get("created_at_ms"), int) and order["created_at_ms"] >= now - 60_000)
-        return validate_intent(intent, strategy=strategy, decision_snapshot=decision_snapshot,
+        config = self._config()
+        if is_sol_mode(config) and intent.get('reduce_only') is not True:
+            config = copy.deepcopy(config)
+            config['live_execution']['max_leverage'] = self._venue_leverage_limit()
+        checked = validate_intent(intent, strategy=strategy, decision_snapshot=decision_snapshot,
             market=current_market, account=world["account"], orders=orders,
-            eligibility=eligibility, config=self._config(), now_ms=now,
+            eligibility=eligibility, config=config, now_ms=now,
             budget_available=budget_available, recent_order_count=recent)
+        if is_sol_mode(config) and intent.get('reduce_only') is not True:
+            equity = world['account']['equity']
+            stop = config['live_execution']['stop_loss_fraction']
+            fee_fraction = max(6., config['risk']['fee_bps']) / 10000
+            slippage = config['live_execution']['max_slippage_bps'] / 10000
+            # Bound modeled dollar loss on total instrument exposure, including
+            # outstanding buys, rather than treating leverage as extra equity.
+            exposure = sum(abs(float(p.get('quantity', 0)) * float(p['mark_price']))
+                for p in world['positions'] if p.get('category') == 'linear' and p.get('symbol') == 'SOLUSDT')
+            pending = sum(max(0., float(o.get('quantity', 0)) - float(o.get('filled_quantity', 0))) *
+                float(o.get('price', o.get('reference_price', 0))) for o in orders
+                if o.get('status') in ACTIVE_ORDERS and o.get('category') == 'linear' and
+                   o.get('symbol') == 'SOLUSDT' and not o.get('reduce_only'))
+            modeled_risk = (checked['checked_notional'] + exposure + pending) * (stop + 2 * fee_fraction + slippage)
+            if modeled_risk > equity * mode_settings(config)['max_position_risk_fraction']:
+                raise IntentRejected('SOL mode modeled position stop-risk budget exceeded')
+        return checked
+
+    def _venue_leverage_limit(self, *, cached=False):
+        metadata = None
+        if cached:
+            with self.store.connection() as db:
+                exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bybit_instruments'").fetchone()
+                row = db.execute('SELECT value,updated_at_ms FROM bybit_instruments WHERE mode=? AND category=? AND symbol=?',
+                    (getattr(self.adapter, 'metadata_mode', self._environment()), 'linear', 'SOLUSDT')).fetchone() if exists else None
+            if row and 0 <= self._now_ms() - row['updated_at_ms'] <= 60_000:
+                metadata = json.loads(row['value'])
+        else:
+            metadata = self.adapter.metadata('linear', 'SOLUSDT')
+        try:
+            limit = float(metadata.get('max_leverage')) if metadata else None
+        except (ValueError, TypeError):
+            limit = None
+        if limit is None or not math.isfinite(limit) or limit < 1:
+            if cached:
+                return None
+            raise IntentRejected('The current SOLUSDT venue leverage limit is unavailable')
+        return limit
+
+    def _set_leverage(self, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None):
+        """A journalled, flat-only leverage choice, separate from order authority."""
+        if not is_sol_mode(self._config()) or args.get('strategy_id') != strategy_id:
+            raise IntentRejected('Agent leverage selection is scoped to SOL Perpetual mode')
+        if not self._permission_allowed():
+            raise IntentRejected('Pause blocks agent leverage changes')
+        with self._mutation_lock:
+            config = self._config()
+            strategy = self._strategy(strategy_id)
+            if not strategy or not config['bybit']['enabled'] or not config['live_execution']['enabled']:
+                raise IntentRejected('Explicit exchange execution permissions are required for leverage changes')
+            if {'category': 'linear', 'symbol': 'SOLUSDT'} not in config['bybit']['allowed_instruments']:
+                raise IntentRejected('SOLUSDT linear must be explicitly allowed before leverage changes')
+            snapshot = self._approve_snapshot(strategy_id, args.get('snapshot_id'), approved_snapshots)
+            now = self._now_ms()
+            lifetime = min(config['live_execution']['max_decision_age_seconds'],
+                           strategy['market_policy']['max_decision_latency_seconds']) * 1000
+            expiry = args.get('expires_at_ms')
+            if (type(expiry) is not int or not now < expiry <= snapshot['captured_at_ms'] + lifetime or
+                    not 0 <= now - snapshot['captured_at_ms'] <= lifetime):
+                raise IntentRejected('Leverage decision is stale or expired')
+            requested = args.get('leverage')
+            if not _finite(requested) or not 1 <= requested <= self._venue_leverage_limit():
+                raise IntentRejected('Requested leverage exceeds the verified venue ceiling')
+            if not isinstance(args.get('rationale'), str) or not args['rationale'].strip():
+                raise IntentRejected('A leverage rationale is required')
+            eligibility = self._eligibility(strategy_id)
+            if not eligibility.get('eligible') or strategy_id not in config['live_execution']['eligible_strategy_versions']:
+                raise IntentRejected('Qualified strategy and explicit operator approval are required')
+            if not self._budget_available():
+                raise IntentRejected('Model budget blocks discretionary leverage changes')
+            world = self._world()
+            account = world['account']
+            if (account.get('reconciliation_required', True) or config['live_execution']['kill_switch'] or
+                    account.get('daily_pnl') is None or account.get('drawdown_fraction') is None or
+                    protective_reasons(account, config) or not 0 <= now - account['updated_at_ms'] <=
+                    config['live_execution']['max_account_age_seconds'] * 1000):
+                raise IntentRejected('Fresh reconciled account and clear risk state are required')
+            if (any(p.get('category') == 'linear' and p.get('symbol') == 'SOLUSDT' and
+                    abs(float(p.get('quantity', 0))) > 0 for p in world['positions']) or
+                    any(o.get('category') == 'linear' and o.get('symbol') == 'SOLUSDT' and
+                        self._active_order(o) for o in world['orders'])):
+                raise IntentRejected('SOLUSDT must be flat with no unresolved orders before leverage changes')
+            previous = self._mutation_existing(tool_id, 'set_leverage', args)
+            if isinstance(previous, dict):
+                if previous.get('mutation_status') == 'completed':
+                    return previous['result']
+                return {'status': 'unknown', 'reason': 'Prior leverage mutation requires read-only reconciliation; it is not replayed'}
+            if not self._permission_allowed() or self._config() != config or self._now_ms() >= expiry:
+                raise IntentRejected('Execution permission changed before leverage mutation')
+            self._verify_trade_approval(trade_approval, 'set_leverage', args, tool_id, strategy_id)
+            try:
+                result = self.adapter.set_leverage('linear', 'SOLUSDT', requested)
+            except Exception as error:
+                return self._mutation_finish(tool_id, {'status': 'unknown',
+                    'reason': 'Leverage readback required (' + type(error).__name__ + ')'}, 'uncertain')
+            if result.get('status') != 'verified' or result.get('leverage') != requested:
+                return self._mutation_finish(tool_id, {'status': 'unknown',
+                    'reason': 'Exchange leverage was not verified'}, 'uncertain')
+            result.update(rationale=args['rationale'], expires_at_ms=expiry)
+            self.store.set_document('live_execution_state', self._state_value(self._world()))
+            return self._mutation_finish(tool_id, result)
 
     def _check_order(self, link_id, strategy_id, orders, *, allow_expired=False, allow_terminal=False):
         if not isinstance(link_id, str) or not link_id:
@@ -743,7 +1010,7 @@ class ExecutionController:
             result["reason"] = error_name
         return result
 
-    def _submit_intent(self, name, args, tool_id, *, strategy_id, approved_snapshots):
+    def _submit_intent(self, name, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None):
         if args.get("strategy_id") != strategy_id:
             raise IntentRejected("Tool is scoped to the event strategy version")
         if not self._permission_allowed():
@@ -788,6 +1055,7 @@ class ExecutionController:
                 raise IntentRejected("Runtime permission changed immediately before submission")
             if self._config() != config:
                 raise IntentRejected("Execution configuration changed during submission validation")
+            self._verify_trade_approval(trade_approval, name, args, tool_id, strategy_id)
             payload = {"category": strategy["market_policy"]["category"], "symbol": strategy["market_policy"]["symbol"],
                 "side": approved["side"], "order_type": approved["order_type"], "quantity": approved["quantity"],
                 "price": approved["limit_price"], "reduce_only": approved["reduce_only"],
@@ -828,7 +1096,7 @@ class ExecutionController:
             self.store.set_document("live_execution_state", self._state_value(world))
             return self._mutation_finish(tool_id, result, "completed" if result["status"] != "unknown" else "uncertain")
 
-    def _amend_order(self, args, tool_id, *, strategy_id, approved_snapshots):
+    def _amend_order(self, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None):
         if not self._permission_allowed():
             raise IntentRejected("Runtime permission is paused; order amendment is blocked")
         existing_mutation = self._mutation_existing(tool_id, "amend_order", args)
@@ -878,6 +1146,7 @@ class ExecutionController:
                 raise IntentRejected("Runtime permission changed immediately before amendment")
             if self._config() != config:
                 raise IntentRejected("Execution configuration changed during amendment validation")
+            self._verify_trade_approval(trade_approval, "amend_order", args, tool_id, strategy_id)
             old_expiry = order.get("expires_at_ms") or approved["expires_at_ms"]
             # Until the venue result is known, an uncertain amendment keeps the
             # earlier local deadline. A completed amendment may extend it.
@@ -965,7 +1234,7 @@ class ExecutionController:
             return self._mutation_finish(tool_id, result,
                 "uncertain" if result.get("status") == "unknown" else "completed")
 
-    def _reduce_exposure(self, args, tool_id, *, strategy_id, approved_snapshots):
+    def _reduce_exposure(self, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None):
         if args.get("strategy_id") != strategy_id:
             raise IntentRejected("Tool is scoped to the event strategy version")
         previous = self._mutation_existing(tool_id, "reduce_exposure", args)
@@ -1018,6 +1287,7 @@ class ExecutionController:
             approved = self._risk_check(intent, strategy=strategy, decision_snapshot=decision_snapshot,
                 current_market=current_market, world=world, orders=world["orders"],
                 eligibility={"eligible": False}, budget_available=self._budget_available())
+            self._verify_trade_approval(trade_approval, "reduce_exposure", args, tool_id, strategy_id)
             with self.store.connection() as db:
                 db.execute("INSERT OR REPLACE INTO execution_order_controls VALUES (?,?,?,?)",
                     (link, approved["expires_at_ms"], approved["rationale"], self._now_ms()))
@@ -1044,7 +1314,8 @@ class ExecutionController:
             self._mutation_finish(tool_id, result, "completed" if result["status"] != "unknown" else "uncertain")
             return result
 
-    def _handle_tool(self, name, args, tool_id, *, strategy_id, approved_snapshots, decision_snapshot, world):
+    def _handle_tool(self, name, args, tool_id, *, strategy_id, approved_snapshots, decision_snapshot, world,
+                     trade_approval=None):
         if name == "inspect_strategies":
             strategy = self._strategy(strategy_id)
             return {"strategy": self._strategy_projection(strategy),
@@ -1073,15 +1344,18 @@ class ExecutionController:
                     "acknowledgements_are_not_fills": True}
         if name == "submit_order_intent":
             return self._submit_intent(name, args, tool_id, strategy_id=strategy_id,
-                                       approved_snapshots=approved_snapshots)
+                                       approved_snapshots=approved_snapshots, trade_approval=trade_approval)
+        if name == 'set_leverage':
+            return self._set_leverage(args, tool_id, strategy_id=strategy_id,
+                                      approved_snapshots=approved_snapshots, trade_approval=trade_approval)
         if name == "amend_order":
             return self._amend_order(args, tool_id, strategy_id=strategy_id,
-                                     approved_snapshots=approved_snapshots)
+                                     approved_snapshots=approved_snapshots, trade_approval=trade_approval)
         if name == "cancel_order":
             return self._cancel_order(args, tool_id, strategy_id=strategy_id)
         if name == "reduce_exposure":
             return self._reduce_exposure(args, tool_id, strategy_id=strategy_id,
-                                         approved_snapshots=approved_snapshots)
+                                         approved_snapshots=approved_snapshots, trade_approval=trade_approval)
         if name == "hold":
             return {"status": "held", "strategy_id": strategy_id,
                     "rationale": args.get("rationale", "")}
@@ -1089,8 +1363,37 @@ class ExecutionController:
 
     def _dispatch_tool(self, name, args, tool_id, *, strategy_id, approved_snapshots, decision_snapshot, world):
         try:
-            return self._handle_tool(name, args, tool_id, strategy_id=strategy_id,
-                approved_snapshots=approved_snapshots, decision_snapshot=decision_snapshot, world=world)
+            trade_approval = None
+            reviewed_tools = {"submit_order_intent", "amend_order", "reduce_exposure", "set_leverage"}
+            if is_sol_mode(self._config()) and name in reviewed_tools:
+                # Existing durable tool identities retain their exact idempotent
+                # replay/reconciliation semantics and never trigger a new review.
+                if self._mutation_row(tool_id) is None:
+                    trade_approval = self._prepare_trade_review(name, args, tool_id,
+                        strategy_id=strategy_id, decision_snapshot=decision_snapshot)
+                    if not isinstance(trade_approval, dict) or trade_approval.get("status") != "approved":
+                        return {"status": "blocked", "reason": _bounded_text(
+                            (trade_approval or {}).get("reason", "Dedicated trade approval is required")),
+                            "trade_review": {key: trade_approval.get(key) for key in
+                                ("status", "review_id", "decision", "rationale", "reason", "proposal_hash")
+                                if key in trade_approval} if isinstance(trade_approval, dict) else
+                                {"status": "blocked"}}
+                else:
+                    # Reconciliation can safely finish an uncertain mutation
+                    # only while its original approval still matches current
+                    # state. Completed idempotent outcomes return without use.
+                    trade_approval = self.trade_reviewer.approval_for_tool(tool_id, name, args)
+            result = self._handle_tool(name, args, tool_id, strategy_id=strategy_id,
+                approved_snapshots=approved_snapshots, decision_snapshot=decision_snapshot, world=world,
+                trade_approval=trade_approval)
+            if is_sol_mode(self._config()) and name in reviewed_tools and isinstance(result, dict):
+                review = (trade_approval if trade_approval and trade_approval.get("status") == "approved"
+                          else self.trade_reviewer.outcome_for_tool(tool_id) if self.trade_reviewer else None)
+                if review:
+                    result = {**result, "trade_review": {key: review[key] for key in
+                        ("status", "review_id", "decision", "rationale", "reason", "proposal_hash")
+                        if key in review}}
+            return result
         except IntentRejected as error:
             return {"status": "blocked", "reason": _bounded_text(str(error))}
         except (ValueError, TypeError, KeyError) as error:
@@ -1132,6 +1435,11 @@ class ExecutionController:
             "max_participation_fraction", "max_quote_age_seconds", "max_account_age_seconds",
             "max_decision_age_seconds", "max_orders_per_minute", "stop_loss_fraction",
             "position_ttl_seconds", "kill_switch", "require_exchange_protection")
+        limits = {key: live.get(key) for key in names}
+        if is_sol_mode(config):
+            limits['max_leverage'] = self._venue_leverage_limit(cached=True)
+            limits['max_position_risk_fraction'] = mode_settings(config)['max_position_risk_fraction']
+            limits['leverage_policy'] = 'agent_with_venue_ceiling'
         return {"policy_version": live.get("policy_version"), "execution_enabled": live.get("enabled"),
             "bybit_enabled": bybit.get("enabled"), "bybit_mode": bybit.get("mode"),
             "mainnet_enabled": bybit.get("mainnet_enabled"),
@@ -1139,7 +1447,7 @@ class ExecutionController:
             "allocation": live.get("allocations", {}).get(strategy_id),
             "allowed_categories": list(bybit.get("allowed_categories", [])),
             "allowed_instruments": copy.deepcopy(bybit.get("allowed_instruments", [])),
-            "limits": {key: live.get(key) for key in names}}
+            "limits": limits}
 
     def _decision_value(self, *, decision_id, event_id, strategy_id, fingerprint, status,
                         snapshot_id, rationale, result=None, expiry=None):
@@ -1156,7 +1464,7 @@ class ExecutionController:
     def _duplicate_decision(self, strategy_id, fingerprint):
         with self.store.connection() as db:
             row = db.execute("SELECT value FROM execution_decisions WHERE strategy_id=? AND fingerprint=? "
-                             "AND status IN ('held','completed','submitted','reduction_requested','cancelled','cancel_requested','filled_during_cancel','amended') "
+                             "AND status IN ('held','completed','submitted','reduction_requested','cancelled','cancel_requested','filled_during_cancel','amended','leverage_set') "
                              "ORDER BY created_at_ms DESC LIMIT 1", (strategy_id, fingerprint)).fetchone()
         return json.loads(row[0]) if row else None
 
@@ -1171,7 +1479,7 @@ class ExecutionController:
             actions = []
             for item in result.get("tools", []) if isinstance(result, dict) else []:
                 if not isinstance(item, dict) or item.get("name") not in {
-                    "submit_order_intent", "amend_order", "cancel_order", "reduce_exposure", "hold"}:
+                    "submit_order_intent", "amend_order", "cancel_order", "reduce_exposure", "set_leverage", "hold"}:
                     continue
                 detail = item.get("result", {})
                 if not isinstance(detail, dict):
@@ -1292,8 +1600,14 @@ class ExecutionController:
             "eligibility": self._eligibility_projection(strategy_id),
             "runtime_permission": True, "account_reconciliation_required": world["account"]["reconciliation_required"],
             "protection_state": safe_state["account"]}
+        if callable(self.support_context_provider):
+            try:
+                payload['support_swarm'] = self.support_context_provider(strategy_id, snapshot)
+            except Exception:
+                payload['support_swarm'] = {'status': 'unavailable', 'reports': []}
+        payload['experiment_id'] = strategy.get('experiment_id', strategy_id)
         try:
-            result = self.agents.tools(payload, EXECUTION_TOOLS,
+            result = self.agents.tools(payload, SOL_EXECUTION_TOOLS if is_sol_mode(config) else EXECUTION_TOOLS,
                 lambda name, args, key: self._dispatch_tool(name, args, key, strategy_id=strategy_id,
                     approved_snapshots=approved_snapshots, decision_snapshot=snapshot, world=world),
                 task_id="execution-" + decision_id)
@@ -1318,13 +1632,13 @@ class ExecutionController:
         tools = result.get("tools", []) if isinstance(result, dict) else []
         tool_rows = [row for row in tools if isinstance(row, dict)]
         operations = [row for row in tool_rows if row.get("name") in {
-            "submit_order_intent", "amend_order", "cancel_order", "reduce_exposure"}]
+            "submit_order_intent", "amend_order", "cancel_order", "reduce_exposure", "set_leverage"}]
         holds = [row for row in tool_rows if row.get("name") == "hold"]
         summary = _bounded_text(result.get("summary", "") if isinstance(result, dict) else "")
         action = operations[-1] if operations else (holds[-1] if holds else None)
         action_result = action.get("result", {}) if action else {}
         status_by_action = {"submit_order_intent": "submitted", "amend_order": "amended",
-            "reduce_exposure": "reduction_requested", "hold": "held"}
+            "reduce_exposure": "reduction_requested", "hold": "held", "set_leverage": "leverage_set"}
         status = status_by_action.get(action.get("name"), "held") if action else "held"
         if action and action.get("name") == "cancel_order":
             cancel_status = action_result.get("status")

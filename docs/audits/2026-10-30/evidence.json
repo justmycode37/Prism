@@ -1,0 +1,73 @@
+{
+  "basis": "Offline temporary fixtures. No real credential, exchange, installed service, or paid provider call.",
+  "execution_ledger_truncation": {
+    "inserted": 10001,
+    "returned": 10000,
+    "latest_execution_present": false,
+    "attributed_quantity": 10000.0,
+    "actual_fixture_quantity": 10001,
+    "attribution_incomplete": true
+  },
+  "discovery_cost_attribution": {
+    "candidate_count": 1,
+    "total_model_charge_fixture_usd": 0.025,
+    "candidate_research_cost_usd": 0.0,
+    "blocked": []
+  },
+  "frozen_policy_and_mutable_execution": {
+    "frozen_stop_fraction": 0.03,
+    "active_stop_fraction": 0.08,
+    "active_ttl_seconds": 3600,
+    "frozen_stop_after_config_update": 0.03,
+    "frozen_ttl_days": 1
+  },
+  "best_case_gate_feasibility": [
+    {
+      "experiment_ordinal": 1,
+      "alpha_budget": 0.025,
+      "earliest_bybit_review_days_if_all_blocks_positive": 60
+    },
+    {
+      "experiment_ordinal": 2,
+      "alpha_budget": 0.008333333333333333,
+      "earliest_bybit_review_days_if_all_blocks_positive": 80
+    },
+    {
+      "experiment_ordinal": 10,
+      "alpha_budget": 0.00045454545454545455,
+      "earliest_bybit_review_days_if_all_blocks_positive": 100
+    },
+    {
+      "experiment_ordinal": 100,
+      "alpha_budget": 4.950495049504951e-06,
+      "earliest_bybit_review_days_if_all_blocks_positive": 140
+    },
+    {
+      "experiment_ordinal": 1000,
+      "alpha_budget": 4.9950049950049954e-08,
+      "earliest_bybit_review_days_if_all_blocks_positive": 180
+    }
+  ],
+  "equity_default_minimum_sessions_for_12_blocks": 240,
+  "cost_scenarios": {
+    "quiet_event_day": {
+      "assumed_model_cost_per_day": 11.284519999999999,
+      "assumed_model_cost_30_days": 338.5356,
+      "model_cost_only_breakeven_monthly_return_on_1000_exposure": 0.3385356,
+      "model_cost_only_breakeven_monthly_return_on_10000_equity": 0.03385356
+    },
+    "busy_event_day": {
+      "assumed_model_cost_per_day": 71.04544,
+      "assumed_model_cost_30_days": 2131.3632,
+      "model_cost_only_breakeven_monthly_return_on_1000_exposure": 2.1313631999999996,
+      "model_cost_only_breakeven_monthly_return_on_10000_equity": 0.21313632
+    }
+  },
+  "operations_projection_schema_mismatch": {
+    "input_account_reconciliation_required": false,
+    "input_account_portfolio_notional": 100.0,
+    "output_risk_status": "reconciliation_required",
+    "output_gross_exposure": null,
+    "output_realized_pnl": null
+  }
+}

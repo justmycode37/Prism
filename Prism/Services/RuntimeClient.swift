@@ -113,6 +113,23 @@ final class RuntimeClient: ObservableObject {
         }
     }
 
+    /// Sends only the mode selection. Encoding the whole local configuration here
+    /// could erase fields owned by a newer runtime.
+    func selectTradingMode(_ mode: String) async -> Bool {
+        guard ["research", "sol_perpetual"].contains(mode), !isBusy, isConnected else { return false }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            let body = try JSONSerialization.data(withJSONObject: ["trading_mode": ["selected": mode]])
+            _ = try await send(path: "/v1/config", method: "POST", body: body)
+            await refresh()
+            return true
+        } catch {
+            errorMessage = readable(error)
+            return false
+        }
+    }
+
     func updateDailySpendCeiling(_ amount: Double?) async -> Bool {
         guard !isBusy, isConnected else { return false }
         if let amount, !amount.isFinite || amount <= 0 {

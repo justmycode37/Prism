@@ -1,6 +1,8 @@
 """Small, stable native-console projection of actual durable service state."""
 from __future__ import annotations
 
+import math
+
 from .domain import identity, timestamp
 
 
@@ -27,6 +29,62 @@ def _order_detail(row):
     if row.get('reason'):
         detail += ' · ' + str(row['reason'])
     return detail
+
+
+def _finite(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _risk_view(execution):
+    """Normalize the durable controller account shape and legacy risk fixture."""
+    risk = execution.get('risk') if isinstance(execution.get('risk'), dict) else {}
+    account = execution.get('account') if isinstance(execution.get('account'), dict) else {}
+    positions = execution.get('positions') if isinstance(execution.get('positions'), list) else []
+    halted = execution.get('risk_halted', account.get('risk_halted', risk.get('halted', False)))
+    reconciliation = execution.get('reconciliation_required',
+                                   account.get('reconciliation_required', risk.get('reconciliation_required', True)))
+    exposure = account.get('portfolio_notional')
+    if not _finite(exposure):
+        exposure = None
+        measured = []
+        for row in positions:
+            if not isinstance(row, dict):
+                measured = []
+                break
+            quantity = row.get('quantity', row.get('qty', row.get('size')))
+            mark = row.get('mark_price')
+            if not _finite(quantity) or not _finite(mark):
+                measured = []
+                break
+            measured.append(abs(quantity * mark))
+        if positions and measured and all(_finite(value) for value in measured):
+            exposure = sum(measured)
+    elif exposure < 0:
+        exposure = None
+
+    unrealized = risk.get('unrealized_pnl', account.get('unrealized_pnl'))
+    if not _finite(unrealized):
+        values = []
+        for row in positions:
+            if not isinstance(row, dict):
+                values = []
+                break
+            value = row.get('unrealized_pnl', row.get('unrealisedPnl'))
+            if not _finite(value):
+                values = []
+                break
+            values.append(value)
+        unrealized = sum(values) if positions and values else None
+    realized = risk.get('realized_pnl', account.get('realized_pnl'))
+    return {
+        'halted': bool(halted),
+        'reconciliation_required': bool(reconciliation),
+        'reasons': account.get('halt_reasons', execution.get('halt_reasons', risk.get('reasons', []))) or [],
+        'gross_exposure': exposure if _finite(exposure) else risk.get('gross_exposure') if _finite(risk.get('gross_exposure')) else None,
+        'realized_pnl': realized if _finite(realized) else None,
+        'unrealized_pnl': unrealized if _finite(unrealized) else None,
+    }
 
 
 def projection(*, mode, enabled, schedule, calendar, subscriptions, memory, execution, resources, blocked):
@@ -70,7 +128,7 @@ def projection(*, mode, enabled, schedule, calendar, subscriptions, memory, exec
         f"{r.get('category', '')}:{r.get('symbol', '')} · {r.get('side', '')}",
         f"Quantity {r.get('quantity', r.get('size', '—'))} · Notional {r.get('notional', r.get('positionValue', '—'))} · P&L {r.get('unrealized_pnl', r.get('unrealisedPnl', '—'))}",
         key=r.get('id'), status=r.get('protection_status'), at=r.get('updated_at')) for r in execution.get('positions', [])])
-    risk = execution.get('risk', {})
+    risk = _risk_view(execution)
     section('blocked', 'Blocked and deferred actions', [_item(
         r.get('title', r.get('kind', 'Action')), r.get('reason', r.get('detail', '')), key=r.get('id'), status=r.get('status', 'blocked'), at=r.get('at'))
         for r in blocked] + [_item('Host risk control', reason, status='blocked') for reason in risk.get('reasons', [])])

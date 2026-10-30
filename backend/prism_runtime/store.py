@@ -212,7 +212,7 @@ class Store:
         result = default_config()
         saved = self.get_document('config', {})
         for key, value in saved.items():
-            result[key] = merge_settings(result[key], value) if key in OPERATION_DEFAULTS else {**result[key], **value} if key in {'risk', 'ingestion', 'sector', 'model_prices', 'research'} else value
+            result[key] = merge_settings(result[key], value) if key in OPERATION_DEFAULTS else {**result[key], **value} if key in {'risk', 'ingestion', 'sector', 'model_prices', 'research', 'trading_mode'} else value
         return result
 
     def update_config(self, changes):
@@ -221,7 +221,7 @@ class Store:
         with self._lock:
             result = self.config()
             for key, value in changes.items():
-                result[key] = merge_settings(result[key], value) if key in OPERATION_DEFAULTS else {**result[key], **value} if key in {'risk', 'ingestion', 'sector', 'model_prices', 'research'} else value
+                result[key] = merge_settings(result[key], value) if key in OPERATION_DEFAULTS else {**result[key], **value} if key in {'risk', 'ingestion', 'sector', 'model_prices', 'research', 'trading_mode'} else value
             self.set_document('config', result)
         self.event('configuration', 'Updated ' + ', '.join(sorted(changes)))
         return result

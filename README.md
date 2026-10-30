@@ -11,6 +11,7 @@ Prism is a native macOS console and a Python research runtime with two lanes: th
 - [Agent procedures](docs/Agents.md) links the executable model manuals and their actual request limits.
 - [Runtime guide](docs/Runtime.md) covers installation, controls, configuration, data, and storage.
 - [Continuous runtime](docs/ContinuousRuntime.md) describes independent workers, source-backed scheduling, durable research dossiers, Bybit identity and operator gates, and offline operating-cost estimates.
+- [SOL Perpetual mode](docs/SOLPerpetualMode.md) explains the in-app Research/SOL mode selector, the one-minute Sol xhigh trader, Luna max support swarm, and agent-selected venue-verified leverage.
 - [Operational cost fixture report](docs/OperationalCosts.json) records request sizes, token assumptions, lane caps, and workload scenarios without live model calls.
 
 ## Runtime

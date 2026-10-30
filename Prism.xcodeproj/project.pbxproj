@@ -28,6 +28,9 @@
 		B509437308F1B6DC32C00525 /* ConsoleComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = D56F32808AB31E985DD8B115 /* ConsoleComponents.swift */; };
 		D3E89859AE8B723377CD5AFC /* PrismTypography.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD62AE30EFCECFFAF35689E7 /* PrismTypography.swift */; };
 		D93CD6DC1B5F554ABE48B425 /* GlassSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02A514F53C1F08B12D229372 /* GlassSurface.swift */; };
+		A60000000000000000000002 /* PrismWorkspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = A60000000000000000000001 /* PrismWorkspace.swift */; };
+		A60000000000000000000004 /* PrismWorkspacePicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = A60000000000000000000003 /* PrismWorkspacePicker.swift */; };
+		A60000000000000000000006 /* PrismSingleTraderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A60000000000000000000005 /* PrismSingleTraderView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -65,6 +68,9 @@
 		F7A24ABC54147B5494034D9A /* Design.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = Design.md; sourceTree = "<group>"; };
 		F889CE9710FF7AB5E4EDB1C5 /* ThirdParty */ = {isa = PBXFileReference; lastKnownFileType = folder; path = ThirdParty; sourceTree = SOURCE_ROOT; };
 		FE037A08DE64FED547B14F1C /* RuntimeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeClient.swift; sourceTree = "<group>"; };
+		A60000000000000000000001 /* PrismWorkspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismWorkspace.swift; sourceTree = "<group>"; };
+		A60000000000000000000003 /* PrismWorkspacePicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismWorkspacePicker.swift; sourceTree = "<group>"; };
+		A60000000000000000000005 /* PrismSingleTraderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrismSingleTraderView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -176,6 +182,7 @@
 			isa = PBXGroup;
 			children = (
 				4EB3DE19ADE079823AE081C2 /* RuntimeState.swift */,
+				A60000000000000000000001 /* PrismWorkspace.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -188,6 +195,8 @@
 				80E83016713E3983F2D13071 /* PrismAgentsView.swift */,
 				1E030161A94899A8679D105D /* PrismExecutionView.swift */,
 				C93E7851E4582B72B445CFFB /* PrismHomeView.swift */,
+				A60000000000000000000005 /* PrismSingleTraderView.swift */,
+				A60000000000000000000003 /* PrismWorkspacePicker.swift */,
 				1200B309AA5FD96418A676A2 /* PrismOverviewView.swift */,
 				1AAFDA4A18F495A24D04D262 /* PrismPortfolioView.swift */,
 				70F1AD85828EF75CA326B0DD /* PrismResearchView.swift */,
@@ -286,6 +295,9 @@
 				A71FF9D3945766BFF70F8F61 /* PrismWordmark.swift in Sources */,
 				00BD75096970AE5D9D3E31BE /* RuntimeClient.swift in Sources */,
 				12697DCE464329B11D53E848 /* RuntimeState.swift in Sources */,
+				A60000000000000000000006 /* PrismSingleTraderView.swift in Sources */,
+				A60000000000000000000004 /* PrismWorkspacePicker.swift in Sources */,
+				A60000000000000000000002 /* PrismWorkspace.swift in Sources */,
 				42732DF4391D985DCB6F1660 /* WholeWindowLiquidGlass.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
