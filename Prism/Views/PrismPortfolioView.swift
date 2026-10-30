@@ -13,6 +13,13 @@ struct PrismPortfolioView: View {
                     Text("Realized \(runtime.state.map { PrismFormat.money($0.portfolio.realizedPnl) } ?? "—")")
                     Text("Unrealized \(runtime.state.map { PrismFormat.money($0.portfolio.unrealizedPnl) } ?? "—")")
                 }.font(.system(size: 11)).foregroundStyle(.secondary)
+                if let receivables = runtime.state?.portfolio.receivables, !receivables.isEmpty {
+                    Text("Income receivable \(PrismFormat.money(receivables.reduce(0) { $0 + $1.amount })) · Cash awaits an observed payment date")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                ForEach(runtime.state?.portfolio.warnings ?? [], id: \.self) { warning in
+                    Text(warning).font(.system(size: 11)).foregroundStyle(.orange)
+                }
             }.padding(.vertical, 10)
             VStack(alignment: .leading, spacing: 18) {
                 Text("Positions").font(.system(size: 13, weight: .medium))

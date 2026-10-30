@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from urllib.parse import urlencode, urlsplit
 
 MAX_SYMBOLS = 80
@@ -126,6 +127,11 @@ def discover_candidates(evidence, listings, config) -> list[dict]:
                 if url not in candidate['source_urls']: candidate['source_urls'].append(url)
                 if eid not in candidate['evidence_ids']: candidate['evidence_ids'].append(eid)
     seeds_order = [normalize_symbol(x) for x in seeds] if isinstance(seeds, (list, tuple)) else []
+    observed = datetime.now(timezone.utc).isoformat()
+    for company in output.values():
+        company.update(first_observed_at=observed, valid_from=observed,
+            membership_basis='current_public_evidence_or_operator_seed', historical_membership_verified=False,
+            business_exposure_verified=False)
     return sorted(output.values(), key=lambda c: (0, seeds_order.index(c['symbol'])) if c['symbol'] in seeds_order else (1, c['symbol']))
 
 

@@ -78,7 +78,7 @@ struct PrismResearchView: View {
             Text("Chips, memory, networking, cloud compute, data centers, power and cooling")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             if let collection = runtime.state?.cascade?.collection {
-                Text("\(collection.collectorCount) collectors · \(collection.evidenceCount) evidence records · \(collection.sourceCount) sources")
+                Text("\(collection.activeCollectorCount ?? collection.collectorCount) active collectors · \(collection.evidenceCount) evidence records · \(collection.sourceCount) sources")
                     .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
             }
             if let sector = runtime.state?.cascade?.sector, !sector.companies.isEmpty {

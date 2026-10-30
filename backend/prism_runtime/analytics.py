@@ -23,7 +23,7 @@ MIN_CANDLES = 300
 MIN_TRADES = 8
 MIN_BLOCKS = 12
 ALPHA = .05
-KINDS = {"momentum", "mean_reversion", "breakout"}
+KINDS = {"momentum", "mean_reversion", "breakout", "event_surprise"}
 
 
 def _number(value, label, *, positive=False):
@@ -61,7 +61,7 @@ def canonical_spec(proposal):
         raise ValueError("A market symbol is required")
     kind = proposal.get("kind", proposal.get("family"))
     if kind not in KINDS:
-        raise ValueError("Supported families are momentum, mean_reversion, breakout")
+        raise ValueError("Supported families are momentum, mean_reversion, breakout, event_surprise")
     if proposal.get("direction", "long") != "long":
         raise ValueError("Only paper spot long strategies are supported")
     parameters = proposal.get("parameters", {})
@@ -71,10 +71,16 @@ def canonical_spec(proposal):
     if not lookback.is_integer() or not 3 <= lookback <= 100:
         raise ValueError("Lookback must be an integer from 3 to 100")
     threshold = _number(parameters.get("threshold", 1.0 if kind == "mean_reversion" else .002 if kind == "momentum" else 0), "threshold")
-    if not (0.1 <= threshold <= 4 if kind == "mean_reversion" else 0 <= threshold <= .2):
+    if not (0.1 <= threshold <= 4 if kind == "mean_reversion" else 0 <= threshold <= 10 if kind == 'event_surprise' else 0 <= threshold <= .2):
         raise ValueError("Threshold is outside the bounded strategy family")
-    return {"symbol": symbol.strip().upper(), "kind": kind,
-            "parameters": {"lookback": int(lookback), "threshold": threshold}}
+    result = {"symbol": symbol.strip().upper(), "kind": kind,
+              "parameters": {"lookback": int(lookback), "threshold": threshold}}
+    if 'security_id' in proposal:
+        security = proposal['security_id']
+        if not isinstance(security, str) or not security.strip() or len(security) > 160:
+            raise ValueError('Invalid stable security identifier')
+        result['security_id'] = security
+    return result
 
 
 def spec_hash(spec):
@@ -161,6 +167,18 @@ def signal_target(spec, history, current_target=0):
     if len(history) < lookback + 1:
         return 0
     last = history[-1]["close"]
+    if spec['kind'] == 'event_surprise':
+        cutoff = history[-1]['end_ms']
+        first = history[-lookback]['start_ms']
+        latest = {}
+        for feature in history[-1].get('event_features', []):
+            if (feature.get('symbol') != spec['symbol'] or not first <= feature.get('session_ms', 0) <= cutoff
+                or feature.get('available_at_ms', cutoff+1) > cutoff or not feature.get('evidence_ids')):
+                continue
+            key = feature.get('event_identity', feature.get('id'))
+            if key not in latest or feature['available_at_ms'] > latest[key]['available_at_ms']:
+                latest[key] = feature
+        return int(any(_number(feature.get('value'), 'event surprise') > threshold for feature in latest.values()))
     if spec["kind"] == "momentum":
         return int(last / history[-lookback - 1]["close"] - 1 > threshold)
     if spec["kind"] == "breakout":
@@ -255,44 +273,110 @@ def _fingerprint(bars):
     return hashlib.sha256(json.dumps(bars, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def validate_edges(proposals: list[dict], markets: list[dict], *, trial_count: int = 1) -> list[dict]:
+def _daily_report(spec, market, markets, start, end, config):
+    from .simulation import replay
+    bars = closed_candles(market)
+    replayed = replay(spec, [market], config, start_ms=bars[start]['start_ms'], end_ms=bars[end-1]['end_ms'],
+        observation_delay_seconds=(config or {}).get('research', {}).get('observation_delay_seconds', 0))
+    book, curve = replayed['portfolio'], replayed['curve']
+    returns, equity = [], book['initial_equity']
+    peak, drawdown = equity, 0.
+    for point in curve:
+        returns.append(point['equity'] / equity - 1)
+        equity = point['equity']
+        peak = max(peak, equity)
+        drawdown = max(drawdown, 1-equity/peak)
+    deviation = statistics.stdev(returns) if len(returns) > 1 else 0.
+    exits = [row for row in book['trades'] if row['side'] == 'sell' and row.get('position_closed', True)]
+    return {'net_return': equity/book['initial_equity']-1, 'returns': returns,
+        'equity_curve': [row['equity']/book['initial_equity'] for row in curve],
+        'sharpe': statistics.fmean(returns)/deviation*math.sqrt(252) if deviation else 0.,
+        'max_drawdown': drawdown, 'trades': len(exits), 'entries': sum(row['side']=='buy' for row in book['trades']),
+        'win_rate': sum(row['realized_pnl'] > 0 for row in exits)/len(exits) if exits else 0.,
+        'costs': (book['fees_paid']+book.get('slippage_paid', 0))/book['initial_equity'], 'bars': len(curve)}
+
+
+def _benchmarks(spec, market, markets, start, end, returns, config):
+    from .simulation import execution_policy
+    policy = execution_policy(config)
+    bars = closed_candles(market)
+    cost = 2*(policy['fee_bps']+policy['slippage_bps']+policy['spread_bps']/2)/10000
+    stock = bars[end-1]['close']/bars[start]['open']-1-cost
+    allocation = policy['allocation_fraction']
+    result = {'stock_buy_hold_return': stock, 'exposure_matched_return': allocation*stock,
+              'cash_return': 0., 'sector_return': None, 'market_return': None,
+              'universe_scope': 'current_membership_only', 'missing_baselines': []}
+    for kind in ('market', 'sector'):
+        benchmark = next((m for m in markets if m.get('benchmark_kind') == kind), None)
+        if benchmark:
+            available = [b for b in closed_candles(benchmark) if bars[start]['start_ms'] <= b['start_ms'] and b['end_ms'] <= bars[end-1]['end_ms']]
+            if len(available) >= end-start-2:
+                result[kind+'_return'] = allocation*(available[-1]['close']/available[0]['open']-1-cost)
+        if result[kind+'_return'] is None:
+            result['missing_baselines'].append(kind)
+    block_size = max(8, spec['parameters']['lookback'])
+    blocks = [math.prod(1+r for r in returns[i:i+block_size])-1 for i in range(0,len(returns)-block_size+1,block_size)]
+    if len(blocks) > 1:
+        uncertainty = 1.96*statistics.stdev(blocks)/math.sqrt(len(blocks))
+        result['block_mean_return'] = statistics.fmean(blocks)
+        result['block_mean_interval'] = [statistics.fmean(blocks)-uncertainty, statistics.fmean(blocks)+uncertainty]
+    if spec['kind'] == 'event_surprise' and market.get('asset_class') == 'equity':
+        control = {'symbol': spec['symbol'], 'kind': 'momentum', 'parameters': {'lookback': spec['parameters']['lookback'], 'threshold': .002}}
+        report = _daily_report(control, market, markets, start, end, config)
+        result['event_ablation_technical_return'] = report['net_return']
+    return result
+
+
+def validate_edges(proposals: list[dict], markets: list[dict], *, trial_count: int = 1, config=None, alpha_budget=None) -> list[dict]:
     """Reject unmeasured claims; compare a frozen rule to cash after trading costs."""
     if not isinstance(proposals, list) or not isinstance(markets, list):
         raise ValueError("Proposals and markets must be lists")
     if isinstance(trial_count, bool) or not isinstance(trial_count, int) or trial_count < 1:
         raise ValueError("trial_count must include all attempted hypotheses")
     trials = max(trial_count, len(proposals), 1)
+    from . import simulation
+    policy = simulation.execution_policy(config)
+    if alpha_budget is not None and (not isinstance(alpha_budget, (float, int)) or isinstance(alpha_budget, bool) or not 0 < alpha_budget <= ALPHA):
+        raise ValueError('Invalid preallocated experiment alpha budget')
     result = []
     for proposal in proposals:
         proposal = proposal if isinstance(proposal, dict) else {}
         edge = {"id": "edge-" + hashlib.sha256(json.dumps(proposal, sort_keys=True, default=str).encode()).hexdigest()[:20],
                 "symbol": proposal.get("symbol", ""), "kind": proposal.get("kind", proposal.get("family", "")),
                 "parameters": deepcopy(proposal.get("parameters", {})), "evidence_ids": deepcopy(proposal.get("evidence_ids", [])),
-                "hypothesis": str(proposal.get("hypothesis", ""))[:4000], "status": "rejected", "metrics": {}, "reason": ""}
+                "hypothesis": str(proposal.get("hypothesis", ""))[:4000], "status": "rejected", "metrics": {}, "reason": "",
+                'development_only': True, 'policy': policy, 'policy_hash': simulation.policy_hash(config)}
         try:
             spec = canonical_spec(proposal)
             if not isinstance(edge["evidence_ids"], list) or not edge["evidence_ids"] or not all(isinstance(value, str) and value for value in edge["evidence_ids"]) or not edge["hypothesis"].strip():
                 raise ValueError("Hypothesis and source evidence lineage are required")
-            bars = closed_candles(_market(spec["symbol"], markets))
+            market = _market(spec['symbol'], markets)
+            bars = closed_candles(market)
             if len(bars) < MIN_CANDLES:
                 raise ValueError(f"Insufficient closed history: need at least {MIN_CANDLES} candles")
             split = int(len(bars) * .65)
             warmup = spec["parameters"]["lookback"] + 1
-            train = _run_segment(spec, bars, warmup, split)
-            holdout = _run_segment(spec, bars, split, len(bars))
+            daily = market.get('asset_class') == 'equity'
+            if daily:
+                train = _daily_report(spec, market, markets, warmup, split, config)
+                holdout = _daily_report(spec, market, markets, split, len(bars), config)
+            else:
+                train = _run_segment(spec, bars, warmup, split, fee_bps=policy['fee_bps'], slippage_bps=policy['slippage_bps'])
+                holdout = _run_segment(spec, bars, split, len(bars), fee_bps=policy['fee_bps'], slippage_bps=policy['slippage_bps'])
             block_size = max(8, spec["parameters"]["lookback"])
             p_value, blocks, positive_blocks, correlation = _sign_test(holdout["returns"], block_size)
             adjusted = min(1.0, p_value * trials)
             metrics = {**_summary(holdout), "p_value": p_value, "adjusted_p_value": adjusted,
-                       "confidence": 1 - adjusted, "trial_count": trials,
+                       "trial_count": trials,
                        "block_size": block_size, "nonzero_blocks": blocks, "positive_blocks": positive_blocks,
                        "block_lag1_correlation": correlation, "train_net_return": train["net_return"], "train_trades": train["trades"]}
-            validation = {"method": "chronological_holdout_block_sign_test", "benchmark": "uninvested_cash",
+            validation = {"method": "development_chronological_block_screen", "benchmark": "stock_and_exposure_matched_buy_hold",
+                          'development_only': True, 'policy_hash': simulation.policy_hash(config),
                           "spec_hash": spec_hash(spec), "data_fingerprint": _fingerprint(bars),
                           "train_start_ms": bars[warmup]["start_ms"], "train_end_ms": bars[split - 1]["end_ms"],
                           "holdout_start_ms": bars[split]["start_ms"], "holdout_end_ms": bars[-1]["end_ms"],
                           "sample_bars": len(bars), "alpha": ALPHA, "trial_count": trials,
-                          "fee_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS,
+                          "fee_bps": policy['fee_bps'], "slippage_bps": policy['slippage_bps'],
                           "assumptions": "Block signs are approximately independent and stationary; significance is a screening result, not a profit probability.",
                           "references": ["https://www.itl.nist.gov/div898/software/dataplot/refman1/auxillar/signtest.htm", "https://www.itl.nist.gov/div898/handbook/prc/section4/prc473.htm"]}
             reasons = []
@@ -304,19 +388,50 @@ def validate_edges(proposals: list[dict], markets: list[dict], *, trial_count: i
                 reasons.append("Serially dependent holdout blocks fail the independence screen")
             if train["net_return"] <= 0 or holdout["net_return"] <= 0:
                 reasons.append("Net return must be positive after costs in both periods")
-            if adjusted > ALPHA:
+            if (p_value > alpha_budget if alpha_budget is not None else adjusted > ALPHA):
                 reasons.append("Holdout evidence fails the multiple-testing corrected significance threshold")
             if holdout["max_drawdown"] > .2:
                 reasons.append("Holdout drawdown exceeds the 20% research ceiling")
+            benchmarks = _benchmarks(spec, market, markets, split, len(bars), holdout['returns'], config)
+            if holdout['net_return'] <= benchmarks['exposure_matched_return']:
+                reasons.append('Development result does not beat exposure-matched buy-and-hold')
+            if len(holdout['returns']) // block_size < MIN_BLOCKS:
+                reasons.append('Requested lookback is infeasible for available independent blocks; more history required')
+            stress, folds, sensitivity = [], [], []
+            if daily:
+                for multiplier in (2, 3):
+                    stressed = deepcopy(config or {})
+                    stressed['risk'] = {**(config or {}).get('risk', {}), 'slippage_bps': policy['slippage_bps'] * multiplier,
+                        'spread_bps': policy['spread_bps'] * multiplier, 'impact_bps': policy['impact_bps'] * multiplier}
+                    report = _daily_report(spec, market, markets, split, len(bars), stressed)
+                    stress.append({'cost_multiplier': multiplier, 'net_return': report['net_return'], 'max_drawdown': report['max_drawdown']})
+                if any(row['net_return'] <= 0 for row in stress):
+                    reasons.append('Development profitability fails adverse execution-cost scenarios')
+                delayed = deepcopy(config or {})
+                delayed['research'] = {**delayed.get('research', {}), 'observation_delay_seconds': 180}
+                delayed_report = _daily_report(spec, market, markets, split, len(bars), delayed)
+                stress.append({'scenario': 'missed_opening_observation', 'observation_delay_seconds': 180,
+                               'net_return': delayed_report['net_return'], 'entries': delayed_report['entries']})
+                for lookback in (spec['parameters']['lookback']-1, spec['parameters']['lookback']+1):
+                    if 3 <= lookback <= 100:
+                        neighbor = {**spec, 'parameters': {**spec['parameters'], 'lookback': lookback}}
+                        report = _daily_report(neighbor, market, markets, split, len(bars), config)
+                        sensitivity.append({'spec': neighbor, 'net_return': report['net_return'],
+                                            'development_only': True, 'eligible_for_deployment': False})
+                width = max(1, (len(bars) - warmup) // 3)
+                for start in range(warmup, len(bars) - width + 1, width):
+                    report = _daily_report(spec, market, markets, start, min(start + width, len(bars)), config)
+                    folds.append({'start_ms': bars[start]['start_ms'], **_summary(report)})
             edge.update(spec, metrics=metrics, validation=validation, train_metrics=_summary(train), holdout_metrics=_summary(holdout),
-                        status="rejected" if reasons else "validated", reason="; ".join(reasons) if reasons else "Frozen parameters passed chronological holdout and cost-aware statistical screening; paper eligible")
+                        benchmarks=benchmarks, stress_reports=stress, walk_forward=folds, parameter_sensitivity=sensitivity,
+                        status="rejected" if reasons else "validated", reason="; ".join(reasons) if reasons else "Frozen rule passed development screening; prospective confirmation required")
         except (ValueError, TypeError, KeyError, OverflowError) as exc:
             edge["reason"] = str(exc)
         result.append(edge)
     return result
 
 
-def assess_strategy(proposal: dict, edges: list[dict], markets: list[dict]) -> dict:
+def assess_strategy(proposal: dict, edges: list[dict], markets: list[dict], config=None) -> dict:
     """The strategist may name and select evidence; it cannot retune tested rules."""
     now = datetime.now(timezone.utc).isoformat()
     proposal = proposal if isinstance(proposal, dict) else {}

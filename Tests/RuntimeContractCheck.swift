@@ -11,6 +11,8 @@ struct RuntimeContractCheck {
         let state = try decoder.decode(RuntimeState.self, from: data)
         try require(state.runtime.mode == "paper", "Paper execution must be explicit.")
         try require(state.runtime.status == "paused", "A new cascade must start paused.")
+        try require(state.research?.historicalResultsAreDevelopment == true && state.research?.experimentCount == 0,
+                    "Development evidence and the prospective registry must reach the console.")
         try require(!state.runtime.openaiConfigured, "The contract fixture must use no provider credential.")
         try require(state.agents.count == 33 && Set(state.agents.map(\.id)).count == 33,
                     "Every cascade agent must have a stable, unique UI identity.")
@@ -37,6 +39,7 @@ struct RuntimeContractCheck {
                     "Discovered company identity and source provenance must decode.")
         var legacy = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         legacy.removeValue(forKey: "cascade")
+        legacy.removeValue(forKey: "research")
         var legacyMarkets = legacy["markets"] as! [[String: Any]]
         legacyMarkets[0]["change_24h"] = NSNull()
         legacy["markets"] = legacyMarkets

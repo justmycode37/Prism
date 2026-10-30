@@ -134,6 +134,18 @@ class AnalyticsTests(unittest.TestCase):
 
 
 class EquityCalendarTests(unittest.TestCase):
+    def test_real_equity_policy_reports_benchmarks_stress_and_sensitivity(self):
+        from test_simulation import daily_market
+        market = daily_market(320)
+        result = validate_edges([hypothesis(symbol='MRVL')], [market])[0]
+        self.assertTrue(result['development_only'])
+        self.assertTrue(result['metrics'], result['reason'])
+        self.assertIn('exposure_matched_return', result['benchmarks'])
+        self.assertEqual(len(result['walk_forward']), 3)
+        self.assertTrue(result['parameter_sensitivity'])
+        outage = next(row for row in result['stress_reports'] if row.get('scenario') == 'missed_opening_observation')
+        self.assertEqual(outage['entries'], 0)
+
     def equity_history(self, count=400):
         from datetime import datetime, timedelta
         from zoneinfo import ZoneInfo

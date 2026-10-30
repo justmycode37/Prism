@@ -147,7 +147,8 @@ class IngestionTests(unittest.TestCase):
             'indicators': {'quote': [{'open': [100, 101], 'high': [103, 104],
                 'low': [99, 100], 'close': [102, 103], 'volume': [20, 30]}]}}]}}
         collector = FixtureCollector({
-            '/v8/finance/chart/MRVL?range=5y&interval=1d': document(json.dumps(ticker), 'application/json')})
+            '/v8/finance/chart/MRVL?range=5y&interval=1d&events=div%2Csplits': document(json.dumps(ticker), 'application/json'),
+            '/v8/finance/chart/MRVL?range=1d&interval=1d&events=div%2Csplits': document(json.dumps(ticker), 'application/json')})
         result = collector.collect({'symbol': 'MRVL', 'sources': []})
         self.assertEqual(result['errors'], [])
         market = result['markets'][0]
@@ -157,7 +158,11 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(len(market['candles']), 2)
         self.assertEqual({row['source_kind'] for row in result['evidence']}, {'market', 'chart'})
         self.assertEqual(len(collector.collect_markets(['MRVL'])), 1)
-        self.assertEqual(len(collector.calls), 1)
+        self.assertEqual(len(collector.calls), 2)
+        refreshed = collector.collect_markets(['MRVL'])[0]
+        self.assertTrue(refreshed['quote_only'])
+        self.assertNotIn('candles', refreshed)
+        self.assertEqual(len(collector.calls), 2)  # Both source URLs retain single-flight caches.
 
     def test_collector_shards_cover_the_full_discovered_universe(self):
         from prism_runtime.config import default_config
