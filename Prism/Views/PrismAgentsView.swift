@@ -269,6 +269,7 @@ struct PrismAgentsView: View {
         let name: String
         switch model {
         case "gpt-6-luna": name = "GPT-6 Luna"
+        case "gpt-6.1-sol": name = "GPT-6.1 Sol"
         case "gpt-6-astra": name = "GPT-6 Astra"
         default: name = model
         }

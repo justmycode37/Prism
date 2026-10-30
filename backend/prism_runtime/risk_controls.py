@@ -43,7 +43,7 @@ def validate_intent(intent, *, strategy, decision_snapshot, market, account, ord
     expiry = number(intent.get('expires_at_ms'), 'Intent expiry', positive=True)
     deadline = min(limits['max_decision_age_seconds'], strategy['market_policy']['max_decision_latency_seconds']) * 1000
     if captured > now_ms + 1000 or now_ms - captured > deadline or not now_ms < expiry <= captured + deadline:
-        raise IntentRejected('Astra intent is stale or exceeds its permitted validity window')
+        raise IntentRejected('Sol intent is stale or exceeds its permitted validity window')
     if account.get('reconciliation_required', True):
         raise IntentRejected('Account reconciliation is required')
     account_at = number(account.get('updated_at_ms'), 'Account update time', positive=True)

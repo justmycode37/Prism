@@ -1,6 +1,6 @@
-# Astra execution controls
+# GPT-6.1 Sol execution controls
 
-`ExecutionController` connects the durable Astra Responses tool loop to the
+`ExecutionController` connects the durable GPT-6.1 Sol Responses tool loop to the
 host `BybitAdapter`, `MarketDataService`, `ResearchMemory`, and deterministic
 risk controls. Construction is offline. The controller does not create an
 exchange transport or load credentials itself.
@@ -23,7 +23,7 @@ ExecutionController(
 `adapter` must provide `reconcile`, `orders`, `executions`, `submit_order`,
 `amend_order`, `cancel_order`, and the protection methods used for linear
 positions. `market` provides `snapshot` and `snapshot_status`. `memory` is a
-`ResearchMemory`. Astra is called only by `handle_event(event)`; `protect()`
+`ResearchMemory`. GPT-6.1 Sol is called only by `handle_event(event)`; `protect()`
 and `reconcile()` never invoke a model.
 
 The mutable `permission_check` callback defaults to `lambda: True`. The
@@ -38,9 +38,9 @@ still enabled.
 `handle_event` accepts the durable event shape used by `ContinuousServices`:
 `{id, kind, strategy_id, snapshot_id, ...}`. It refreshes host account and
 market state, scopes the model packet to the event's exact strategy version,
-and passes only the names and schemas in `EXECUTION_TOOLS` to Astra. Tool
+and passes only the names and schemas in `EXECUTION_TOOLS` to GPT-6.1 Sol. Tool
 proposals are checked against the exact host snapshot and current account under
-the controller's mutation lock. That lock is not held while Astra is running.
+the controller's mutation lock. That lock is not held while GPT-6.1 Sol is running.
 
 The host handles `inspect_strategies`, `inspect_market`, `inspect_account`,
 `inspect_orders`, `submit_order_intent`, `amend_order`, `cancel_order`,
@@ -59,7 +59,7 @@ replaced with a default. Daily P&L uses the first
 verified equity observed in the UTC day; drawdown uses the durable account
 peak. Account state is scoped by a one-way hash of Bybit environment and
 account identity. Credentials and raw account response objects are excluded
-from Astra packets and the public controller state.
+from GPT-6.1 Sol packets and the public controller state.
 
 The controller estimates daily P&L as current Unified account equity minus the
 first verified equity snapshot observed that UTC day. It reads the Bybit

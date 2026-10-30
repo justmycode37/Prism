@@ -42,8 +42,8 @@ DEFAULT_CONFIG = {
     'layers': {
         'collector': {'count': 24, 'model': 'gpt-6-luna', 'reasoning_effort': 'low'},
         'analyst': {'count': 6, 'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium'},
-        'strategist': {'count': 2, 'model': 'gpt-6-astra', 'reasoning_effort': 'high'},
-        'executor': {'count': 1, 'model': 'gpt-6-astra', 'reasoning_effort': 'max'},
+        'strategist': {'count': 2, 'model': 'gpt-6.1-sol', 'reasoning_effort': 'high'},
+        'executor': {'count': 1, 'model': 'gpt-6.1-sol', 'reasoning_effort': 'max'},
     },
     # Operator-supplied conservative reservation rates, not a published price claim.
     'model_prices': {

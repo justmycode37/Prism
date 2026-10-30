@@ -44,7 +44,7 @@ class AgentRuntimeTests(unittest.TestCase):
         result = self.agent.tools({'strategy_version': 'frozen'}, tools, handle, task_id='decision')
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(self.requests), 2)
-        self.assertEqual(self.requests[0]['model'], 'gpt-6-astra')
+        self.assertEqual(self.requests[0]['model'], 'gpt-6.1-sol')
         self.assertFalse(self.requests[0]['parallel_tool_calls'])
         self.assertIn('reasoning', [r.get('type') for r in self.requests[1]['input']])
         self.assertIn('function_call_output', [r.get('type') for r in self.requests[1]['input']])
@@ -89,11 +89,41 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertFalse(self.store.config()['bybit']['enabled'])
         self.assertFalse(self.store.config()['bybit']['mainnet_enabled'])
         self.store.update_config({'resources': {'execution': {'daily_calls': 5}}})
-        self.assertEqual(self.store.config()['resources']['execution']['model'], 'gpt-6-astra')
-        with self.assertRaises(ValueError):
-            self.store.update_config({'resources': {'execution': {'model': 'gpt-6-luna'}}})
+        self.assertEqual(self.store.config()['resources']['execution']['model'], 'gpt-6.1-sol')
+        for model in ('gpt-6-luna', 'gpt-6-astra'):
+            with self.subTest(model=model), self.assertRaises(ValueError):
+                self.store.update_config({'resources': {'execution': {'model': model}}})
         with self.assertRaises(ValueError):
             self.store.update_config({'live_execution': {'max_decision_age_seconds': 300}})
+
+    def test_saved_astra_routing_migrates_once_without_rewriting_history_or_limits(self):
+        legacy = self.store.config()
+        legacy['resources']['execution'].update(model='gpt-6-astra', daily_calls=7,
+                                                 daily_usd=11., reasoning_effort='medium')
+        for role in ('strategist', 'executor'):
+            legacy['layers'][role]['model'] = 'gpt-6-astra'
+        self.store.set_document('config', legacy)
+        self.store.set_document('execution_state', {'decision': 'prior hold', 'order_id': 'keep'})
+        call = self.store.reserve('gpt-6-astra', 1000, 100, now=self.clock())
+        self.store.settle(call, {'input_tokens': 200, 'output_tokens': 20})
+        expected = copy.deepcopy(legacy)
+        expected['resources']['execution']['model'] = 'gpt-6.1-sol'
+        for role in ('strategist', 'executor'):
+            expected['layers'][role]['model'] = 'gpt-6.1-sol'
+        restarted = Store(self.store.path, clock=self.clock)
+        self.assertEqual(restarted.config(), expected)
+        self.assertEqual(restarted.get_document('config_before_sol_routing'), legacy)
+        self.assertEqual(restarted.get_document('execution_state'), {'decision': 'prior hold', 'order_id': 'keep'})
+        with restarted.connection() as db:
+            receipt = dict(db.execute('SELECT * FROM cascade_calls WHERE id=?', (call,)).fetchone())
+        self.assertEqual(receipt['model'], 'gpt-6-astra')
+        self.assertAlmostEqual(receipt['charged'], .009)
+        again = Store(self.store.path, clock=self.clock)
+        self.assertEqual(again.config(), expected)
+        self.assertEqual(again.get_document('config_before_sol_routing'), legacy)
+        with again.connection() as db:
+            count = db.execute("SELECT COUNT(*) FROM cascade_events WHERE message LIKE 'Migrated execution and strategy-review%'").fetchone()[0]
+        self.assertEqual(count, 1)
 
 
 if __name__ == '__main__':

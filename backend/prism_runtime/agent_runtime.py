@@ -20,7 +20,7 @@ DEFAULT_RESOURCES = {
     'scheduler': {'model': 'gpt-6-luna', 'reasoning_effort': 'low', 'daily_calls': 96, 'daily_usd': 15., 'concurrency': 1, 'max_output_tokens': 4096},
     'discovery': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium', 'daily_calls': 96, 'daily_usd': 100., 'concurrency': 4, 'max_output_tokens': 8192},
     'review': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium', 'daily_calls': 32, 'daily_usd': 40., 'concurrency': 1, 'max_output_tokens': 8192},
-    'execution': {'model': 'gpt-6-astra', 'reasoning_effort': 'high', 'daily_calls': 240, 'daily_usd': 150., 'concurrency': 1, 'max_output_tokens': 4096},
+    'execution': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'high', 'daily_calls': 240, 'daily_usd': 150., 'concurrency': 1, 'max_output_tokens': 4096},
 }
 
 
@@ -143,7 +143,7 @@ class ResponsesAgent:
 
     def _base(self, component, payload, role):
         limits = self.budget.limits(component)
-        return {'model': 'gpt-6-astra' if component == 'execution' else limits['model'],
+        return {'model': DEFAULT_RESOURCES['execution']['model'] if component == 'execution' else limits['model'],
                 'reasoning': {'effort': limits['reasoning_effort']}, 'store': False,
                 'include': ['reasoning.encrypted_content'], 'max_output_tokens': limits['max_output_tokens'],
                 'input': [{'role': 'developer', 'content': self._instructions(role)},

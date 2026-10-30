@@ -31,8 +31,8 @@ Daily-equity v1 manuals are loaded into v1 requests and sliced to 6,000 characte
 
 - [Collector](../backend/agent_roles/collector.md): extract and attribute claims from supplied evidence.
 - [Analyst](../backend/agent_roles/analyst.md): create source-grounded, falsifiable proposals.
-- [Strategist](../backend/agent_roles/strategist.md): optional v1 advisory review of frozen candidates.
-- [Executor](../backend/agent_roles/executor.md): v2 GPT-6 Astra tool-using execution role; daily-equity v1 keeps its separate advisory output schema and host policy.
+- [Strategist](../backend/agent_roles/strategist.md): optional v1 GPT-6.1 Sol advisory review of frozen candidates.
+- [Executor](../backend/agent_roles/executor.md): GPT-6.1 Sol tool-using v2 execution role; daily-equity v1 keeps its separate advisory output schema and host policy.
 - [Scheduler](../backend/agent_roles/scheduler.md): source-backed, bounded task planning.
 - [Bybit researcher](../backend/agent_roles/bybit_researcher.md): exact-instrument development discovery.
 - [Reviewer](../backend/agent_roles/reviewer.md): durable strategy dossier review and bounded revision proposals.

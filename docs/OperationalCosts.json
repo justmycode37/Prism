@@ -91,11 +91,11 @@
       "conservative_runtime_reservation_usd": 0.6718
     },
     "execution": {
-      "model": "gpt-6-astra",
+      "model": "gpt-6.1-sol",
       "reasoning_effort": "high",
       "configured_price_per_million_usd": {
-        "input": 30.0,
-        "output": 150.0
+        "input": 10.0,
+        "output": 50.0
       },
       "bounded_strategy_dossier_bytes_for_execution": 7577,
       "responses_rounds": [
@@ -103,21 +103,21 @@
           "request_body_bytes": 97169,
           "assumed_input_tokens": 24293,
           "assumed_output_tokens": 350,
-          "estimated_usd": 0.78129,
-          "conservative_runtime_reservation_usd": 3.88947
+          "estimated_usd": 0.26043,
+          "conservative_runtime_reservation_usd": 1.29649
         },
         {
           "request_body_bytes": 98523,
           "assumed_input_tokens": 24631,
           "assumed_output_tokens": 500,
-          "estimated_usd": 0.81393,
-          "conservative_runtime_reservation_usd": 3.93009
+          "estimated_usd": 0.27131,
+          "conservative_runtime_reservation_usd": 1.31003
         }
       ],
       "two_round_event_decision": {
         "responses": 2,
-        "estimated_usd": 1.59522,
-        "conservative_runtime_reservation_usd": 7.81956,
+        "estimated_usd": 0.53174,
+        "conservative_runtime_reservation_usd": 2.6065199999999997,
         "total_input_bytes": 195692,
         "total_assumed_input_tokens": 48924,
         "total_assumed_output_tokens": 850
@@ -126,8 +126,8 @@
         "request_body_bytes": 177338,
         "assumed_input_tokens": 44335,
         "assumed_output_tokens": 300,
-        "estimated_usd_per_additional_response": 1.37505,
-        "conservative_runtime_reservation_usd": 6.29454
+        "estimated_usd_per_additional_response": 0.45835,
+        "conservative_runtime_reservation_usd": 2.09818
       },
       "tool_limit": {
         "max_rounds": 4,
@@ -147,8 +147,8 @@
         "execution": 24
       },
       "requested_responses_total": 48,
-      "requested_uncapped_estimated_usd": 24.04628,
-      "sum_uncapped_request_reservations_usd": 116.186124,
+      "requested_uncapped_estimated_usd": 11.284519999999999,
+      "sum_uncapped_request_reservations_usd": 53.629644,
       "component_cap_admitted_responses": {
         "scheduler": 12,
         "discovery": 8,
@@ -163,10 +163,10 @@
       },
       "component_cap_admitted_execution_decisions": 12,
       "global_cap_admitted_execution_decisions": 12,
-      "estimated_usd_after_component_caps": 24.04628,
-      "sum_request_reservations_after_component_caps": 116.186124,
-      "estimated_usd_after_global_caps": 24.04628,
-      "sum_request_reservations_after_global_caps": 116.186124,
+      "estimated_usd_after_component_caps": 11.284519999999999,
+      "sum_request_reservations_after_component_caps": 53.629644,
+      "estimated_usd_after_global_caps": 11.284519999999999,
+      "sum_request_reservations_after_global_caps": 53.629644,
       "global_budget_order_assumption": [
         "scheduler",
         "discovery",
@@ -196,8 +196,8 @@
         "execution": 160
       },
       "requested_responses_total": 272,
-      "requested_uncapped_estimated_usd": 156.12384,
-      "sum_uncapped_request_reservations_usd": 753.250576,
+      "requested_uncapped_estimated_usd": 71.04544,
+      "sum_uncapped_request_reservations_usd": 336.207376,
       "component_cap_admitted_responses": {
         "scheduler": 48,
         "discovery": 48,
@@ -212,10 +212,10 @@
       },
       "component_cap_admitted_execution_decisions": 80,
       "global_cap_admitted_execution_decisions": 80,
-      "estimated_usd_after_component_caps": 156.12384,
-      "sum_request_reservations_after_component_caps": 753.250576,
-      "estimated_usd_after_global_caps": 156.12384,
-      "sum_request_reservations_after_global_caps": 753.250576,
+      "estimated_usd_after_component_caps": 71.04544,
+      "sum_request_reservations_after_component_caps": 336.207376,
+      "estimated_usd_after_global_caps": 71.04544,
+      "sum_request_reservations_after_global_caps": 336.207376,
       "global_budget_order_assumption": [
         "scheduler",
         "discovery",
@@ -245,26 +245,26 @@
         "execution": 2880
       },
       "requested_responses_total": 2880,
-      "requested_uncapped_estimated_usd": 2297.1168000000002,
-      "sum_uncapped_request_reservations_usd": 11260.1664,
+      "requested_uncapped_estimated_usd": 765.7056,
+      "sum_uncapped_request_reservations_usd": 3753.3887999999997,
       "component_cap_admitted_responses": {
         "scheduler": 0,
         "discovery": 0,
         "review": 0,
-        "execution": 184
+        "execution": 240
       },
       "global_cap_admitted_responses": {
         "scheduler": 0,
         "discovery": 0,
         "review": 0,
-        "execution": 184
+        "execution": 240
       },
-      "component_cap_admitted_execution_decisions": 92,
-      "global_cap_admitted_execution_decisions": 92,
-      "estimated_usd_after_component_caps": 146.76024,
-      "sum_request_reservations_after_component_caps": 719.39952,
-      "estimated_usd_after_global_caps": 146.76024,
-      "sum_request_reservations_after_global_caps": 719.39952,
+      "component_cap_admitted_execution_decisions": 120,
+      "global_cap_admitted_execution_decisions": 120,
+      "estimated_usd_after_component_caps": 63.8088,
+      "sum_request_reservations_after_component_caps": 312.78239999999994,
+      "estimated_usd_after_global_caps": 63.8088,
+      "sum_request_reservations_after_global_caps": 312.78239999999994,
       "global_budget_order_assumption": [
         "scheduler",
         "discovery",

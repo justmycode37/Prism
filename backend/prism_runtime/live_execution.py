@@ -1,4 +1,4 @@
-"""Event-driven Astra execution over the host Bybit and market-data services.
+"""Event-driven Sol execution over the host Bybit and market-data services.
 
 The controller owns no exchange transport.  All market/account reads and order
 mutations go through the injected services, so development and tests can use
@@ -40,14 +40,14 @@ def _order_link(tool_id):
 
 
 class ExecutionController:
-    """Operational Astra execution coordinator.
+    """Operational Sol execution coordinator.
 
     Args:
         store: Prism's SQLite ``Store``.
         adapter: ``BybitAdapter`` (including its injected transport, if offline).
         market: ``MarketDataService`` with ``snapshot`` and ``snapshot_status``.
         memory: ``ResearchMemory``; execution observations are recorded per strategy.
-        agents: ``ResponsesAgent``. Astra is called only from ``handle_event``.
+        agents: ``ResponsesAgent``. Sol is called only from ``handle_event``.
         eligibility: Optional ``eligibility(strategy_id)`` callback. Defaults to
             ``LiveResearch(store).eligibility``.
         clock: Callable returning epoch seconds.
@@ -1213,7 +1213,7 @@ class ExecutionController:
         return result
 
     def handle_event(self, event):
-        """Run one bounded Astra conversation for a durable runtime event."""
+        """Run one bounded Sol conversation for a durable runtime event."""
         if not isinstance(event, dict):
             return {"status": "blocked", "reason": "Invalid execution event"}
         strategy_id = event.get("strategy_id")
@@ -1233,7 +1233,7 @@ class ExecutionController:
         if not config["bybit"].get("enabled") or not config["live_execution"].get("enabled") or not self._permission_allowed():
             reason = ("Bybit is disabled by the operator" if not config["bybit"].get("enabled") else
                       "Live execution is disabled by the operator" if not config["live_execution"].get("enabled") else
-                      "Runtime permission is paused; discretionary Astra execution is blocked.")
+                      "Runtime permission is paused; discretionary Sol execution is blocked.")
             value = self._decision_value(decision_id=decision_id, event_id=event_id, strategy_id=strategy_id,
                 fingerprint=identity([strategy_id, event.get("kind"), event.get("snapshot_id"), reason]),
                 status="blocked", snapshot_id=event.get("snapshot_id"), rationale=reason)
@@ -1273,7 +1273,7 @@ class ExecutionController:
         if not self._permission_allowed():
             value = self._decision_value(decision_id=decision_id, event_id=event_id, strategy_id=strategy_id,
                 fingerprint=fingerprint, status="blocked", snapshot_id=snapshot_id,
-                rationale="Runtime permission is paused; discretionary Astra execution is blocked.")
+                rationale="Runtime permission is paused; discretionary Sol execution is blocked.")
             self._record_memory(world, value)
             return value
         approved_snapshots = {snapshot_id}
@@ -1299,7 +1299,7 @@ class ExecutionController:
                 task_id="execution-" + decision_id)
         except BudgetExceeded as error:
             status = "blocked"
-            reason = "Astra execution budget unavailable (" + type(error).__name__ + ")"
+            reason = "Sol execution budget unavailable (" + type(error).__name__ + ")"
             value = self._decision_value(decision_id=decision_id, event_id=event_id, strategy_id=strategy_id,
                 fingerprint=fingerprint, status=status, snapshot_id=snapshot_id, rationale=reason,
                 result={"summary": reason})
@@ -1308,7 +1308,7 @@ class ExecutionController:
             return value
         except Exception as error:
             status = "blocked"
-            reason = "Astra execution unavailable (" + type(error).__name__ + ")"
+            reason = "Sol execution unavailable (" + type(error).__name__ + ")"
             value = self._decision_value(decision_id=decision_id, event_id=event_id, strategy_id=strategy_id,
                 fingerprint=fingerprint, status=status, snapshot_id=snapshot_id, rationale=reason,
                 result={"summary": reason})
@@ -1341,9 +1341,9 @@ class ExecutionController:
             rationale = rationale or action_rationale or action_result.get("rationale") or action_result.get("decision_rationale")
             rationale = rationale or summary
             if not rationale and action.get("name") == "hold":
-                rationale = "Astra recorded a hold."
+                rationale = "Sol recorded a hold."
         else:
-            rationale = summary or "Astra made no execution proposal; the host recorded a hold."
+            rationale = summary or "Sol made no execution proposal; the host recorded a hold."
         rationale = _bounded_text(rationale)
         decision_snapshot_id = (action_result.get("decision_snapshot_id") or action_result.get("snapshot_id")
             or snapshot_id)
