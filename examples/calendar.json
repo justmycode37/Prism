@@ -1,0 +1,78 @@
+{
+  "observed_at": "2020-10-28T12:00:00-04:00",
+  "events": [
+    {
+      "id": "synthetic-recorded-earnings-fixture-001",
+      "revision": 1,
+      "kind": "earnings",
+      "target": "FIXTURE",
+      "status": "confirmed",
+      "source_time": "2020-10-29T16:05:00-04:00",
+      "source_timezone": "America/New_York",
+      "source_url": "operator://synthetic-recorded-calendar-fixture",
+      "provenance": "Synthetic historical schema fixture; not a real company event or current schedule.",
+      "observed_at": "2020-10-28T12:00:00-04:00",
+      "freshness_seconds": 3600,
+      "uncertainty_seconds": 0
+    }
+  ],
+  "sessions": [
+    {
+      "id": "synthetic-recorded-session-fixture-2020-10-29",
+      "exchange": "FIXTURE-EXCHANGE",
+      "date": "2020-10-29",
+      "revision": 1,
+      "source_timezone": "America/New_York",
+      "source_time": "2020-10-29T09:30:00-04:00",
+      "open_time": "2020-10-29T09:30:00-04:00",
+      "close_time": "2020-10-29T16:00:00-04:00",
+      "status": "open",
+      "source_url": "operator://synthetic-recorded-calendar-fixture",
+      "provenance": "Synthetic historical session fixture; does not establish an exchange calendar.",
+      "observed_at": "2020-10-28T12:00:00-04:00",
+      "freshness_seconds": 3600,
+      "uncertainty_seconds": 0
+    }
+  ],
+  "coverage": [
+    {
+      "id": "synthetic-historical-earnings-coverage",
+      "category": "earnings",
+      "scope": "global",
+      "from_time": "2020-10-01T00:00:00-04:00",
+      "to_time": "2020-11-01T00:00:00-04:00",
+      "source_timezone": "America/New_York",
+      "observed_at": "2020-10-28T12:00:00-04:00",
+      "freshness_seconds": 3600,
+      "complete": false,
+      "source_url": "operator://synthetic-recorded-calendar-fixture",
+      "provenance": "Synthetic historical coverage declaration; partial and expired by design."
+    },
+    {
+      "id": "synthetic-historical-market-session-coverage",
+      "category": "market_sessions",
+      "scope": "global",
+      "from_time": "2020-10-01T00:00:00-04:00",
+      "to_time": "2020-11-01T00:00:00-04:00",
+      "source_timezone": "America/New_York",
+      "observed_at": "2020-10-28T12:00:00-04:00",
+      "freshness_seconds": 3600,
+      "complete": false,
+      "source_url": "operator://synthetic-recorded-calendar-fixture",
+      "provenance": "Synthetic historical coverage declaration; partial and expired by design."
+    },
+    {
+      "id": "synthetic-historical-economic-coverage",
+      "category": "economic",
+      "scope": "global",
+      "from_time": "2020-10-01T00:00:00-04:00",
+      "to_time": "2020-11-01T00:00:00-04:00",
+      "source_timezone": "America/New_York",
+      "observed_at": "2020-10-28T12:00:00-04:00",
+      "freshness_seconds": 3600,
+      "complete": false,
+      "source_url": "operator://synthetic-recorded-calendar-fixture",
+      "provenance": "Synthetic historical coverage declaration; partial and expired by design."
+    }
+  ]
+}

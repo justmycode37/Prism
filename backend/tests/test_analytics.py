@@ -21,7 +21,7 @@ def history(count=1600, *, symbol="TESTUSDT", upward=True):
                      "open": price, "high": max(price, close) * 1.0001,
                      "low": min(price, close) * .9999, "close": close, "volume": 10, "closed": True})
         price = close
-    return {"symbol": symbol, "candles": bars}
+    return {"symbol": symbol, "asset_class": "fixture", "candles": bars}
 
 
 def hypothesis(**updates):
@@ -159,7 +159,7 @@ class EquityCalendarTests(unittest.TestCase):
             bars.append({**row, 'start_ms': start, 'end_ms': start + 86400000})
             day += timedelta(days=1)
         return {'symbol': 'MRVL', 'asset_class': 'equity', 'interval_ms': 86400000,
-                'exchange_timezone': 'America/New_York', 'candles': bars}
+                'exchange_timezone': 'America/New_York', 'history_adjustment': 'adjusted_close', 'candles': bars}
 
     def test_weekend_holiday_and_dst_gaps_preserve_observed_sessions(self):
         market = self.equity_history()

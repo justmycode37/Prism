@@ -20,6 +20,9 @@ from .ingestion import SourceCollector
 from .provider import ModelProvider
 from .store import BudgetExceeded
 from . import temporal, simulation, experiments
+from .search import expand_hypothesis
+from .agent_runtime import ComponentBudget
+from .research_memory import ResearchMemory
 
 
 class Runtime:
@@ -30,6 +33,9 @@ class Runtime:
         self._collector_injected = collector is not None
         self._collector_config_key = identity(store.config())
         self.provider = provider or ModelProvider(self.key_loader)
+        self.component_budget = ComponentBudget(store)
+        self.memory = ResearchMemory(store)
+        self.continuous = None
         self.started_at = timestamp()
         self.last_error = None
         self.status = 'paused'
@@ -66,7 +72,7 @@ class Runtime:
                 self.store.set_document('portfolio', execution.initial_portfolio(old_account.get('initial_equity', 100000.)))
                 self.store.event('research', 'Archived the legacy simulated account; prospective paper accounting starts separately.')
             self.store.set_document('research_protocol_version', 1)
-        self.store.event('cascade', 'Reverse cascade loaded: collectors → analysts → strategists → executor. Paper mode; paused until Start.')
+        self.store.event('runtime', 'Event-driven research and trading runtime loaded; paused until Start. Exchange execution requires explicit operator configuration.')
 
     def has_key(self):
         with self._state_lock:
@@ -90,12 +96,63 @@ class Runtime:
                 self._generation += 1
                 self.status = 'paused'
             else:
+                if self.continuous and getattr(self.continuous, 'requires_restart', False):
+                    raise ValueError('Restart the paused runtime to apply the configured account/environment change')
                 self.paused = False
                 self.status = 'running'
                 self.next_cycle_at = time.time()
             self.last_error = None
-        self.store.event('control', f'Cascade {action}; execution mode remains paper.')
+        self.store.event('control', f'Runtime {action}; configured Bybit mode is {self.store.config()["bybit"]["mode"]}.')
+        if self.continuous:
+            self.continuous.wake()
         self._wake.set()
+
+    def update_configuration(self, changes):
+        # Shared with ContinuousServices' mutation lock: once a config update
+        # returns, no submit validated under the prior envelope can begin.
+        with self._execution_lock:
+            return self._update_configuration(changes)
+
+    def _update_configuration(self, changes):
+        """Reject an account/environment transition while state can be exposed."""
+        from .config import validate_config_update
+        from .operations_config import merge_settings
+        from .risk_controls import ACTIVE_ORDERS
+        validated = validate_config_update(changes)
+        old = self.store.config()
+        updated = merge_settings(old, validated)
+        critical = any(old['bybit'][key] != updated['bybit'][key]
+                       for key in ('mode', 'account_id', 'account_type', 'position_mode'))
+        narrowing = (old['bybit']['enabled'] and not updated['bybit']['enabled'] or
+                     old['bybit']['mainnet_enabled'] and not updated['bybit']['mainnet_enabled'] or
+                     any(x not in updated['bybit']['allowed_instruments'] for x in old['bybit']['allowed_instruments']))
+        with self._execution_lock, self._state_lock:
+            if critical and not self.paused:
+                raise ValueError('Pause before changing the account/environment; a process restart applies the new binding')
+            if self.continuous and (critical or narrowing) and self.continuous.has_exposure():
+                raise ValueError('Close exposure and reconcile outstanding orders before changing the exchange envelope')
+            if critical or narrowing:
+                with self.store.connection() as db:
+                    exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bybit_orders'").fetchone()
+                    if exists:
+                        rows = db.execute('SELECT status FROM bybit_orders').fetchall()
+                        if any(row['status'] in ACTIVE_ORDERS for row in rows):
+                            raise ValueError('Unresolved exchange orders prevent an environment or allowlist transition')
+                    positions = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bybit_positions'").fetchone()
+                    if positions:
+                        rows = db.execute('SELECT value FROM bybit_positions').fetchall()
+                        if any(float(json.loads(row['value']).get('quantity', 0)) > 0 for row in rows):
+                            raise ValueError('Exchange positions prevent an environment or allowlist transition')
+                # Spot inventory lives in the wallet and execution attribution,
+                # not the derivatives position endpoint.
+                paper = self.store.get_document('bybit_paper_exchange_v1', {})
+                if any(float(x.get('quantity', 0)) > 0 for x in paper.get('positions', {}).values()):
+                    raise ValueError('Paper positions must be closed before switching their execution environment')
+            result = self.store.update_config(validated)
+            if self.continuous:
+                self.continuous.configuration_changed(result)
+        self.configuration_changed()
+        return result
 
     def configuration_changed(self):
         # Freeze a cycle's roster and inputs. New topology applies only at its next boundary.
@@ -105,24 +162,82 @@ class Runtime:
                 self.collector = SourceCollector(self.store.config())
                 self._collector_config_key = identity(self.store.config())
         self._wake.set()
+        if self.continuous:
+            self.continuous.wake()
+
+    def register_strategy(self, values):
+        from .live_research import LiveResearch
+        if not isinstance(values, dict) or set(values) != {'spec', 'market_policy', 'hypothesis', 'evidence_ids'}:
+            raise ValueError('Registration requires spec, market_policy, hypothesis and existing evidence_ids')
+        result = LiveResearch(self.store, clock=self.store._clock).register(**values)
+        if self.continuous:
+            strategy = next(x for x in self.store.strategies() if x['id'] == result['id'])
+            self.continuous.market.register_strategy(strategy)
+            self.continuous.wake()
+        self._research_state_cache = None
+        self._wake.set()
+        return result
+
+    def queue_review(self, strategy_id):
+        if not isinstance(strategy_id, str) or not strategy_id:
+            raise ValueError('An exact strategy version is required')
+        result = self.memory.enqueue_review(strategy_id, trigger='manual', priority=50)
+        self._wake.set()
+        if self.continuous:
+            self.continuous.wake()
+        return result
+
+    def import_development_tape(self, body):
+        from .live_research import LiveResearch
+        if (not isinstance(body, dict) or set(body) != {'strategy_id', 'observations', 'evaluate'}
+                or not isinstance(body['strategy_id'], str) or not isinstance(body['observations'], list)
+                or len(body['observations']) > 128 or type(body['evaluate']) is not bool):
+            raise ValueError('An exact strategy_id, up to 128 measured observations, and evaluate boolean are required')
+        live = LiveResearch(self.store, clock=self.store._clock)
+        result = live.record_intrabar_development_tape(body['strategy_id'], body['observations']) if body['observations'] else {}
+        if body['evaluate']:
+            result['evaluation'] = live.evaluate_intrabar_development(body['strategy_id'])
+            self.memory.enqueue_review(body['strategy_id'], trigger='initial_evaluation',
+                                       material={'development': result['evaluation']})
+        self._research_state_cache = None
+        if self.continuous:
+            self.continuous.wake()
+        return result
+
+    def import_calendar(self, body):
+        if self.continuous:
+            return self.continuous.import_calendar(body)
+        from .scheduling import CalendarFeedProvider, Scheduler
+        if not isinstance(body, dict) or set(body) - {'id', 'events', 'sessions', 'coverage', 'source_url', 'provenance'}:
+            raise ValueError('Calendar import requires sourced events, sessions and coverage')
+        clock = self.store._clock
+        result = CalendarFeedProvider(clock=clock).load([{'id': 'operator-calendar', **body, 'type': 'operator'}])
+        if result['errors']:
+            raise ValueError('Invalid calendar document')
+        scheduler = Scheduler(self.store, clock=clock)
+        scheduler.upsert_events(result['events'])
+        scheduler.upsert_coverage(result['coverage'])
+        return result
+
+    def operations_state(self):
+        if self.continuous:
+            return self.continuous.state()
+        from .operations_console import projection
+        config = self.store.config()
+        return projection(mode=config['bybit']['mode'], enabled=False,
+            schedule={'rationale': 'Runtime is paused; Start enables the independent services and validated event schedule.'},
+            calendar=[], subscriptions=[], memory=self.memory.state(), execution={},
+            resources=self.component_budget.state(), blocked=[{'kind': 'Calendar coverage',
+                'reason': 'Calendar coverage has not yet been loaded and verified.'}])
 
     def _active(self, generation):
         return not self.paused and not self._stop.is_set() and self._generation == generation
 
     def run_forever(self):
-        self._market_thread = threading.Thread(target=self._market_loop, name='cascade-market-clock', daemon=True)
-        self._market_thread.start()
-        while not self._stop.is_set():
-            if not self.paused and time.time() >= self.next_cycle_at:
-                try:
-                    self.run_cycle()
-                except Exception:
-                    self.last_error = 'Cycle interrupted; completed jobs and handoffs are retained.'
-                    self.store.event('cascade', self.last_error, 'error')
-                    self.status = 'error'
-                    self.next_cycle_at = time.time() + 30
-            self._wake.wait(0.5)
-            self._wake.clear()
+        from .continuous import ContinuousServices
+        if self.continuous is None:
+            self.continuous = ContinuousServices(self)
+        self.continuous.run()
 
     def shutdown(self):
         with self._execution_lock, self._state_lock:
@@ -130,6 +245,9 @@ class Runtime:
             self._generation += 1
             self._stop.set()
             self._wake.set()
+        if self.continuous:
+            self.continuous.market.stop()
+            self.continuous.wake()
         if self._market_thread:
             self._market_thread.join(timeout=15)
 
@@ -147,7 +265,7 @@ class Runtime:
         method = getattr(self.collector, 'collect_markets', None)
         if method is None:
             return
-        tracked = [row['symbol'] for row in self.store.strategies() if row.get('status') in {'shadow', 'paper'}]
+        tracked = [row['symbol'] for row in self.store.strategies() if row.get('policy_version', 1) == 1 and row.get('status') in {'shadow', 'paper'}]
         symbols = list(dict.fromkeys(self._symbols() + tracked + self.store.config()['research']['benchmark_symbols']
             + [row['symbol'] for row in self.store.get_document('portfolio', {}).get('positions', [])]))
         markets = method(symbols)
@@ -165,7 +283,7 @@ class Runtime:
             known = {item['symbol']: item for item in self.store.markets(history=False)}
             features = self.store.get_document('event_features_by_symbol', {})
             benchmarks = self.store.config()['research']['benchmark_symbols']
-            tracked = {row['symbol'] for row in self.store.strategies() if row.get('status') in {'shadow', 'paper'}}
+            tracked = {row['symbol'] for row in self.store.strategies() if row.get('policy_version', 1) == 1 and row.get('status') in {'shadow', 'paper'}}
             held = {row['symbol'] for row in self.store.get_document('portfolio', {}).get('positions', [])}
             universe = set(self._symbols())
             for market in markets:
@@ -231,7 +349,7 @@ class Runtime:
                     'evidence_ids': [row['id'] for row in evidence]}
         self.store.set_document('sector_universe', universe)
         held = {row['symbol'] for row in self.store.get_document('portfolio', {}).get('positions', [])}
-        tracked = {row['symbol'] for row in self.store.strategies() if row.get('status') in {'shadow', 'paper'}}
+        tracked = {row['symbol'] for row in self.store.strategies() if row.get('policy_version', 1) == 1 and row.get('status') in {'shadow', 'paper'}}
         selected_symbols = set(universe['symbols']) | held | tracked | set(config['research']['benchmark_symbols'])
         self.store.set_document('markets', [row for row in self._markets() if row['symbol'] in selected_symbols])
         if result.get('errors'):
@@ -284,6 +402,17 @@ class Runtime:
             }
             payload['prior_research'] = [row for row in self.store.research_memory(limit=20)
                                        if row.get('updated_at_ms', row.get('registered_at_ms', cutoff + 1)) <= cutoff]
+            # Targeted durable memory accompanies the old discovery summary.
+            # Selection is by strategy/instrument relevance, not global recency.
+            targets = {item.get('payload', {}).get('experiment_id') for item in inputs}
+            symbols = {symbol for item in inputs for symbol in item.get('payload', {}).get('symbols', [])}
+            symbols.update(item.get('payload', {}).get('symbol') for item in inputs)
+            relevant = [row for row in self.store.experiments(limit=10000)
+                        if row['registered_at_ms'] <= cutoff and (row['id'] in targets or row['spec'].get('symbol') in symbols)]
+            if relevant:
+                payload['strategy_dossiers'] = [self.memory.dossier(row['id'], task=agent['layer'],
+                    max_bytes=max(2000, min(16000, config['max_input_bytes'] // 8))) for row in relevant[:2]]
+                payload['strategy_dossier_omissions'] = max(0, len(relevant) - 2)
             payload['research_capabilities'] = {
                 'families': ['momentum', 'mean_reversion', 'breakout', 'event_surprise'],
                 'historical_phase': 'development', 'execution': 'paper',
@@ -353,7 +482,7 @@ class Runtime:
             return cached
         request_id = self.store.save_snapshot('model_request', {'agent': model_agent, 'payload': payload},
                                               payload.get('information_cutoff_ms', round(time.time() * 1000)))
-        reservation = self.store.reserve(agent['model'], request_size, config['max_output_tokens'],
+        reservation = self.component_budget.reserve('discovery', agent['model'], request_size, config['max_output_tokens'],
                                           context={'cycle_id': payload['cycle_id'], 'agent_id': agent['id'], 'request_snapshot': request_id})
         try:
             result = self.provider.run(model_agent, payload)
@@ -397,6 +526,8 @@ class Runtime:
 
     def _gather_sources(self, cycle, generation):
         """Finish public acquisition before model fan-out, so every scout can use the pool."""
+        imported = self.store.evidence(self.store.get_document("external_evidence_ids", []))
+        self._retain_evidence(cycle, imported)
         agents = self._cycle_agents(cycle, 'collector')
         def gather(agent):
             if not self._active(generation):
@@ -565,16 +696,47 @@ class Runtime:
             return []
         return [handoff(cycle['id'], 'analyst_proposal', agent['id'], proposal, proposal['evidence_ids'], [item['id'] for item in inputs]) for proposal in proposals]
 
-    def _validate_analyst_batch(self, cycle):
+    def _validate_analyst_batch(self, cycle, generation=None):
         """Register before evaluation. All historical outcomes are development evidence."""
         config = cycle.get('config_snapshot', self.store.config())
         self._research_state_cache = None
         checkpoint = self.store.get_document('validation_' + cycle['id'])
         if checkpoint is None:
             proposed = self.store.handoffs(cycle['id'], 'analyst_proposal')
+            maximum = config['research']['max_candidates_per_cycle']
+            deferred = proposed[maximum:]
+            proposed = proposed[:maximum]
+            # Keep each analyst attempt, but evaluate a bounded, predeclared
+            # neighborhood of every distinct source-supported mechanism.
+            expanded = []
+            seen = set()
+            variant_groups = []
+            for source in proposed:
+                try:
+                    variants = expand_hypothesis(source['payload'],
+                        max_candidates=config['research']['variants_per_hypothesis'])
+                    digest = analytics.spec_hash(source['payload'])
+                    if digest not in seen:
+                        variant_groups.append((source, variants[1:]))
+                    seen.add(digest)
+                except (ValueError, TypeError, KeyError):
+                    pass
+            for index in range(config['research']['variants_per_hypothesis'] - 1):
+                for source, variants in variant_groups:
+                    if index >= len(variants) or len(proposed) + len(expanded) >= maximum:
+                        continue
+                    variant = variants[index]
+                    digest = analytics.spec_hash(variant)
+                    if digest in seen:
+                        continue
+                    seen.add(digest)
+                    expanded.append(handoff(cycle['id'], 'analyst_proposal', source['producer'], variant,
+                                            source['evidence_ids'], source['input_ids']))
+            proposed += expanded
             with self._trial_lock:
-                trials = self.store.get_document('statistical_trial_count', 0) + len(proposed)
+                trials = self.store.get_document('statistical_trial_count', 0) + len(proposed) + len(deferred)
                 checkpoint = {'trial_count': max(1, trials), 'proposals': proposed,
+                              'generated_variants': len(expanded), 'deferred_proposal_ids': [row['id'] for row in deferred],
                               'market_snapshot': self.store.freeze_markets(self._research_markets(cycle), cycle['information_cutoff_ms']),
                               'validated_at': timestamp()}
                 self.store.commit_validation(cycle['id'], trials, checkpoint)
@@ -590,19 +752,25 @@ class Runtime:
             except (ValueError, TypeError):
                 pass
         allocated_cost = self.store.cycle_cost(cycle['id']) / max(1, len(unique))
-        charged = set()
+        prepared, snapshots = [], {}
+        # Register the entire batch before any outcome is visible.
         for source in checkpoint['proposals']:
             proposal = source['payload']
             registered = None
             try:
                 spec = analytics.canonical_spec(proposal)
-                evidence = self.store.evidence(proposal['evidence_ids'])
-                snapshot = self.store.save_snapshot('experiment_inputs', {
-                    'market_snapshot': checkpoint.get('market_snapshot'), 'evidence': evidence,
-                    'universe': self.store.get_document('sector_universe', {})}, cycle['information_cutoff_ms'])
+                references = tuple(sorted(proposal['evidence_ids']))
+                if references not in snapshots:
+                    evidence = self.store.evidence(proposal['evidence_ids'])
+                    snapshot = self.store.save_snapshot('experiment_inputs', {
+                        'market_snapshot': checkpoint.get('market_snapshot'), 'evidence': evidence,
+                        'universe': self.store.get_document('sector_universe', {})}, cycle['information_cutoff_ms'])
+                    snapshots[references] = (snapshot, evidence)
+                snapshot, evidence = snapshots[references]
                 registered = self.store.register_experiment(spec, policy=policy, context={
                     'cycle_id': cycle['id'], 'agent_id': source['producer'], 'hypothesis': proposal.get('hypothesis'),
                     'input_snapshot': snapshot, 'evidence_ids': proposal['evidence_ids'], 'code_version': code_hash,
+                    'data_fingerprint': checkpoint.get('market_snapshot'),
                     'source_families': sorted({row.get('source_family') or row['source_url'] for row in evidence}),
                     'research_arm': {'collectors': config['research']['active_collectors'], 'analysts': config['research']['active_analysts']},
                     'information_cutoff_ms': cycle['information_cutoff_ms'], 'config': config,
@@ -611,13 +779,41 @@ class Runtime:
                     'historical_phase': 'development', 'universe_scope': 'current_membership_only'})
             except (ValueError, TypeError, KeyError) as error:
                 self.store.event('research', 'Invalid candidate retained as a rejected development result: ' + str(error)[:200], 'warning')
-            edge = analytics.validate_edges([proposal], checkpoint['markets'], trial_count=checkpoint['trial_count'],
-                config=config, alpha_budget=registered['alpha_budget'] if registered else None)[0]
+            prepared.append((source, registered))
+        charged = set()
+        from .datasets import _dataset_alpha_allocation, _refresh_search_correction
+        for source, registered in prepared:
+            if generation is not None and not self._active(generation):
+                return False
+            proposal = source['payload']
+            cache_key = identity([registered['id'], checkpoint.get('market_snapshot'), code_hash, config]) if registered else None
+            edge = self.store.get_document('development_report_' + cache_key) if cache_key else None
+            cache_hit = edge is not None
+            alpha, dataset_index = (_dataset_alpha_allocation(self.store, registered, checkpoint.get('market_snapshot'))
+                                    if registered else (None, None))
+            if edge is None:
+                edge = analytics.validate_edges([proposal], checkpoint['markets'], trial_count=checkpoint['trial_count'],
+                    config=config, alpha_budget=alpha)[0]
+                if registered:
+                    _refresh_search_correction(edge, checkpoint['trial_count'], alpha)
+                if cache_key:
+                    self.store.set_document('development_report_' + cache_key, edge)
+            else:
+                _refresh_search_correction(edge, checkpoint['trial_count'], alpha)
+                # A reused economic rule keeps the current attempt's evidence
+                # and text while its measured outcomes remain unchanged.
+                edge.update(evidence_ids=proposal['evidence_ids'], hypothesis=proposal.get('hypothesis', ''))
+                edge['id'] = 'edge-' + hashlib.sha256(json.dumps(proposal, sort_keys=True, default=str).encode()).hexdigest()[:20]
             edge.update(agent_id=source['producer'], created_at=checkpoint['validated_at'], development_only=True)
             if registered:
                 edge['experiment_id'] = registered['id']
                 self.store.record_evaluation(registered['id'], {'phase': 'development', 'cycle_id': cycle['id'],
                     'edge': edge, 'input_ids': source['input_ids'],
+                    'candidate_cache_key': cache_key, 'cache_hit': cache_hit,
+                    'data_fingerprint': checkpoint.get('market_snapshot'),
+                    'alpha_budget': alpha, 'dataset_alpha_allocation_index': dataset_index,
+                    'input_snapshot': snapshots[tuple(sorted(proposal['evidence_ids']))][0],
+                    'information_cutoff_ms': cycle['information_cutoff_ms'],
                     'research_cost_usd': 0. if registered['id'] in charged else allocated_cost})
                 charged.add(registered['id'])
             metrics = edge.get('metrics', {})
@@ -640,6 +836,7 @@ class Runtime:
                                                    edge['evidence_ids'], source['input_ids']))
                 except (ValueError, StopIteration):
                     continue
+        return True
 
     def _strategize(self, agent, cycle, inputs, generation):
         payload = self._payload(agent, cycle, inputs)
@@ -680,8 +877,9 @@ class Runtime:
         payload = self._payload(agent, cycle, inputs)
         if not self._active(generation):
             return []
-        if payload['inputs'] and self.store.config()['research']['use_model_executor']:
-            self._model(agent, payload)  # Advisory only; a timing overlay is not silently deployed.
+        # Legacy daily-equity paper execution remains deterministic. Operational
+        # Astra decisions belong to the independent Bybit execution lane, with
+        # tool results and current host checks; never pay for ignored advice.
         with self._execution_lock:
             if not self._active(generation):
                 return []
@@ -696,7 +894,7 @@ class Runtime:
         for strategy in self.store.strategies():
             identifier = strategy.get('experiment_id')
             experiment = self.store.experiment(identifier) if identifier else None
-            if experiment and experiment['status'] == 'promoted' and strategy.get('spec'):
+            if experiment and experiment['policy'].get('version') == 1 and experiment['status'] == 'promoted' and strategy.get('spec'):
                 strategies.append({**strategy, 'status': 'paper', 'forward_eligible': True})
         decisions = [{'strategy_id': row['id'], 'action': 'activate', 'reason': 'Registered prospective admission'} for row in strategies]
         self.store.set_document('active_decisions', decisions)
@@ -708,7 +906,7 @@ class Runtime:
 
     def _advance_shadows(self, config):
         markets = self._markets()
-        all_strategies = self.store.strategies()
+        all_strategies = [row for row in self.store.strategies() if row.get('policy_version', 1) == 1]
         active = [row for row in all_strategies if row.get('status') in {'shadow', 'paper'}
                   and row.get('experiment_id') and self.store.experiment(row['experiment_id'])['status'] in {'shadow', 'promoted'}]
         active.sort(key=lambda row: row['registered_at_ms'])
@@ -790,7 +988,8 @@ class Runtime:
             return
         equity = portfolio['equity']
         previous_equity = prior['equity'] if prior else portfolio['initial_equity']
-        research_cost = self.store.research_cost(experiment['id'])
+        source_cost, source_cost_complete = self.store.research_source_cost(experiment['id'])
+        research_cost = self.store.research_cost(experiment['id']) + source_cost
         previous_cost = prior.get('research_cost_paid_usd', 0.) if prior else 0.
         elapsed_days = (close_ms - (prior['session_ms'] if prior else experiment['registered_at_ms'])) / 86400000
         observation = {'session_ms': close_ms, 'timestamp_ms': close_ms, 'observed_at_ms': now_ms,
@@ -802,7 +1001,7 @@ class Runtime:
                 for row in portfolio.get('trades', [])),
             'valuation_complete': True, 'fees_paid': portfolio.get('fees_paid', 0),
             'research_cost_usd': max(0., research_cost-previous_cost), 'research_cost_paid_usd': research_cost,
-            'risk_halted': portfolio.get('risk_halted', False),
+            'risk_halted': portfolio.get('risk_halted', False), 'source_cost_complete': source_cost_complete,
             'data_cost_usd': config['research']['data_cost_usd_per_day'] * elapsed_days,
             'infrastructure_cost_usd': config['research']['infrastructure_cost_usd_per_day'] * elapsed_days}
         for label, baseline in baselines.items():
@@ -814,7 +1013,14 @@ class Runtime:
                 and 0 <= now_ms-baseline_market.get('as_of_ms', 0) <= 120000):
                 previous = prior.get('baseline_equities', {}).get(label, portfolio['initial_equity']) if prior else portfolio['initial_equity']
                 observation[label] = baseline['equity'] / previous - 1
-        self.store.record_forward(experiment['id'], observation)
+        captured_baselines = {label: book for label, book in baselines.items() if label in observation}
+        observation['baseline_equities'] = {label: book['equity'] for label, book in captured_baselines.items()}
+        try:
+            observation = self.store.record_captured_forward(
+                experiment['id'], observation, portfolio, captured_baselines, markets)
+        except ValueError as error:
+            self.store.event('research', 'Forward session capture rejected: ' + str(error), 'warning')
+            return
         self.store.set_document(observation_key, observation)
         updated = self.store.experiment(experiment['id'])
         report = experiments.forward_report(updated.get('observations', []),
@@ -964,7 +1170,7 @@ class Runtime:
                         cycle.update(status='completed', finished_at=timestamp(), skipped_reason='No material change to source content, daily history, rules or policy.')
                         self.store.set_document('active_cycle', cycle)
                         self.store.event('research', cycle['skipped_reason'] + ' Model work reused.')
-                        self.next_cycle_at = time.time() + self.store.config()['cycle_interval_seconds']
+                        self.next_cycle_at = 0.  # The persisted dynamic plan chooses subsequent work.
                         self.status = 'running'
                         return True
                 self.status = layer
@@ -989,7 +1195,8 @@ class Runtime:
                     self.store.event(layer, 'Cycle checkpoint retained while model-budget reservations are unavailable.', 'warning')
                     return False
                 if layer == 'analyst':
-                    self._validate_analyst_batch(cycle)
+                    if not self._validate_analyst_batch(cycle, generation):
+                        return False
                 cycle['stage'] = index + 1
                 self.store.set_document('active_cycle', cycle)
                 count = len(self.store.handoffs(cycle['id'], layer))
@@ -1000,7 +1207,7 @@ class Runtime:
             self.store.set_document('last_material_fingerprint', cycle.get('material_fingerprint'))
             self.status = 'running'
             self.last_error = None
-            self.next_cycle_at = time.time() + self.store.config()['cycle_interval_seconds']
+            self.next_cycle_at = 0.  # Compatibility field; no interval drives another cycle.
             return True
         finally:
             self._cycle_lock.release()
@@ -1015,7 +1222,6 @@ class Runtime:
                 roles.append({**agent, 'id': layer, 'name': layer.title(), 'researcher': layer != 'executor'})
         markets = self.store.markets(history=False)
         cycle = self.store.get_document('active_cycle', {}) or {}
-        self.has_key()
         evidence_ids = self.store.get_document('cycle_evidence_' + cycle.get('id', ''), [])
         source_urls = self.store.get_document('cycle_sources_' + cycle.get('id', ''), [])
         universe = self.store.get_document('sector_universe', {'id': 'ai_infrastructure', 'name': 'AI infrastructure',
@@ -1030,16 +1236,17 @@ class Runtime:
             research_summary = summary
             self._research_state_cache_at = time.monotonic()
         return {
-            'runtime': {'status': 'paused' if self.paused else self.status, 'mode': 'paper', 'started_at': self.started_at,
-                        'next_cycle_at': None if self.paused else timestamp(self.next_cycle_at), **self._credentials,
+            'runtime': {'status': 'paused' if self.paused else self.status, 'mode': config['bybit']['mode'], 'started_at': self.started_at,
+                        'next_cycle_at': None if self.paused or not self.next_cycle_at else timestamp(self.next_cycle_at), **self._credentials,
                         'credentials_ready': self._key_configured,
-                        'last_error': self.last_error, 'live_trading_available': False},
+                        'last_error': self.last_error, 'live_trading_available': True},
+            'operations': self.operations_state(),
             'budget': self.store.budget(), 'agents': agents, 'agent_roles': roles,
             'research': {**research_summary,
                 'protocol': config['research'], 'phase': 'prospective_shadow',
                 'coverage': self.store.get_document('coverage_'+cycle.get('id','')) or temporal.coverage_report([], markets),
                 'historical_results_are_development': True},
-            'strategies': [row for row in self.store.strategies() if row.get('symbol') in self._symbols()], 'portfolio': self.store.get_document('portfolio'),
+            'strategies': [row for row in self.store.strategies() if row.get('symbol') in self._symbols() or row.get('policy_version') == 2], 'portfolio': self.store.get_document('portfolio'),
             'markets': [{key: row.get(key) for key in ('symbol', 'price', 'change_24h', 'funding_rate', 'updated_at',
                                                       'asset_class', 'currency', 'exchange')} for row in markets],
             'events': self.store.events(), 'config': config,

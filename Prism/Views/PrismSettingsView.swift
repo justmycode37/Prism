@@ -5,8 +5,6 @@ struct PrismSettingsView: View {
     @ObservedObject var runtime: RuntimeClient
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var contrast
-    @State private var appearanceExpanded = true
-    @State private var spendingExpanded = true
     @State private var ceilingEnabled = false
     @State private var ceilingAmount = ""
     @State private var spendingDraftLoaded = false
@@ -14,10 +12,21 @@ struct PrismSettingsView: View {
     @State private var spendingSaveMessage: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 28) {
-            DisclosureGroup("Appearance", isExpanded: $appearanceExpanded) {
+        VStack(alignment: .leading, spacing: 16) {
+            ConsoleMetricGrid {
+                ConsoleMetric(title: "Model cost today",
+                              value: runtime.state.map { PrismFormat.money($0.budget.spentTodayUsd) } ?? "—",
+                              detail: "Estimated · USD")
+                ConsoleMetric(title: "Requests today",
+                              value: runtime.state.map { String($0.budget.callsToday) } ?? "—",
+                              detail: "Across all agents")
+                ConsoleMetric(title: "Daily ceiling",
+                              value: runtime.state.map { state in state.budget.dailyLimitUsd.map { PrismFormat.money($0) } ?? "Off" } ?? "—",
+                              detail: runtime.state.map { "\(PrismFormat.money($0.budget.reservedUsd)) reserved" } ?? "Awaiting runtime")
+            }
+            ConsoleCard("Appearance") {
                 VStack(alignment: .leading, spacing: 22) {
-                    HStack(spacing: 14) {
+                    HStack(spacing: 12) {
                         ForEach(PrismAppearance.allCases) { appearance in appearanceButton(appearance) }
                     }
                     #if PRISM_EXPERIMENTAL_GLASS
@@ -44,23 +53,19 @@ struct PrismSettingsView: View {
                             .accessibilityValue(preferences.milkiness.formatted(.percent.precision(.fractionLength(0))))
                             .disabled(reduceTransparency)
                     }
-                }.padding(.vertical, 20).padding(.leading, 18)
+                }
             }
-            DisclosureGroup("API spending", isExpanded: $spendingExpanded) {
-                spendingControls.padding(.vertical, 20).padding(.leading, 18)
+            ConsoleCard("Spending controls", caption: "All agents") {
+                spendingControls
             }
         }
-        .font(.system(size: 13)).padding(.horizontal, 4)
+        .font(.system(size: 13))
         .task { loadSpendingDraft() }
         .onChange(of: runtime.lastUpdated) { _, _ in loadSpendingDraft() }
     }
 
     private var spendingControls: some View {
         VStack(alignment: .leading, spacing: 16) {
-            row("Estimated today (USD)") {
-                Text(runtime.state.map { PrismFormat.money($0.budget.spentTodayUsd) } ?? "—")
-                    .monospacedDigit().foregroundStyle(.secondary)
-            }
             Toggle(isOn: Binding(
                 get: { ceilingEnabled },
                 set: { ceilingEnabled = $0; editSpendingDraft() }
@@ -97,7 +102,10 @@ struct PrismSettingsView: View {
                 if let spendingSaveMessage {
                     Text(spendingSaveMessage).font(.system(size: 11)).foregroundStyle(.secondary)
                 }
-                Button("Save") { Task { await saveSpendingDraft() } }
+                Button { Task { await saveSpendingDraft() } } label: {
+                    Text("Save").font(.system(size: 12, weight: .medium)).frame(width: 64, height: 34)
+                }
+                    .buttonStyle(.plain).glassEffect(.clear.interactive(), in: .capsule)
                     .disabled(!spendingDraftEdited || !runtime.isConnected || runtime.isBusy ||
                               (ceilingEnabled && validatedCeiling == nil))
             }
@@ -139,13 +147,15 @@ struct PrismSettingsView: View {
         let selected = preferences.selection == appearance
         return Button { preferences.selection = appearance } label: {
             VStack(spacing: 10) {
-                Image(systemName: appearance.symbol).font(.system(size: 20))
+                Image(systemName: appearance.symbol).font(.system(size: 18, weight: .regular))
                 Text(appearance.title).font(.system(size: 11))
             }
             .foregroundStyle(selected ? .primary : .secondary)
-            .frame(width: 100, height: 76).contentShape(RoundedRectangle(cornerRadius: 20))
+            .frame(maxWidth: .infinity).frame(height: 72).contentShape(RoundedRectangle(cornerRadius: 20))
         }
-        .buttonStyle(.plain).glassEffect(.clear.interactive(), in: .rect(cornerRadius: 20))
+        .buttonStyle(.plain)
+        .background { if selected { RoundedRectangle(cornerRadius: 20).fill(.primary.opacity(0.07)) } }
+        .glassEffect(.clear.interactive(), in: .rect(cornerRadius: 20))
         .accessibilityLabel(appearance.title).accessibilityValue(selected ? "Selected" : "Not selected")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }

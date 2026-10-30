@@ -81,8 +81,8 @@ def import_dataset(store, document):
 def evaluate_dataset(store, document, proposals, config=None):
     """All outputs are development experiments; forward promotion stays separate."""
     record = import_dataset(store, document)
-    if not isinstance(proposals, list) or not proposals:
-        raise ValueError('Supply explicit frozen proposals.')
+    if not isinstance(proposals, list) or not 1 <= len(proposals) <= 5000:
+        raise ValueError('Supply one to 5000 explicit frozen proposals.')
     frozen_document = store.snapshot(record['snapshot_id'])['value']
     frozen_proposals = deepcopy(proposals)
     config = deepcopy(config if config is not None else store.config())
@@ -90,33 +90,44 @@ def evaluate_dataset(store, document, proposals, config=None):
     policy_digest = simulation.policy_hash(config)
     config_digest = hashlib.sha256(json.dumps(config, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
     code_digest = _search_implementation_hash()
-    reports = []
+    reports, prepared = [], []
+    markets = [temporal.market_as_of(row, record['as_of_ms']) for row in frozen_document['markets']]
+    available_refs = {row['id'] for row in temporal.evidence_as_of(frozen_document.get('evidence', []), record['as_of_ms'])}
     for proposal in frozen_proposals:
+        analytics.canonical_spec(proposal)
         source_market = next((market for market in frozen_document['markets'] if market['symbol'] == proposal.get('symbol')), {})
         if source_market.get('security_id'):
             proposal = {**proposal, 'security_id': source_market['security_id']}
         spec = analytics.canonical_spec(proposal)
         refs = proposal.get('evidence_ids', [])
-        if not refs or not set(refs) <= {row.get('id') for row in frozen_document.get('evidence', [])}:
-            raise ValueError('Proposal requires evidence present in the dataset')
+        if not isinstance(refs, list) or not refs or not all(isinstance(ref, str) for ref in refs) or not set(refs) <= available_refs:
+            raise ValueError('Proposal requires evidence available at the dataset cutoff')
         experiment = store.register_experiment(spec, policy=policy, context={
             'dataset_id': record['id'], 'input_snapshot': record['snapshot_id'], 'data_fingerprint': record['fingerprint'],
             'information_cutoff_ms': record['as_of_ms'], 'historical_phase': 'development', 'config': config,
             'hypothesis': proposal.get('hypothesis'), 'evidence_ids': refs})
-        markets = [temporal.market_as_of(row, record['as_of_ms']) for row in frozen_document['markets']]
+        alpha, allocation_index = _dataset_alpha_allocation(store, experiment, record['fingerprint'])
+        prepared.append((proposal, spec, experiment, alpha, allocation_index))
+    with store.connection() as db:
+        trial_count = max(1, db.execute('SELECT COUNT(*) FROM experiment_attempts').fetchone()[0])
+    strategy_experiments = {row.get('experiment_id') for row in store.strategies()}
+    for proposal, spec, experiment, alpha, allocation_index in prepared:
+        refs = proposal['evidence_ids']
         cache_key = _candidate_cache_key(record['fingerprint'], spec, policy_digest, config_digest, code_digest)
         saved_evaluation = next((row for row in (store.experiment(experiment['id']) or {}).get('evaluations', [])
                                  if row.get('candidate_cache_key') == cache_key), None)
         cache_hit = saved_evaluation is not None
         result = deepcopy(saved_evaluation['report']) if cache_hit else analytics.validate_edges(
-            [proposal], markets, config=config, alpha_budget=experiment['alpha_budget'])[0]
+            [proposal], markets, config=config, trial_count=trial_count, alpha_budget=alpha)[0]
+        _refresh_search_correction(result, trial_count, alpha)
         evaluation = {'phase': 'development', 'dataset_id': record['id'], 'data_fingerprint': record['fingerprint'],
+                      'input_snapshot': record['snapshot_id'], 'information_cutoff_ms': record['as_of_ms'],
+                      'alpha_budget': alpha, 'dataset_alpha_allocation_index': allocation_index,
                       'policy_hash': policy_digest, 'candidate_cache_key': cache_key,
                       'cache_hit': cache_hit, 'report': result}
         store.record_evaluation(experiment['id'], evaluation)
         market = next((market for market in markets if market['symbol'] == spec['symbol']), {})
-        existing = next((row for row in store.strategies() if row.get('experiment_id') == experiment['id']), None)
-        if existing is None and len(analytics.closed_candles(market)) >= analytics.MIN_CANDLES:
+        if experiment['id'] not in strategy_experiments and len(analytics.closed_candles(market)) >= analytics.MIN_CANDLES:
             from .domain import timestamp
             store.save_strategy({'id': 'strategy_'+experiment['id'], 'experiment_id': experiment['id'],
                 'name': str(proposal.get('hypothesis', 'Frozen dataset candidate'))[:120],
@@ -127,11 +138,11 @@ def evaluate_dataset(store, document, proposals, config=None):
                 'validation': {'passed': True, 'spec_hash': analytics.spec_hash(spec), 'policy_hash': simulation.policy_hash(config), 'development_only': True},
                 'reason': 'Frozen for future shadow observations; historical results remain development evidence.',
                 **{key: result.get('metrics', {}).get(key) for key in ('net_return', 'sharpe', 'max_drawdown', 'trades')}})
+            strategy_experiments.add(experiment['id'])
         reports.append({'experiment_id': experiment['id'], **result})
     try:
-        unique = {analytics.spec_hash(proposal): analytics.canonical_spec(proposal) for proposal in frozen_proposals}
-        portfolio = simulation.replay_portfolio(list(unique.values()),
-            [temporal.market_as_of(row, record['as_of_ms']) for row in document['markets']], config)
+        unique = {analytics.spec_hash(spec): spec for _, spec, _, _, _ in prepared}
+        portfolio = simulation.replay_portfolio(list(unique.values()), markets, config)
     except ValueError as error:
         portfolio = {'status': 'inconclusive', 'reason': str(error)}
     return {'dataset': record, 'phase': 'development', 'results': reports, 'portfolio_replay': portfolio}
@@ -176,6 +187,10 @@ def search_dataset(store, document, *, max_candidates=DEFAULT_MAX_CANDIDATES, co
     proposals = generate_candidates(frozen_document['markets'], evidence_ids=evidence_ids,
                                    max_candidates=max_candidates, families=families, lookbacks=lookbacks,
                                    exclude_symbols=benchmark_symbols)
+    for proposal in proposals:
+        proposal['dataset_evidence_ids'] = proposal.pop('evidence_ids')
+        proposal['evidence_ids'] = []
+        proposal['hypothesis_support'] = 'Unscreened technical grid; dataset provenance is not supporting source evidence.'
     cached_run = _claim_or_read_search(store, run_key, search_id)
     if cached_run is not None:
         if cached_run.get('status') == 'complete':
@@ -186,6 +201,16 @@ def search_dataset(store, document, *, max_candidates=DEFAULT_MAX_CANDIDATES, co
                 'development_only': True, 'cache_hit': True,
                 'reason': 'An identical frozen search is already being evaluated.'}
 
+    try:
+        return _score_claimed_search(store, frozen_document, record, config, policy, policy_hash, config_hash,
+            implementation_hash, search_settings, search_id, run_key, proposals, grid_size, max_candidates)
+    except BaseException:
+        store.set_document(run_key, {'status': 'failed', 'search_id': search_id})
+        raise
+
+
+def _score_claimed_search(store, frozen_document, record, config, policy, policy_hash, config_hash,
+                          implementation_hash, search_settings, search_id, run_key, proposals, grid_size, max_candidates):
     markets = [temporal.market_as_of(row, record['as_of_ms']) for row in frozen_document['markets']]
     proposal_context = []
     # Freeze every rule and its alpha allocation before running even the first backtest.
@@ -200,7 +225,8 @@ def search_dataset(store, document, *, max_candidates=DEFAULT_MAX_CANDIDATES, co
                    'historical_phase': 'development', 'phase': 'development', 'config': config,
                    'policy_hash': policy_hash, 'search_protocol': SEARCH_PROTOCOL, 'search_id': search_id,
                    'candidate_index': index, 'candidate_count': len(proposals), 'candidate_key': candidate_key,
-                   'hypothesis': proposal['hypothesis'], 'evidence_ids': proposal['evidence_ids']}
+                   'hypothesis': proposal['hypothesis'], 'evidence_ids': proposal['evidence_ids'],
+                   'dataset_evidence_ids': proposal.get('dataset_evidence_ids', [])}
         experiment = store.register_experiment(spec, policy=policy, context=context)
         effective_alpha, dataset_allocation_index = _dataset_alpha_allocation(
             store, experiment, record['fingerprint'])
@@ -243,6 +269,7 @@ def search_dataset(store, document, *, max_candidates=DEFAULT_MAX_CANDIDATES, co
             'alpha_budget': item['effective_alpha'], 'registry_alpha_budget': experiment['alpha_budget'],
             'dataset_alpha_allocation_index': item['dataset_allocation_index'], 'cache_hit': cache_hit,
             'dataset_id': record['id'], 'data_fingerprint': record['fingerprint'],
+            'input_snapshot': record['snapshot_id'], 'information_cutoff_ms': record['as_of_ms'],
             'policy_hash': policy_hash, 'report': edge})
         results.append(edge)
 
@@ -275,7 +302,7 @@ def search_dataset(store, document, *, max_candidates=DEFAULT_MAX_CANDIDATES, co
                   'breadth_truncated': grid_size > len(proposals)},
               'ranking': {'metric': 'chronological holdout net return after modeled costs',
                   'order': 'descending; tie breaks preserve deterministic candidate order',
-                  'interpretation': 'Development ranking only; rejection and inconclusive results remain visible.'},
+                  'interpretation': 'Cumulative returns over each row test period; compare matching periods. Development only; rejected results remain visible.'},
               'results': results}
     store.set_document(run_key, {'status': 'complete', 'search_id': search_id, 'report': report})
     return report
@@ -290,7 +317,8 @@ def _refresh_search_correction(edge, trial_count, alpha_budget):
         metrics['adjusted_p_value'] = min(1.0, p_value * trial_count)
         validation = edge.get('validation', {})
         validation['trial_count'] = trial_count
-        reasons = [reason for reason in edge.get('reason', '').split('; ') if reason]
+        reasons = ([reason for reason in edge.get('reason', '').split('; ') if reason]
+                   if edge.get('status') == 'rejected' else [])
         significance_reason = 'Holdout evidence fails the multiple-testing corrected significance threshold'
         if p_value > alpha_budget and significance_reason not in reasons:
             reasons.append(significance_reason)
@@ -300,7 +328,7 @@ def _refresh_search_correction(edge, trial_count, alpha_budget):
             family_reason = 'Search-adjusted p-value exceeds the 5% family-wise screen'
             if family_reason not in reasons:
                 reasons.append(family_reason)
-        edge['reason'] = '; '.join(reasons)
+        edge['reason'] = '; '.join(reasons) if reasons else 'Frozen rule passed development screening; prospective confirmation required'
         if reasons:
             edge['status'] = 'rejected'
         elif edge.get('status') == 'rejected':
@@ -341,7 +369,12 @@ def _candidate_cache_key(data_fingerprint, spec, policy_hash, config_hash, imple
 
 
 def _search_implementation_hash():
-    return hashlib.sha256(Path(__file__).read_bytes() + Path(strategy_search.__file__).read_bytes()).hexdigest()
+    # A corrected execution, signal, or temporal engine must invalidate reports
+    # even when the candidate grid and dataset are unchanged.
+    directory = Path(__file__).parent
+    modules = ('datasets.py', 'search.py', 'analytics.py', 'simulation.py',
+               'execution.py', 'temporal.py', 'experiments.py', 'config.py', 'store.py')
+    return hashlib.sha256(b''.join(name.encode() + (directory / name).read_bytes() for name in modules)).hexdigest()
 
 
 def _claim_or_read_search(store, key, search_id):
@@ -354,10 +387,19 @@ def _claim_or_read_search(store, key, search_id):
             saved = json.loads(row['value'])
             if saved.get('status') == 'complete':
                 return saved
-            started = saved.get('started_at_ms', now)
-            if saved.get('status') == 'running' and now - started < 3_600_000:
-                return {'status': 'running', 'search_id': search_id}
-        saved = {'status': 'running', 'search_id': search_id, 'started_at_ms': now}
+            if saved.get('status') == 'running':
+                import os
+                try:
+                    os.kill(saved.get('owner_pid', -1), 0) if saved.get('owner_pid', 0) > 0 else None
+                    alive = saved.get('owner_pid', 0) > 0
+                except ProcessLookupError:
+                    alive = False
+                except PermissionError:
+                    alive = True
+                if alive or ('owner_pid' not in saved and now - saved.get('started_at_ms', now) < 3_600_000):
+                    return {'status': 'running', 'search_id': search_id}
+        import os
+        saved = {'status': 'running', 'search_id': search_id, 'started_at_ms': now, 'owner_pid': os.getpid()}
         db.execute('INSERT INTO cascade_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                    (key, json.dumps(saved, sort_keys=True, separators=(',', ':'), allow_nan=False)))
     return None

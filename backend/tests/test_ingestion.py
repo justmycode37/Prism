@@ -71,6 +71,80 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(result['errors'], [])
         self.assertEqual(result['evidence'][0]['source_url'], 'https://publisher.test/report')
 
+    def test_youtube_channel_feed_keeps_video_provenance_without_guessing_transcript(self):
+        feed = '''<feed xmlns="http://www.w3.org/2005/Atom" xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+          <entry><id>yt:video:abcdefghijk</id><yt:videoId>abcdefghijk</yt:videoId>
+            <title>AI data center power outlook</title>
+            <link rel="alternate" href="https://www.youtube.com/watch?v=abcdefghijk&amp;feature=feed"/>
+            <published>2026-10-28T10:30:00-04:00</published><summary>Channel description only.</summary>
+          </entry></feed>'''
+        collector = FixtureCollector({"/videos.xml": document(feed, "application/atom+xml")},
+                                     {"crawl_articles": True})
+        result = collector.collect({"sources": [{"url": "https://public.test/videos.xml", "kind": "atom"}]})
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(len(result["evidence"]), 1)
+        item = result["evidence"][0]
+        self.assertEqual(item["source_kind"], "youtube")
+        self.assertEqual(item["source_url"], "https://www.youtube.com/watch?v=abcdefghijk")
+        self.assertEqual(item["published_at"], "2026-10-28T14:30:00Z")
+        self.assertEqual(item["discovered_from"], ["https://public.test/videos.xml"])
+        self.assertEqual(item["transcript_status"], "not_in_public_feed")
+        self.assertFalse(any("youtube.com/watch" in url for url, _ in collector.calls))
+
+    def test_feed_private_source_links_are_skipped_without_fetching_them(self):
+        feed = '''<rss><channel>
+          <item><title>Private destination</title><link>https://127.0.0.1/private</link><description>bad</description></item>
+          <item><title>Public report</title><link>https://publisher.test/report</link><description>good</description></item>
+        </channel></rss>'''
+        collector = FixtureCollector({"/feed": document(feed, "application/rss+xml")})
+        result = collector.collect({"sources": ["https://public.test/feed"]})
+        self.assertEqual([item["source_url"] for item in result["evidence"]], ["https://publisher.test/report"])
+        self.assertTrue(any("Feed entry skipped" in error for error in result["errors"]))
+        self.assertFalse(any("127.0.0.1" in url for url, _ in collector.calls))
+
+    def test_news_dedup_merges_feed_provenance_and_html_uses_article_metadata(self):
+        duplicate = '''<rss><channel><item><title>MRVL AI capacity update</title>
+          <link>https://publisher.test/story?utm_source=feed</link><description>Capacity expands.</description>
+          <pubDate>Wed, 28 Oct 2026 10:00:00 GMT</pubDate></item></channel></rss>'''
+        collector = FixtureCollector({"/one": document(duplicate, "application/rss+xml"),
+                                     "/two": document(duplicate, "application/rss+xml"),
+                                     "/story": document('<html><head><title>MRVL capacity</title>'
+                                         '<meta property="article:published_time" content="2026-10-28T11:00:00Z">'
+                                         '<meta name="description" content="Long-form public article."></head>'
+                                         '<body><nav>Navigation boilerplate</nav><main>MRVL adds power and AI capacity.</main></body></html>')},
+                                    {"crawl_articles": True, "articles_per_feed": 1})
+        result = collector.collect({"symbols": ["MRVL"], "sources": [
+            {"url": "https://public.test/one", "kind": "rss"},
+            {"url": "https://public.test/two", "kind": "rss"},
+        ]})
+        public_story = [item for item in result["evidence"] if item["source_url"] == "https://publisher.test/story"]
+        self.assertEqual(len(public_story), 1)
+        item = public_story[0]
+        self.assertEqual(item["source_kind"], "article")
+        self.assertEqual(set(item["discovered_from"]), {"https://public.test/one", "https://public.test/two"})
+        self.assertEqual(item["published_at"], "2026-10-28T11:00:00Z")
+        self.assertNotIn("Navigation boilerplate", item["content"])
+
+    def test_normalized_imports_are_attached_to_collect_with_provenance(self):
+        collector = FixtureCollector({})
+        result = collector.collect({"sources": [], "imported_source_provider": "adapter-fixture",
+                                    "imported_sources": [{
+                                        "source_kind": "youtube_transcript",
+                                        "source_url": "https://youtu.be/abcdefghijk",
+                                        "title": "Transcript",
+                                        "content": "Imported transcript text.",
+                                        "published_at": "2026-10-29T09:00:00+02:00",
+                                        "import_reference": "fixture-run-1",
+                                    }]})
+        self.assertEqual(result["errors"], [])
+        item = result["evidence"][0]
+        self.assertEqual(item["source_url"], "https://www.youtube.com/watch?v=abcdefghijk")
+        self.assertEqual(item["source_kind"], "youtube_transcript")
+        self.assertEqual(item["source_origin"], "imported")
+        self.assertEqual(item["import_provider"], "adapter-fixture")
+        self.assertEqual(item["import_reference"], "fixture-run-1")
+        self.assertEqual(item["published_at"], "2026-10-29T07:00:00Z")
+
     def test_evidence_identity_versions_source_content_without_observation_clock(self):
         collector = FixtureCollector({})
         first = collector._evidence("https://public.test/article", "article", "Title", "Original", {})

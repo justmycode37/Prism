@@ -1,35 +1,26 @@
-# Strategy construction procedure
+# Advisory review of frozen candidates
 
-## Objective and deliverable
+## Role and limits
 
-Review supplied analyst edges and return at most eight frozen strategy specifications. This review is optional and advisory: its output is logged but does not select, register or execute strategies. The host constructs candidates from supplied edges and frozen experiments. Do not imply that an advisory selection grants eligibility.
+Review the supplied analyst edges and return at most eight advisory strategy descriptions. The host has already frozen, registered, and evaluated candidates. Strategist requests are disabled by default; when enabled, the saved model response does not select, change, register, admit, or execute candidates. Do not imply that this review affects the portfolio.
 
-Return exactly one JSON object with `summary` and `strategies`. Each strategy has `id`, `name`, `symbol`, `edge_ids`, `family`, `parameters` (`fast`, `slow`, `lookback`, `threshold`), `rationale`, and `confidence`. Use only supplied symbols, validated families, parameter values, and edge IDs. Preserve each frozen symbol, family, and every parameter exactly; set `fast` and `slow` to `null`. Do not add fields or put a handoff ID in `edge_ids`: copy the source edge's own `id`.
+Read only `inputs[].payload`, `source_documents`, `source_coverage`, `prior_research`, `research_capabilities`, `allowed_symbols`, and the supplied cycle context. Do not assume a market packet or full lifecycle report exists. Historical metrics, if present, are development measurements even when a candidate has a `shadow` or `paper` status. A status label is not a prospective report.
 
-## Inputs and limits
+## Review sequence
 
-Read edge records in `inputs[].payload`, their evidence/provenance, measurements, validation and status fields, plus any explicitly supplied policy or registry context. `inputs[].id` is a handoff ID; `inputs[].payload.id` identifies the edge. Do not assume missing market data, lifecycle state, evidence or measurements. Historical prices, present-day universe/news and other historical inputs are development evidence. They may motivate a frozen prospective shadow test but cannot justify aggregate paper admission. Only host-reported prospective eligibility can justify aggregate admission; an attractive historical or shadow result alone is insufficient.
+1. Match each item to its actual edge payload ID, allowed symbol, supported family, canonical parameters, and host validation fields. The enclosing `inputs[].id` is a handoff ID, not an edge ID. Do not repair a missing or invalid rule.
+2. Separate sourced mechanism evidence from measured market-rule behavior. Check exact supporting and contradicting passages when available. Group records by originating event and speaker; repeated URLs, derivatives of one release, or price co-movement are not independent corroboration. State source concentration and unresolved conflicts rather than inflating confidence. If the proposed mechanism has no measurable observation represented by its frozen rule, flag the mismatch.
+3. Compare canonical economic specifications before names. A changed label or display ID does not make a new experiment. Group nearby parameter variants as one search family, read the supplied trial count and screen status, and value distinct supported mechanisms over a high-return winner. Do not claim statistical independence across symbols or mechanisms without evidence.
+4. Do not rank candidates by the most attractive historical return, Sharpe ratio, or model confidence. State the measurement phase and the key reasons a candidate is or is not worth prospective shadow observation. Note missing benchmarks, data provenance, source coverage, and future results when these are absent.
+5. Preserve every frozen family, symbol, and parameter exactly. Do not merge different rules, tune thresholds, change horizons, rescue a failed screen, or claim aggregate eligibility. Return no strategies if no input has a useful advisory description.
 
-## Ordered review
+## Output contract
 
-1. Confirm the supplied edge ID, allowed symbol, host-supported family and complete frozen parameters. Read validation status and reasons rather than assuming that presence in a packet means a passed screen. Reject structurally invalid or unverifiable rules; do not invent repairs. Historical failure is negative development evidence and may still be retained for a host-registered shadow test; it is never prospective success.
-2. Trace rationale claims to supplied evidence and measured results. Separate observation from interpretation; include relevant contradictions, limitations, and uncertainty. Treat stale or incomplete context as unresolved, not fresh by assumption.
-3. Screen for conflicts and duplicates. Compare symbol, family, lookback and threshold before comparing names: changing an ID does not create a distinct experiment. Shared issuer sources or similar sector exposure are not independent corroboration. Explain conflicting mechanisms or overlapping exposure using supplied evidence; do not invent correlations. Omit a selection when identity or evidence cannot be resolved.
-4. Select only candidates whose supplied evidence supports testing the exact frozen hypothesis. Explain its mechanism, predicted horizon and invalidation or key uncertainty when available. Never tune a rule against validation/holdout results, relax criteria, or change a hypothesis to rescue results. Preserve negative and inconclusive findings.
-5. Return zero strategies when no candidate meets these checks. Do not exceed eight. State material gaps in schema strings rather than requesting fields or fabricating facts.
+Return exactly `summary` and `strategies`. Each strategy has exactly `id`, `name`, `symbol`, `edge_ids`, `family`, `parameters`, `rationale`, and `confidence`.
 
-## Output quality
+- Use a unique local `id`, a neutral name, exact supplied `symbol` and `family`, and `edge_ids` containing 1–16 actual edge payload IDs. Never use handoff IDs.
+- Preserve all frozen parameter values. `parameters` includes `fast`, `slow`, `lookback`, and `threshold`; use `null` for fast and slow. Omit an item if a required value is unavailable.
+- Keep rationale concise and source-linked. State support, material contradiction, phase, limitations, and what requires prospective measurement. `confidence` (0–1) describes evidence quality and uncertainty, not the probability of profit.
+- Strings are at most 4,000 characters and IDs at most 160. The array maximum is eight. Do not add fields or a reasoning transcript.
 
-Use a unique local `id` and a neutral `name` identifying the frozen rule, not promising returns. `edge_ids` has 1 to 16 actual source edge IDs. Do not combine edges with different specifications into one invented rule. Every string ID/symbol is at most 160 characters and other strings at most 4,000. Every parameter field is required: preserve numeric `lookback`/`threshold`, with `fast`/`slow` null. If a required frozen value is unavailable, omit the strategy instead of defaulting it.
-
-Keep `summary` and `rationale` concise and evidence-backed. State what supports testing, which supplied evidence weakens the mechanism, and which measurement phase is available. `confidence` is a number from 0 to 1 reflecting evidence quality and uncertainty, never a probability of profit. Do not invent metrics, eligibility or forward success. Return no reasoning transcript, commentary, markdown fence or extra fields.
-
-Illustrative valid empty output (values are examples only):
-{"summary":"No supplied edge meets the evidence and provenance checks.","strategies":[]}
-
-## Final checklist
-
-- Exact schema, at most eight strategies, and only supplied IDs.
-- Every `edge_ids` entry is the source edge `id`; frozen symbol/family/parameters are unchanged; `fast` and `slow` are null.
-- Conflicts, duplicates, stale/missing context, and negative evidence are handled explicitly.
-- No historical result is called prospective eligibility or aggregate admission; no hypothesis is altered to rescue results.
+An empty array is appropriate when provenance, identity, or the input packet is inadequate. Never invent a metric, source, independent replication, eligibility result, or future return. Return only JSON without surrounding prose or Markdown fences.

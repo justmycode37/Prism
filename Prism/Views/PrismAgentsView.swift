@@ -8,53 +8,95 @@ struct PrismAgentsView: View {
 
     var body: some View {
         let roster = AgentRoster(agents: agents)
-        VStack(alignment: .leading, spacing: 28) {
+        VStack(alignment: .leading, spacing: 16) {
             if agents.isEmpty && roles.isEmpty {
-                Text("Agents appear when the runtime connects.")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                ConsoleCard {
+                    ConsoleEmptyState(symbol: PrismPage.agents.symbol, title: "No agents yet", message: "Agents and roles appear when the runtime connects.")
+                }
             } else {
-                rosterSummary
-                if !roster.rows.isEmpty {
-                    rosterSection("Firm hierarchy", rows: roster.rows)
+                ConsoleMetricGrid {
+                    ConsoleMetric(title: "Agents", value: "\(agents.count)", detail: "Across all roles")
+                    ConsoleMetric(title: "Active", value: "\(agents.filter { ["working", "running", "active"].contains($0.status) }.count)", detail: "Currently working")
+                    ConsoleMetric(title: "Model cost today", value: runtime.state.map { PrismFormat.money($0.budget.spentTodayUsd) } ?? "—", detail: "All agents · estimated")
                 }
-                if !roster.unlinkedRows.isEmpty {
-                    rosterSection("Other agents", rows: roster.unlinkedRows)
+                ForEach(roles) { role in roleWidget(role) }
+                let otherAgents = agents.filter { agent in !roles.contains { $0.id == (agent.roleId ?? agent.id) } }
+                if !otherAgents.isEmpty {
+                    ConsoleCard("Other agents", caption: "\(otherAgents.count) agents") {
+                        ForEach(otherAgents) { agent in agentRow(agent) }
+                    }
                 }
-                if !roles.isEmpty { roleCatalog }
+                ConsoleCard {
+                    DisclosureGroup("Reporting lines") {
+                        VStack(alignment: .leading, spacing: 14) {
+                            if !roster.rows.isEmpty { rosterSection("Firm hierarchy", rows: roster.rows) }
+                            if !roster.unlinkedRows.isEmpty { rosterSection("Other agents", rows: roster.unlinkedRows) }
+                        }.padding(.top, 12)
+                    }.font(.system(size: 12))
+                }
             }
         }
-        .padding(.horizontal, 4)
     }
 
-    private var rosterSummary: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 18) {
-            Text("\(agents.count) agents").foregroundStyle(.primary)
-            Text("\(agents.filter(\.isOrchestrator).count) orchestrators")
-            Text("\(agents.filter { $0.status == "working" }.count) working")
+    private func roleWidget(_ role: AgentRole) -> some View {
+        let members = agents.filter { ($0.roleId ?? $0.id) == role.id }
+        let latest = members.filter { !$0.summary.isEmpty }.sorted {
+            (PrismFormat.date($0.lastRunAt) ?? .distantPast) > (PrismFormat.date($1.lastRunAt) ?? .distantPast)
+        }.first
+        return ConsoleCard {
+            HStack(spacing: 12) {
+                ConsoleIcon(symbol: roleSymbol(role))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(role.name).font(.system(size: 14, weight: .medium))
+                    Text(role.team).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 4)
+                Text(staffingDescription(role)).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Text(role.mandate).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
+            if let latest {
+                Text(latest.summary).font(.system(size: 12)).lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            DisclosureGroup("Agents & role details") {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(members) { agent in agentRow(agent) }
+                    detail("Role mandate", text: role.mandate)
+                    metadata("Role type", value: PrismFormat.label(role.kind))
+                    if let template = role.templateRoleId {
+                        metadata("Based on", value: roles.first { $0.id == template }?.name ?? PrismFormat.label(template))
+                    }
+                    creationDetails(createdBy: role.createdBy, createdAt: role.createdAt)
+                    manualDisclosure(instructions: role.instructions, path: role.instructionPath)
+                }.font(.system(size: 11)).padding(.top, 10)
+            }.font(.system(size: 11)).tint(.secondary)
         }
-        .font(.system(size: 11)).foregroundStyle(.secondary)
-        .accessibilityElement(children: .combine)
+    }
+
+    private func roleSymbol(_ role: AgentRole) -> String {
+        let key = role.templateRoleId ?? role.id
+        if key.contains("collector") { return "tray.and.arrow.down" }
+        if key.contains("analyst") { return "chart.xyaxis.line" }
+        if key.contains("strategist") { return "square.stack.3d.up" }
+        if key.contains("executor") { return "arrow.triangle.swap" }
+        if key.contains("review") { return "checkmark.seal" }
+        if key.contains("schedul") { return "clock" }
+        return "person"
     }
 
     private func rosterSection(_ title: String, rows: [AgentRoster.Row]) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
-            sectionTitle(title)
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title.uppercased()).font(.system(size: 9, weight: .medium, design: .monospaced)).foregroundStyle(.tertiary)
             ForEach(rows) { row in
                 agentRow(row.agent)
-                    .padding(.leading, CGFloat(min(row.depth, 5)) * 18)
-                    .overlay(alignment: .leading) {
-                        if row.depth > 0 {
-                            Rectangle().fill(.primary.opacity(0.09)).frame(width: 1)
-                                .padding(.leading, CGFloat(min(row.depth, 5) - 1) * 18 + 5)
-                        }
-                    }
+                    .padding(.leading, CGFloat(min(row.depth, 5)) * 12)
             }
         }
     }
 
     private func agentRow(_ agent: AgentStatus) -> some View {
         DisclosureGroup {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 13) {
                 if !agent.task.isEmpty { detail("Current assignment", text: agent.task) }
                 if !agent.summary.isEmpty { detail("Latest report", text: agent.summary) }
                 if let mandate = agent.mandate, !mandate.isEmpty {
@@ -89,6 +131,10 @@ struct PrismAgentsView: View {
                         .font(.system(size: 13, weight: agent.isOrchestrator ? .medium : .regular))
                     Text(agentSubtitle(agent))
                         .font(.system(size: 10)).foregroundStyle(.secondary)
+                    if !agent.summary.isEmpty {
+                        Text(agent.summary).font(.system(size: 10)).foregroundStyle(.secondary)
+                            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 Spacer(minLength: 8)
                 StatusPill(status: agent.status)
@@ -105,7 +151,7 @@ struct PrismAgentsView: View {
                 }
                 ForEach(capabilities) { capability in
                     HStack(alignment: .top, spacing: 9) {
-                        Image(systemName: capability.available ? "checkmark.circle.fill" : "minus.circle")
+                        Image(systemName: capability.available ? "checkmark.circle" : "minus.circle")
                             .foregroundStyle(capability.available ? Color.mint : .secondary)
                             .accessibilityHidden(true)
                         VStack(alignment: .leading, spacing: 5) {
@@ -172,54 +218,6 @@ struct PrismAgentsView: View {
         return "\(seconds) s"
     }
 
-    private var roleCatalog: some View {
-        DisclosureGroup {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(roles) { role in
-                    DisclosureGroup {
-                        VStack(alignment: .leading, spacing: 14) {
-                            detail("Mandate", text: role.mandate)
-                            VStack(alignment: .leading, spacing: 7) {
-                                metadata("Department", value: role.team)
-                                metadata("Responsibility", value: role.kind == "orchestrator" ? "Coordinate agents" : "Specialist")
-                                if let template = role.templateRoleId {
-                                    metadata("Based on", value: roles.first { $0.id == template }?.name ?? PrismFormat.label(template))
-                                }
-                                creationDetails(createdBy: role.createdBy, createdAt: role.createdAt)
-                            }
-                            manualDisclosure(instructions: role.instructions, path: role.instructionPath)
-                        }
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 12).padding(.leading, 18)
-                    } label: {
-                        HStack(spacing: 12) {
-                            Text(role.name).font(.system(size: 12))
-                            if role.isDynamic == true {
-                                Text("Created").font(.system(size: 10)).foregroundStyle(.secondary)
-                            }
-                            Spacer(minLength: 8)
-                            Text(staffingDescription(role))
-                                .font(.system(size: 10)).foregroundStyle(.secondary)
-                        }.padding(.vertical, 5)
-                    }
-                }
-            }
-            .padding(.top, 12).padding(.leading, 18)
-        } label: {
-            HStack {
-                sectionTitle("Role catalog")
-                Spacer(minLength: 8)
-                Text("\(roles.count) roles").font(.system(size: 10)).foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private func sectionTitle(_ text: String) -> some View {
-        Text(text).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-            .accessibilityAddTraits(.isHeader)
-    }
-
     private func detail(_ title: String, text: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.system(size: 10, weight: .medium)).foregroundStyle(.tertiary)
@@ -261,7 +259,7 @@ struct PrismAgentsView: View {
     }
 
     private func agentSubtitle(_ agent: AgentStatus) -> String {
-        var parts = [agent.team, agent.isOrchestrator ? "Orchestrator" : "Specialist"]
+        var parts = [roleName(for: agent), agent.isOrchestrator ? "Orchestrator" : "Specialist"]
         if agent.isDynamic == true { parts.append("Created") }
         return parts.joined(separator: " · ")
     }

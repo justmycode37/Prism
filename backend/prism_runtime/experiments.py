@@ -26,6 +26,9 @@ def forward_report(observations, config=None):
     if any(not row.get('valuation_complete', False) for row in observations):
         result['reasons'] = ['Incomplete valuations cannot support promotion']
         return result
+    if any(row.get('source_cost_complete') is False for row in observations):
+        result['reasons'] = ['Imported source costs are incomplete; promotion requires known operating costs']
+        return result
     dates = [row.get('session_ms', 0) for row in observations]
     if any(not isinstance(d, int) or isinstance(d, bool) or d <= 0 for d in dates) or any(b <= a for a,b in zip(dates,dates[1:])):
         raise ValueError('Forward sessions must be unique and chronological')
@@ -37,13 +40,25 @@ def forward_report(observations, config=None):
     operating_curve = []
     baseline_returns = {name: [] for name in ('benchmark_return','market_return','sector_return')}
     missing = set()
+    previous_trade_count = 0
     for row in observations:
         equity = row.get('equity')
         if not isinstance(equity,(float,int)) or isinstance(equity,bool) or not math.isfinite(equity) or equity <= 0:
             raise ValueError('Finite positive observed equity required')
-        daily_cost = sum(row.get(name,0.) for name in ('research_cost_usd','data_cost_usd','infrastructure_cost_usd'))
-        if not isinstance(daily_cost,(int,float)) or not math.isfinite(daily_cost) or daily_cost < 0:
-            raise ValueError('Invalid operating cost')
+        daily_cost = 0.
+        for name in ('research_cost_usd','data_cost_usd','infrastructure_cost_usd'):
+            value = row.get(name, 0.)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError('Each operating cost must be finite and nonnegative')
+            daily_cost += value
+        if not math.isfinite(daily_cost) or not math.isfinite(costs + daily_cost):
+            raise ValueError('Operating costs exceed finite accounting bounds')
+        trades = row.get('completed_trades', 0)
+        if isinstance(trades, bool) or not isinstance(trades, int) or trades < previous_trade_count:
+            raise ValueError('Completed round-trip counts must be nonnegative monotonic integers')
+        previous_trade_count = trades
+        if row.get('initial_equity', initial) != initial:
+            raise ValueError('Forward capital basis cannot change within an experiment')
         costs += daily_cost
         operating = equity-costs
         if operating <= 0:
@@ -62,11 +77,14 @@ def forward_report(observations, config=None):
             else:
                 baseline_returns[name].append(value)
     benchmark_wealth = {name: math.prod(1+r for r in values) for name,values in baseline_returns.items()}
+    if any(not math.isfinite(value) for value in benchmark_wealth.values()):
+        raise ValueError('Benchmark compounding exceeds finite accounting bounds')
     total = previous/initial-1
     result.update(net_return=total, operating_pnl_usd=previous-initial, trading_pnl_usd=observations[-1]['equity']-initial,
         operating_cost_usd=costs, max_drawdown=drawdown, volatility=statistics.stdev(net_returns) if len(net_returns)>1 else 0.,
         completed_trades=observations[-1].get('completed_trades',0), missing_baselines=sorted(missing),
-        excess_return=total-(benchmark_wealth['benchmark_return']-1), baseline_returns={k:v-1 for k,v in benchmark_wealth.items()})
+        excess_return=None if 'benchmark_return' in missing else total-(benchmark_wealth['benchmark_return']-1),
+        baseline_returns={k: None if k in missing else v-1 for k,v in benchmark_wealth.items()})
     if drawdown > min(.10,settings.get('max_forward_drawdown',.10)) or observations[-1].get('risk_halted'):
         result.update(status='retired', reasons=['Prospective drawdown limit exceeded'])
         return result

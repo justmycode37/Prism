@@ -14,9 +14,10 @@ class DatasetTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.tmp.name) / 'offline.sqlite3')
-        self.data = {'id': 'vendor-v1', 'source': 'Offline test provider', 'as_of': timestamp(),
+        cutoff = timestamp()
+        self.data = {'id': 'vendor-v1', 'source': 'Offline test provider', 'as_of': cutoff,
                      'markets': [market_fixture()], 'evidence': [{'id': 'source', 'content': 'Fixture pattern',
-                     'source_url': 'https://example.org/fixture', 'observed_at': timestamp()}]}
+                     'source_url': 'https://example.org/fixture', 'observed_at': cutoff}]}
 
     def tearDown(self):
         self.tmp.cleanup()

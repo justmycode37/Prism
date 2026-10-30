@@ -1,12 +1,12 @@
 # Prism — macOS design plan
 
-22 October 2026 · current implementation
+30 October 2026 · current implementation
 
 ## Final visual direction
 
-A restrained glass widget with a small, inset glass icon rail on the left. Overview centers the total all-time paper P&L and percentage above a thin history line, with runtime status and one Start/Stop control below. The rest of the interface uses the native system font.
+The existing floating glass window and inset icon rail remain the visual foundation. Every page now uses a shared family of restrained frosted widgets: 22-point corners, 20-point content padding, 16-point page spacing, quiet outline symbols, and rounded numeric typography. Native clear glass remains on navigation and controls; translucent material keeps data widgets readable over the window backdrop.
 
-The user's latest references call for transparent optical depth, rounded corners, a soft transition at the perimeter, and refraction of the backdrop near the edges. There is no crisp decorative outline, rainbow frame, tagline, or stacked dashboard cards. Native glass provides the lens behavior; a diffuse highlight gives the surface thickness without drawing a separate frame.
+Results, agent roles, performance and estimated running costs take priority. Details such as role manuals, source versions, operational journals, and failure reasons stay reachable through disclosure controls. There is no decorative animation or saturated dashboard background.
 
 ## Dimensions and behavior
 
@@ -17,16 +17,16 @@ The user's latest references call for transparent optical depth, rounded corners
 | Position | Move by dragging empty glass; remember main window frame |
 | Corners | 38-point glass radius |
 | Navigation | Compact icon-only rail, native clear glass, tooltips and accessibility labels |
-| Overview | Total all-time paper P&L, percentage of initial capital, and a thin line using every recorded valuation at its actual timestamp; no axes, grid, legend, fill, or chart background. Runtime status and one glass Start/Stop control sit below. |
+| Overview | All-time paper P&L and percentage, estimated model spend today with request count, and agent activity. One Start/Stop control, followed by the top five development results; expand rows for metrics and qualification, or show all loaded results. Test-period filtering is preserved. |
 | Sections | Overview, Research, Test, Execution, Agents — five rail items |
-| Details | Research holds ideas; Test holds backtests; Execution holds simulated positions, fills and activity; Agents shows the collector, analyst, strategist and executor cascade, with expandable assignments, reports, model details and role manuals; the role catalog describes the four layers |
-| Settings | Appearance with independent blur and milkiness sliders |
+| Pages | Research shows hypotheses, evidence and sources. Test separates prospective reports from historical results. Execution shows operational performance and component costs, followed by the paper ledger and searchable activity. Agents presents each reported role with staffing, mandate and latest output; individual assignments, hierarchy and manuals are expandable. |
+| Settings | Spend today, requests and ceiling, appearance controls, independent blur/milkiness sliders, and explicit-save daily spending controls |
 
-The main window uses native window resizing with visually hidden chrome. Settings opens from the small upper-right gear within the same glass window, outside the five-section rail. The user can close the main window and reopen it from the Dock or Window → Show Prism.
+The main window uses native window resizing with visually hidden chrome. Settings opens from the small upper-right settings control within the same glass window, outside the five-section rail. The user can close the main window and reopen it from the Dock or Window → Show Prism.
 
 ## Rendering architecture
 
-The `installGlass` method in `PrismApp.swift` retains the approved GitHub renderer. A clear AppKit container holds two separate layers: the native glass backdrop, then the transparent SwiftUI hosting view. Keeping these as siblings prevents the backdrop from sampling controls. Operational pages use the same surface, with no stacked opaque dashboard cards. The navigation rail uses clear glass rather than a milky regular-glass plate.
+The `installGlass` method in `PrismApp.swift` retains the approved GitHub renderer. A clear AppKit container holds two separate layers: the native glass backdrop, then the transparent SwiftUI hosting view. Keeping these as siblings prevents the backdrop from sampling controls. Operational pages add translucent material widgets over the same surface. Content widgets do not use optical liquid glass, so their text stays separate from the native control sampling layer. The navigation rail uses clear glass rather than a milky regular-glass plate.
 
 The prototype vendors [WholeWindowLiquidGlass](https://github.com/vientooscuro/WholeWindowLiquidGlass), which uses `NSGlassEffectView` and adjusts its private rendering filters. The progressive blur bands use equal nonzero weights on the main window backdrop, so the radius controls visible blur across its surface. Smaller controls retain their existing glass treatment. A Background blur slider controls the backdrop radius from 0 to 100, defaulting to 40, shared by Light and Dark. It updates the existing renderer immediately without changing tint, opacity, brightness, or saturation settings. A separate Milkiness slider controls the appearance veil from 0% to 100%, defaulting to 0%: no added white overlay in Light or black overlay in Dark. Both values persist locally. Milkiness is a compositing opacity, not an exact measured transmission percentage.
 
@@ -48,8 +48,9 @@ The Start/Stop control exposes an accessible label for starting or stopping all 
 - `Design/GlassSurface.swift`: diffuse finish, frosting, accessibility appearance.
 - `Design/PrismWordmark.swift` and `PrismTypography.swift`: retained wordmark assets, no longer rendered in the current interface.
 - `Views/PrismHomeView.swift`: glass rail and shared page container.
-- `Views/PrismOverviewView.swift`: all-time paper P&L chart and runtime controls; hover selects a recorded value without adding grid lines.
-- `Views/PrismSettingsView.swift`: appearance controls.
+- `Views/PrismOverviewView.swift`: P&L, spending, agents, development leaderboard and runtime controls.
+- `Views/ConsoleComponents.swift`: shared frosted cards, responsive metric grids, outline icon badges, status and empty states.
+- `Views/PrismSettingsView.swift`: appearance and explicit-save spending controls.
 - `Appearance/AppearancePreferences.swift`: stored appearance, blur, and milkiness preferences.
 - `Vendor/WholeWindowLiquidGlass.swift`: attributed renderer behind a compilation condition.
 - `Resources/Fonts/Raleway.ttf`: retained font asset; licenses included in app resources.
@@ -58,10 +59,16 @@ Xcode previews show the SwiftUI composition. Judge desktop refraction in the run
 
 ## Operational boundaries
 
-Keep Overview as the resting state. Operational pages show actual backend state, failed experiments, role outputs, market observations, and ledger-derived simulated P&L. Detailed findings stay behind disclosure controls. Offline state is explicit; previous snapshots are identified as stale.
+Keep Overview as the resting state. Cost labels distinguish today’s estimated model spend, reported research totals, and operation component budgets. Missing figures remain unavailable; costs are not allocated to individual agents without reported data. Historical returns are development evidence and remain separate from prospective qualification.
+
+Operational pages show actual backend state, failed experiments, role outputs, market observations, and ledger-derived simulated P&L. Detailed findings stay behind disclosure controls. Offline state is explicit; previous snapshots are identified as stale.
 
 Before live trading, provide visible environment, runtime health, data freshness, incidents, and emergency controls. Explain the difference between pausing research, blocking new exposure, canceling entries, and flattening positions. The current Overview is not the full future trading control surface.
 
 ## Remaining review
 
 Validate window dragging/resizing on the actual Mac, keyboard focus, VoiceOver, contrast over varied backdrops, system accessibility accommodations, and idle energy use. Current build and interaction observations are recorded in `Validation.md`.
+
+## Offline layout checks
+
+`scripts/check-ui-rendering.sh` builds a separate fixture renderer with an inert runtime client. It excludes the production app and client, so it cannot start the installed service, read control credentials, or call a provider. It renders the six pages at 840 × 560 and 600 × 420 in both appearances, plus empty offline states. Outputs go to `/tmp/prism-ui-redesign/`. These images check content layout; desktop refraction still requires an explicitly authorized running-app check.

@@ -65,6 +65,9 @@ def install_service() -> None:
             "PRISM_STATE_DIR": str(STATE),
             "PRISM_CONTROL_TOKEN_FILE": str(TOKEN),
             "PRISM_OPENAI_KEY_FILE": os.environ.get("PRISM_OPENAI_KEY_FILE", str(STATE / "secrets" / "openai.key")),
+            "PRISM_BYBIT_TESTNET_CREDENTIALS_FILE": os.environ.get("PRISM_BYBIT_TESTNET_CREDENTIALS_FILE", str(STATE / "secrets" / "bybit-testnet.json")),
+            "PRISM_BYBIT_MAINNET_CREDENTIALS_FILE": os.environ.get("PRISM_BYBIT_MAINNET_CREDENTIALS_FILE", str(STATE / "secrets" / "bybit-mainnet.json")),
+            "PRISM_BYBIT_MAINNET_ENABLED": "1" if os.environ.get("PRISM_BYBIT_MAINNET_ENABLED") == "1" else "0",
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "PYTHONUNBUFFERED": "1",
         },
@@ -108,8 +111,10 @@ def request(path: str, payload: dict | None = None) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("install", "uninstall", "status", "start", "stop", "pause", "resume", "run", "configure"))
+    parser.add_argument("command", choices=("install", "uninstall", "status", "start", "stop", "pause", "resume", "run", "configure", "register", "calendar", "review", "development-tape"))
     parser.add_argument("--config-file", type=Path, help="JSON object to POST as a partial configuration update.")
+    parser.add_argument("--input-file", type=Path, help="Explicit strategy registration or sourced calendar JSON object.")
+    parser.add_argument("--strategy-id", help="Exact strategy or experiment version to review.")
     arguments = parser.parse_args()
     try:
         if arguments.command == "install":
@@ -124,7 +129,19 @@ def main() -> int:
             return 0
         if arguments.command == "status":
             state = request("/v1/state")
-            result = {key: state.get(key) for key in ("runtime", "budget", "cascade")}
+            result = {key: state.get(key) for key in ("runtime", "budget", "cascade", "operations")}
+        elif arguments.command in {"register", "calendar", "development-tape"}:
+            if arguments.input_file is None:
+                parser.error(arguments.command + " requires --input-file PATH")
+            body = json.loads(arguments.input_file.read_text())
+            if not isinstance(body, dict):
+                raise ValueError("Input must contain a JSON object")
+            endpoint = {"register": "/v1/strategy", "calendar": "/v1/calendar", "development-tape": "/v1/development-tape"}
+            result = request(endpoint[arguments.command], body)
+        elif arguments.command == "review":
+            if not arguments.strategy_id:
+                parser.error("review requires --strategy-id VERSION")
+            result = request("/v1/review", {"strategy_id": arguments.strategy_id})
         elif arguments.command == "configure":
             if arguments.config_file is None:
                 parser.error("configure requires --config-file PATH")

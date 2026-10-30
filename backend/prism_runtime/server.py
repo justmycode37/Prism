@@ -87,7 +87,7 @@ def create_server(runtime, token, port=8787):
                 return
             path = urlsplit(self.path).path
             if path == '/health':
-                self.respond(200, {'ok': True, 'service': 'prism-runtime', 'architecture': 'reverse_cascade', 'mode': 'paper'})
+                self.respond(200, {'ok': True, 'service': 'prism-runtime', 'architecture': 'event_driven', 'mode': runtime.store.config()['bybit']['mode']})
             elif path == '/v1/state':
                 try:
                     self.respond(200, runtime.state())
@@ -103,9 +103,11 @@ def create_server(runtime, token, port=8787):
                 self.respond(415, {'error': 'An application/json body is required.'})
                 return
             try:
+                path = urlsplit(self.path).path
                 size = int(self.headers.get('Content-Length', '-1'))
-                if self.headers.get('Transfer-Encoding') or not 0 < size <= 16384:
-                    self.respond(413, {'error': 'Request body must be between 1 and 16384 bytes.'})
+                maximum = 1_000_000 if path == '/v1/development-tape' else 16384
+                if self.headers.get('Transfer-Encoding') or not 0 < size <= maximum:
+                    self.respond(413, {'error': 'Request body exceeds this endpoint’s bounded input size.'})
                     return
                 def invalid_constant(_value):
                     raise ValueError('Nonfinite JSON number')
@@ -118,8 +120,17 @@ def create_server(runtime, token, port=8787):
                         raise ValueError('A single action is required')
                     runtime.control(body['action'])
                 elif path == '/v1/config':
-                    runtime.store.update_config(body)
-                    runtime.configuration_changed()
+                    runtime.update_configuration(body)
+                elif path == '/v1/strategy':
+                    runtime.register_strategy(body)
+                elif path == '/v1/review':
+                    if set(body) != {'strategy_id'}:
+                        raise ValueError('An exact strategy_id is required')
+                    runtime.queue_review(body['strategy_id'])
+                elif path == '/v1/calendar':
+                    runtime.import_calendar(body)
+                elif path == '/v1/development-tape':
+                    runtime.import_development_tape(body)
                 else:
                     self.respond(404, {'error': 'Unknown local endpoint.'})
                     return

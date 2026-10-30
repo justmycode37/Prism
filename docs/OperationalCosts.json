@@ -1,0 +1,293 @@
+{
+  "basis": "Offline fixture request-body byte measurements and explicit output/workload assumptions; not a bill or market experiment.",
+  "method": {
+    "request_bytes": "Compact UTF-8 JSON body constructed with Prism Responses roles, manuals, strict schemas, execution tools, and representative continuation outputs.",
+    "input_tokens": "Assumed at 4 UTF-8 bytes per input token; actual tokenization and cached-token treatment are not measured.",
+    "runtime_usd_reservation": "Admission simulation separately matches Store.reserve: request-body bytes plus 12000 reservation bytes, plus each lane maximum output-token allowance. This is a conservative cap reservation, not predicted API usage.",
+    "reservation_settlement": "Sequential successful requests settle to the assumed usage cost before the next reservation. Sums of request reservations are not daily charges or simultaneous reservations. Unknown usage instead charges the full reservation; that failure scenario admits fewer calls.",
+    "complete_execution_units": "Admission counts complete two-round conversations; a final incomplete conversation can consume one extra response in the runtime. Concurrent calls and actual usage can change the mix.",
+    "output_tokens": {
+      "scheduler": 700,
+      "discovery": 1800,
+      "review": 1200,
+      "execution_round_1": 350,
+      "execution_round_2": 500,
+      "execution_additional_round": 300
+    },
+    "scenario_counts_are_assumptions": true,
+    "execution_scenario_unit": "One event decision is costed as two Responses requests. Extra tool rounds add separately priced Responses requests."
+  },
+  "configured_model_rates_usd_per_million": {
+    "gpt-6-luna": {
+      "input": 1.0,
+      "output": 5.0
+    },
+    "gpt-6.1-sol": {
+      "input": 10.0,
+      "output": 50.0
+    },
+    "gpt-6-astra": {
+      "input": 30.0,
+      "output": 150.0
+    }
+  },
+  "rate_notice": "These are local reservation assumptions from default_config, not a claim about published provider pricing.",
+  "global_budget": {
+    "daily_limit_usd": null,
+    "max_calls_per_day": null,
+    "default_limits_are_unset": true,
+    "when_configured_order_dependent": "The scenario estimate applies the shared global budget in the explicit component order listed with each scenario; concurrent runtime reservations may admit a different mix."
+  },
+  "components": {
+    "scheduler": {
+      "request_body_bytes": 11197,
+      "assumed_input_tokens": 2800,
+      "assumed_output_tokens_per_response": 700,
+      "model": "gpt-6-luna",
+      "reasoning_effort": "low",
+      "configured_price_per_million_usd": {
+        "input": 1.0,
+        "output": 5.0
+      },
+      "estimated_usd_per_response": 0.0063,
+      "conservative_runtime_reservation_usd": 0.043677
+    },
+    "discovery": {
+      "request_body_bytes": 186291,
+      "assumed_input_tokens": 46573,
+      "assumed_output_tokens_per_response": 1800,
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "medium",
+      "configured_price_per_million_usd": {
+        "input": 10.0,
+        "output": 50.0
+      },
+      "estimated_usd_per_response": 0.55573,
+      "conservative_runtime_reservation_usd": 2.39251,
+      "packet_fixture": {
+        "bar_counts_by_interval": {
+          "1": 500,
+          "5": 500,
+          "15": 500,
+          "60": 500,
+          "D": 500
+        },
+        "total_bars": 2500,
+        "bounded_previous_dossier_max_bytes": 8000,
+        "bounded_previous_dossier_actual_bytes": 7577
+      }
+    },
+    "review": {
+      "request_body_bytes": 14220,
+      "assumed_input_tokens": 3555,
+      "assumed_output_tokens_per_response": 1200,
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "medium",
+      "configured_price_per_million_usd": {
+        "input": 10.0,
+        "output": 50.0
+      },
+      "estimated_usd_per_response": 0.09555,
+      "conservative_runtime_reservation_usd": 0.6718
+    },
+    "execution": {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "high",
+      "configured_price_per_million_usd": {
+        "input": 30.0,
+        "output": 150.0
+      },
+      "bounded_strategy_dossier_bytes_for_execution": 7577,
+      "responses_rounds": [
+        {
+          "request_body_bytes": 97169,
+          "assumed_input_tokens": 24293,
+          "assumed_output_tokens": 350,
+          "estimated_usd": 0.78129,
+          "conservative_runtime_reservation_usd": 3.88947
+        },
+        {
+          "request_body_bytes": 98523,
+          "assumed_input_tokens": 24631,
+          "assumed_output_tokens": 500,
+          "estimated_usd": 0.81393,
+          "conservative_runtime_reservation_usd": 3.93009
+        }
+      ],
+      "two_round_event_decision": {
+        "responses": 2,
+        "estimated_usd": 1.59522,
+        "conservative_runtime_reservation_usd": 7.81956,
+        "total_input_bytes": 195692,
+        "total_assumed_input_tokens": 48924,
+        "total_assumed_output_tokens": 850
+      },
+      "one_additional_tool_round": {
+        "request_body_bytes": 177338,
+        "assumed_input_tokens": 44335,
+        "assumed_output_tokens": 300,
+        "estimated_usd_per_additional_response": 1.37505,
+        "conservative_runtime_reservation_usd": 6.29454
+      },
+      "tool_limit": {
+        "max_rounds": 4,
+        "max_tools": 8,
+        "parallel_tool_calls": false
+      }
+    }
+  },
+  "scenarios": [
+    {
+      "name": "quiet_event_day",
+      "assumed_requested_execution_decisions": 12,
+      "requested_responses_by_component": {
+        "scheduler": 12,
+        "discovery": 8,
+        "review": 4,
+        "execution": 24
+      },
+      "requested_responses_total": 48,
+      "requested_uncapped_estimated_usd": 24.04628,
+      "sum_uncapped_request_reservations_usd": 116.186124,
+      "component_cap_admitted_responses": {
+        "scheduler": 12,
+        "discovery": 8,
+        "review": 4,
+        "execution": 24
+      },
+      "global_cap_admitted_responses": {
+        "scheduler": 12,
+        "discovery": 8,
+        "review": 4,
+        "execution": 24
+      },
+      "component_cap_admitted_execution_decisions": 12,
+      "global_cap_admitted_execution_decisions": 12,
+      "estimated_usd_after_component_caps": 24.04628,
+      "sum_request_reservations_after_component_caps": 116.186124,
+      "estimated_usd_after_global_caps": 24.04628,
+      "sum_request_reservations_after_global_caps": 116.186124,
+      "global_budget_order_assumption": [
+        "scheduler",
+        "discovery",
+        "review",
+        "execution"
+      ],
+      "daily_component_usd_caps": {
+        "scheduler": 15.0,
+        "discovery": 100.0,
+        "review": 40.0,
+        "execution": 150.0
+      },
+      "daily_component_response_caps": {
+        "scheduler": 96,
+        "discovery": 96,
+        "review": 32,
+        "execution": 240
+      }
+    },
+    {
+      "name": "busy_event_day",
+      "assumed_requested_execution_decisions": 80,
+      "requested_responses_by_component": {
+        "scheduler": 48,
+        "discovery": 48,
+        "review": 16,
+        "execution": 160
+      },
+      "requested_responses_total": 272,
+      "requested_uncapped_estimated_usd": 156.12384,
+      "sum_uncapped_request_reservations_usd": 753.250576,
+      "component_cap_admitted_responses": {
+        "scheduler": 48,
+        "discovery": 48,
+        "review": 16,
+        "execution": 160
+      },
+      "global_cap_admitted_responses": {
+        "scheduler": 48,
+        "discovery": 48,
+        "review": 16,
+        "execution": 160
+      },
+      "component_cap_admitted_execution_decisions": 80,
+      "global_cap_admitted_execution_decisions": 80,
+      "estimated_usd_after_component_caps": 156.12384,
+      "sum_request_reservations_after_component_caps": 753.250576,
+      "estimated_usd_after_global_caps": 156.12384,
+      "sum_request_reservations_after_global_caps": 753.250576,
+      "global_budget_order_assumption": [
+        "scheduler",
+        "discovery",
+        "review",
+        "execution"
+      ],
+      "daily_component_usd_caps": {
+        "scheduler": 15.0,
+        "discovery": 100.0,
+        "review": 40.0,
+        "execution": 150.0
+      },
+      "daily_component_response_caps": {
+        "scheduler": 96,
+        "discovery": 96,
+        "review": 32,
+        "execution": 240
+      }
+    },
+    {
+      "name": "requested_every_minute",
+      "assumed_requested_execution_decisions": 1440,
+      "requested_responses_by_component": {
+        "scheduler": 0,
+        "discovery": 0,
+        "review": 0,
+        "execution": 2880
+      },
+      "requested_responses_total": 2880,
+      "requested_uncapped_estimated_usd": 2297.1168000000002,
+      "sum_uncapped_request_reservations_usd": 11260.1664,
+      "component_cap_admitted_responses": {
+        "scheduler": 0,
+        "discovery": 0,
+        "review": 0,
+        "execution": 184
+      },
+      "global_cap_admitted_responses": {
+        "scheduler": 0,
+        "discovery": 0,
+        "review": 0,
+        "execution": 184
+      },
+      "component_cap_admitted_execution_decisions": 92,
+      "global_cap_admitted_execution_decisions": 92,
+      "estimated_usd_after_component_caps": 146.76024,
+      "sum_request_reservations_after_component_caps": 719.39952,
+      "estimated_usd_after_global_caps": 146.76024,
+      "sum_request_reservations_after_global_caps": 719.39952,
+      "global_budget_order_assumption": [
+        "scheduler",
+        "discovery",
+        "review",
+        "execution"
+      ],
+      "daily_component_usd_caps": {
+        "scheduler": 15.0,
+        "discovery": 100.0,
+        "review": 40.0,
+        "execution": 150.0
+      },
+      "daily_component_response_caps": {
+        "scheduler": 96,
+        "discovery": 96,
+        "review": 32,
+        "execution": 240
+      }
+    }
+  ],
+  "exclusions": [
+    "Market-data, public-data, source acquisition, and infrastructure costs.",
+    "Provider retries, cache discounts, and API usage-token receipts.",
+    "No network, key loading, installed service, or model request occurred."
+  ]
+}

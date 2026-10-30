@@ -6,14 +6,16 @@ import math
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
+from .operations_config import OPERATION_DEFAULTS, validate_operations_section
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 ARCHITECTURE_VERSION = 1
 LAYER_ORDER = ('collector', 'analyst', 'strategist', 'executor')
 DEFAULT_CONFIG = {
+    **OPERATION_DEFAULTS,
     'model': 'gpt-6-luna',  # Existing UI configuration field: collector model.
     'max_concurrency': 8,
-    'cycle_interval_seconds': 3600,
+    'cycle_interval_seconds': 3600,  # Legacy UI field; never drives continuous research.
     'market_refresh_seconds': 60,
     'daily_limit_usd': None,
     'max_calls_per_day': None,
@@ -26,6 +28,7 @@ DEFAULT_CONFIG = {
         'active_collectors': 6, 'active_analysts': 2,
         'discovery_interval_seconds': 86400,
         'max_shadow_candidates': 64,
+        'variants_per_hypothesis': 16, 'max_candidates_per_cycle': 256,
         'max_holding_sessions': 20,
         'min_forward_sessions': 60, 'min_forward_trades': 8,
         'forward_block_sessions': 5, 'min_forward_blocks': 12,
@@ -93,7 +96,9 @@ def validate_config_update(changes: dict) -> dict:
                       'max_output_tokens': (1024, 32768), 'max_input_bytes': (4000, 2000000),
                       'max_evidence_per_cycle': (24, 20000), 'max_handoffs_per_agent': (4, 256)}
     for key, value in changes.items():
-        if key in {'daily_limit_usd', 'max_calls_per_day'} and value is None:
+        if key in OPERATION_DEFAULTS:
+            result[key] = validate_operations_section(key, value)
+        elif key in {'daily_limit_usd', 'max_calls_per_day'} and value is None:
             result[key] = None
         elif key == 'daily_limit_usd':
             if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
@@ -130,6 +135,7 @@ def validate_config_update(changes: dict) -> dict:
             if not isinstance(value, dict) or not value or set(value) - set(DEFAULT_CONFIG['research']):
                 raise ValueError('Invalid research protocol settings.')
             integers = {'active_collectors': (1, 24), 'active_analysts': (1, 6),
+                        'variants_per_hypothesis': (1, 128), 'max_candidates_per_cycle': (1, 2000),
                         'discovery_interval_seconds': (3600, 604800), 'max_shadow_candidates': (1, 256),
                         'max_holding_sessions': (1, 100), 'min_forward_sessions': (60, 2520),
                         'min_forward_trades': (8, 1000), 'forward_block_sessions': (5, 100),

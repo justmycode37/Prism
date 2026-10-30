@@ -1,4 +1,4 @@
-"""Launch Prism's local cascade scheduler and authenticated UI API."""
+"""Launch Prism's independent event services and authenticated local UI API."""
 from __future__ import annotations
 
 import fcntl
@@ -42,7 +42,8 @@ def main() -> int:
         signal.signal(signal.SIGTERM, stop_server)
         scheduler = threading.Thread(target=runtime.run_forever, name="prism-cascade", daemon=True)
         scheduler.start()
-        print("Prism cascade API listening on http://127.0.0.1:8787 (paper execution).", flush=True)
+        print("Prism API listening on http://127.0.0.1:8787 (" + store.config()['bybit']['mode'] +
+              "; explicit operator execution gates apply).", flush=True)
         server.serve_forever(poll_interval=0.25)
         return 0
     except (OSError, ValueError) as error:

@@ -55,3 +55,21 @@ class ForwardReportTests(unittest.TestCase):
         rows=observations()
         rows[0]['valuation_complete']=False
         self.assertEqual(forward_report(rows)['status'],'inconclusive')
+
+    def test_cost_offsets_invalid_trade_counts_and_changed_capital_are_rejected(self):
+        for changes in ({'research_cost_usd': -100., 'data_cost_usd': 100.},
+                        {'research_cost_usd': True}, {'completed_trades': -1},
+                        {'completed_trades': 1.5}, {'initial_equity': 50000.}):
+            with self.subTest(changes=changes):
+                rows = observations()
+                rows[20].update(changes)
+                with self.assertRaises(ValueError):
+                    forward_report(rows)
+
+    def test_missing_baseline_is_not_reported_as_a_zero_return(self):
+        rows = observations()
+        del rows[0]['benchmark_return']
+        result = forward_report(rows)
+        self.assertEqual(result['status'], 'inconclusive')
+        self.assertIsNone(result['baseline_returns']['benchmark_return'])
+        self.assertIsNone(result['excess_return'])

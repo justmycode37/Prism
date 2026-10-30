@@ -13,6 +13,44 @@ struct RuntimeState: Decodable, Sendable {
     /// Additive cascade metadata; nil when the backend omits the key (legacy / offline fixture).
     let cascade: CascadeMetadata?
     let research: ResearchStatus?
+    /// Continuous runtime projection; absent in older journals and fixtures.
+    let operations: OperationalStatus?
+}
+
+struct OperationalStatus: Decodable, Sendable {
+    let mode: String
+    let enabled: Bool
+    let nextWakeAt: String?
+    let rationale: String?
+    let riskStatus: String?
+    let grossExposure: Double?
+    let realizedPnl: Double?
+    let unrealizedPnl: Double?
+    let sections: [OperationalSection]
+    let componentCosts: [OperationalCost]
+}
+
+struct OperationalSection: Decodable, Identifiable, Sendable {
+    let id: String
+    let title: String
+    let items: [OperationalItem]
+}
+
+struct OperationalItem: Decodable, Identifiable, Sendable {
+    let id: String
+    let title: String
+    let detail: String
+    let status: String?
+    let time: String?
+    let sourceUrl: String?
+}
+
+struct OperationalCost: Decodable, Identifiable, Sendable {
+    let id: String
+    let calls: Int
+    let spentUsd: Double
+    let reservedUsd: Double
+    let limitUsd: Double
 }
 
 struct ResearchStatus: Decodable, Sendable {
@@ -24,6 +62,81 @@ struct ResearchStatus: Decodable, Sendable {
     let operatingCosts: ResearchCosts?
     let coverage: ResearchCoverage?
     let forwardReports: [ForwardResearchReport]?
+    /// Optional bounded projection; older runtimes do not send it.
+    let leaderboard: ResearchLeaderboard?
+}
+
+struct ResearchLeaderboard: Decodable, Sendable {
+    let rows: [ResearchLeaderboardRow]?
+    let total: Int?
+    let ranked: Int?
+    let rankingBasis: String?
+    let limit: Int?
+
+    var testWindows: [String] {
+        Array(Set((rows ?? []).compactMap(\.testWindow))).sorted(by: >)
+    }
+
+    /// Sort finite development returns first, preserving backend order for ties
+    /// and for rows whose return has not been measured.
+    var rankedRows: [ResearchLeaderboardRow] {
+        (rows ?? []).enumerated().sorted { lhs, rhs in
+            let left = lhs.element.finiteNetReturn
+            let right = rhs.element.finiteNetReturn
+            switch (left, right) {
+            case let (left?, right?):
+                return left == right ? lhs.offset < rhs.offset : left > right
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            case (nil, nil):
+                return lhs.offset < rhs.offset
+            }
+        }.map(\.element)
+    }
+}
+
+struct ResearchLeaderboardRow: Decodable, Identifiable, Sendable {
+    let id: String
+    let experimentId: String?
+    let name: String?
+    let symbol: String?
+    let family: String?
+    let phase: String?
+    let netReturn: Double?
+    let maxDrawdown: Double?
+    let trades: Int?
+    let screenStatus: String?
+    let prospectiveStatus: String?
+    let qualification: ResearchQualification?
+    let forwardNetReturn: Double?
+    let forwardAsOf: String?
+    let testStart: String?
+    let testEnd: String?
+
+    var testWindow: String? {
+        guard let testStart, let testEnd, !testStart.isEmpty, !testEnd.isEmpty else { return nil }
+        return "\(testStart) → \(testEnd)"
+    }
+
+    var finiteNetReturn: Double? {
+        guard let netReturn, netReturn.isFinite else { return nil }
+        return netReturn
+    }
+
+    var finiteMaxDrawdown: Double? {
+        guard let maxDrawdown, maxDrawdown.isFinite else { return nil }
+        return maxDrawdown
+    }
+}
+
+struct ResearchQualification: Decodable, Sendable {
+    let qualified: Bool?
+    let status: String?
+    let basis: String?
+    let rankingEffect: String?
+    let reasons: [String]?
 }
 
 struct ResearchCosts: Decodable, Sendable {
@@ -370,12 +483,12 @@ enum PrismPage: String, CaseIterable, Identifiable {
     var title: String { rawValue.capitalized }
     var symbol: String {
         switch self {
-        case .overview: "square.grid.2x2"
-        case .research: "sparkle.magnifyingglass"
-        case .test: "waveform.path.ecg"
-        case .execution: "arrow.left.arrow.right"
-        case .agents: "person.3"
-        case .settings: "gearshape"
+        case .overview: "chart.xyaxis.line"
+        case .research: "scope"
+        case .test: "checkmark.seal"
+        case .execution: "arrow.triangle.swap"
+        case .agents: "person.2"
+        case .settings: "slider.horizontal.3"
         }
     }
 }
