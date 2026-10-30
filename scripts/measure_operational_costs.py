@@ -46,7 +46,7 @@ def _body(component: str, role: str, payload: dict, config: dict,
           *, schema: dict | None = None, tools: list | None = None) -> dict:
     resource = config['resources'][component]
     body = {
-        'model': 'gpt-6-astra' if component == 'execution' else resource['model'],
+        'model': resource['model'],
         'reasoning': {'effort': resource['reasoning_effort']},
         'store': False,
         'include': ['reasoning.encrypted_content'],
@@ -286,7 +286,7 @@ def _execution_measurement(payload: dict, config: dict) -> dict:
             'approved_version': False})})
     second = _request_size(continuation)
     second_output_tokens = 500
-    model = 'gpt-6-astra'
+    model = config['resources']['execution']['model']
     first_cost = _cost(config, model, first['assumed_input_tokens'], first_output_tokens)
     second_cost = _cost(config, model, second['assumed_input_tokens'], second_output_tokens)
     first_reservation = _reservation(config, 'execution', model, first['request_body_bytes'])

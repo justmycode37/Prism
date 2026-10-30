@@ -22,7 +22,7 @@ class SectorRuntimeTests(unittest.TestCase):
         layers = default_config()['layers']
         self.assertEqual([layers[name]['count'] for name in ('collector', 'analyst', 'strategist', 'executor')], [24, 6, 2, 1])
         self.assertEqual([layers[name]['model'] for name in ('collector', 'analyst', 'strategist', 'executor')],
-                         ['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-astra'])
+                         ['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6.1-sol', 'gpt-6.1-sol'])
         self.assertEqual([layers[name]['reasoning_effort'] for name in ('collector', 'analyst', 'strategist', 'executor')],
                          ['low', 'medium', 'high', 'max'])
         self.assertEqual(len(roster(default_config())), 33)

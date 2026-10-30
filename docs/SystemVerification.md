@@ -17,7 +17,7 @@ The test repairs a missing REST history candle, verifies that recovered REST bar
 
 The prospective path creates 60 consecutive UTC-day marks from actual immutable MarketData snapshots. Twelve synthetic completed trades produce twelve positive five-day blocks against flat same-instrument and cash baselines. Assertions retain the registered fee, slippage, funding, operating-cost, benchmark, multiple-comparison correction, and block-correlation checks. Eligibility remains false until the exact strategy version and allocation are explicitly configured.
 
-The execution portion routes injected Astra function calls through the real host tools. A pre-60-day request, unknown snapshot, and stale snapshot are blocked. After qualification and operator approval, a valid order is durably acknowledged with zero filled quantity; a later quote advances the local paper exchange, produces an execution, updates ResearchMemory, and remains deduplicated when the controller is reconstructed.
+The execution portion routes injected GPT-6.1 Sol function calls through the real host tools. A pre-60-day request, unknown snapshot, and stale snapshot are blocked. After qualification and operator approval, a valid order is durably acknowledged with zero filled quantity; a later quote advances the local paper exchange, produces an execution, updates ResearchMemory, and remains deduplicated when the controller is reconstructed.
 
 ## Spot quote boundary
 
@@ -40,3 +40,12 @@ market/calendar data, and injected exchange/model transports. No installed
 service, exchange or model credentials, paid research, or real orders were
 used. Authenticated Bybit behavior, live calendar vendor completeness, and
 actual provider availability remain external activation checks.
+
+## Sol routing follow-up
+
+The GPT-6.1 Sol follow-up passed all 361 offline tests in 25.714 seconds,
+including saved-configuration migration, historical charge preservation,
+legacy advisory task routing, and the operational tool loop. The migration
+checks also passed after adding a write transaction around the upgrade.
+The Swift contract check and unsigned Debug Xcode build passed. No installed
+service was started or reconfigured during verification.

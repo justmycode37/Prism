@@ -70,8 +70,8 @@ _SCHEMAS = {
 _DEFAULTS = {
     "collector": ("gpt-6-luna", "low"),
     "analyst": ("gpt-6.1-sol", "medium"),
-    "strategist": ("gpt-6-astra", "high"),
-    "execution": ("gpt-6-astra", "max"),
+    "strategist": ("gpt-6.1-sol", "high"),
+    "execution": ("gpt-6.1-sol", "max"),
 }
 _INSTRUCTIONS = {
     "collector": "Extract a few material, novel findings with source evidence IDs. "
@@ -179,6 +179,8 @@ class ModelProvider:
         schema = output_schema(layer)
         default_model, default_effort = _DEFAULTS[layer]
         model = str(agent.get("model") or default_model)
+        if layer in {"execution", "strategist"} and model == "gpt-6-astra":
+            model = default_model  # Old persisted task records follow the current role routing.
         effort = str(agent.get("reasoning_effort") or default_effort)
         if effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
             raise ProviderError("Unsupported reasoning effort")

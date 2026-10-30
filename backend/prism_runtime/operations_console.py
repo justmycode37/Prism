@@ -57,7 +57,7 @@ def projection(*, mode, enabled, schedule, calendar, subscriptions, memory, exec
         f"{r.get('parent_experiment_id', 'parent')} → {r.get('child_experiment_id') or 'no child'}",
         str(r.get('evaluation') or 'Separate experiment; parent history retained.'), key=r.get('id'), status=r.get('status'))
         for r in memory.get('recent_revisions', [])])
-    section('decisions', 'Astra decisions', [_item(
+    section('decisions', 'Sol decisions', [_item(
         f"{r.get('strategy_id', r.get('strategy_version', 'Strategy'))} · {r.get('action', 'decision')}",
         r.get('rationale', r.get('reason', r.get('summary', ''))), key=r.get('id'), status=r.get('status'), at=r.get('created_at', r.get('at')))
         for r in execution.get('decisions', [])])

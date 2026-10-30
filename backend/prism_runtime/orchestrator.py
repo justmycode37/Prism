@@ -878,7 +878,7 @@ class Runtime:
         if not self._active(generation):
             return []
         # Legacy daily-equity paper execution remains deterministic. Operational
-        # Astra decisions belong to the independent Bybit execution lane, with
+        # Sol decisions belong to the independent Bybit execution lane, with
         # tool results and current host checks; never pay for ignored advice.
         with self._execution_lock:
             if not self._active(generation):

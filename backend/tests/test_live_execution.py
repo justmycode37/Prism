@@ -182,7 +182,7 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertIn('configuration changed', result['rationale'])
         self.assertEqual(self.adapter.orders(), [])
 
-    def test_astra_receives_dossier_declared_history_and_sourced_event_context(self):
+    def test_sol_receives_dossier_declared_history_and_sourced_event_context(self):
         self.memory.record_execution(self.strategy_id, {'id': 'previous-hold', 'status': 'held',
             'rationale': 'Wait for the sourced event before revisiting entry.'})
         value = copy.deepcopy(self.market.values[self.strategy_id])
@@ -428,7 +428,7 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertGreaterEqual(self.adapter.account_snapshot()["positions"][0]["stop_loss"], 97.1)
 
     def test_budget_failure_is_durable_and_does_not_disable_protection(self):
-        # Occupy Astra's single-call lane before the execution event.
+        # Occupy Sol's single-call lane before the execution event.
         self.store.update_config({"resources": {"execution": {"daily_calls": 1}}})
         self.responses.responses.append({"status": "completed", "output": [{"type": "message", "content": [
             {"type": "output_text", "text": "{\"ready\":true}"}]}],
@@ -440,7 +440,7 @@ class LiveExecutionTests(unittest.TestCase):
             "order_type": "Limit", "quantity": .2, "price": 100., "order_link_id": "budget-pending",
             "strategy_id": self.strategy_id, "snapshot_id": self.snapshot["snapshot_id"],
             "expires_at_ms": round(self.now[0] * 1000) + 20_000, "rationale": "Fixture pending order"})
-        # No second Astra response is queued: the component call budget blocks it.
+        # No second Sol response is queued: the component call budget blocks it.
         blocked = self.controller.handle_event(self.event("budget-failure"))
         self.assertEqual(blocked["status"], "blocked")
         self.store.update_config({"live_execution": {"kill_switch": True}})

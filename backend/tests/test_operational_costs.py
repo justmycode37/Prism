@@ -38,7 +38,7 @@ class OperationalCostTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_shared_call_cap_counts_each_astra_round(self):
+    def test_shared_call_cap_counts_each_sol_round(self):
         config = costs.default_config()
         requested = {name: 3 if name == 'execution' else 0 for name in costs.COMPONENT_ORDER}
         row = costs._admit_work(requested, {name: 1 for name in requested},

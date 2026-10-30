@@ -20,7 +20,7 @@ OPERATION_DEFAULTS = {
         'scheduler': {'model': 'gpt-6-luna', 'reasoning_effort': 'low', 'daily_calls': 96, 'daily_usd': 15., 'concurrency': 1, 'max_output_tokens': 4096},
         'discovery': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium', 'daily_calls': 96, 'daily_usd': 100., 'concurrency': 8, 'max_output_tokens': 8192},
         'review': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium', 'daily_calls': 32, 'daily_usd': 40., 'concurrency': 1, 'max_output_tokens': 8192},
-        'execution': {'model': 'gpt-6-astra', 'reasoning_effort': 'high', 'daily_calls': 240, 'daily_usd': 150., 'concurrency': 1, 'max_output_tokens': 4096},
+        'execution': {'model': 'gpt-6.1-sol', 'reasoning_effort': 'high', 'daily_calls': 240, 'daily_usd': 150., 'concurrency': 1, 'max_output_tokens': 4096},
     },
     'bybit': {
         'mode': 'paper', 'enabled': False, 'mainnet_enabled': False,
@@ -55,7 +55,7 @@ def validate_operations_section(section, changes):
             if set(row) != set(OPERATION_DEFAULTS[section][component]):
                 raise ValueError('Unknown resource setting')
             if row['model'] != OPERATION_DEFAULTS[section][component]['model']:
-                raise ValueError('Runtime role model is fixed; execution requires gpt-6-astra')
+                raise ValueError(component + ' model is fixed at ' + OPERATION_DEFAULTS[section][component]['model'])
             if row['reasoning_effort'] not in {'low', 'medium', 'high', 'xhigh', 'max'}:
                 raise ValueError('Invalid reasoning effort')
             for name in ('daily_calls', 'concurrency', 'max_output_tokens'):

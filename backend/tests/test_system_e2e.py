@@ -416,12 +416,12 @@ class SystemEndToEndTests(unittest.TestCase):
         self.assertEqual(order["status"], "open")
         self.assertEqual(order["filled_quantity"], 0.0)
         self.assertTrue(submitted["result"]["tools"][0]["result"]["acknowledgement_is_not_fill"])
-        self.assertTrue(any(request.get("model") == "gpt-6-astra" for request in responses.requests
+        self.assertTrue(any(request.get("model") == "gpt-6.1-sol" for request in responses.requests
                             if request.get("tools")))
-        astra_packet = json.loads(next(request for request in reversed(responses.requests)
+        execution_packet = json.loads(next(request for request in reversed(responses.requests)
                                       if request.get('tools'))['input'][1]['content'])
-        self.assertIn('first conclusion remains', json.dumps(astra_packet['dossier']['previous_reviews']))
-        self.assertEqual(astra_packet['dossier']['identity']['canonical_spec'], registered['spec'])
+        self.assertIn('first conclusion remains', json.dumps(execution_packet['dossier']['previous_reviews']))
+        self.assertEqual(execution_packet['dossier']['identity']['canonical_spec'], registered['spec'])
 
         self.clock.advance(1.0)
         later_quote = self._update_quote(self.market, bid=100.02, ask=100.03, step=0.0)
@@ -446,7 +446,7 @@ class SystemEndToEndTests(unittest.TestCase):
         self.assertEqual(replayed, submitted)
         self.assertEqual(len(adapter.orders()), 1)
         self.assertEqual(len(self.store.get_document("strategy_execution_" + self.strategy_id)["fills"]), 1)
-        self.assertTrue(all(request.get("model") != "gpt-6-astra" or request.get("store") is False
+        self.assertTrue(all(request.get("model") != "gpt-6.1-sol" or request.get("store") is False
                             for request in responses.requests))
 
     def test_spot_orderbook_quote_remains_measured_composite_provenance(self):

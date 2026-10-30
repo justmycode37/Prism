@@ -23,10 +23,10 @@ struct RuntimeContractCheck {
                     "Every cascade agent must have a stable, unique UI identity.")
         try require(state.agents.filter { $0.model == "gpt-6-luna" }.count == 24,
                     "The default breadth layer must expose 24 Luna collectors.")
-        try require(state.agents.filter { $0.model == "gpt-6.1-sol" }.count == 6,
-                    "The default analysis layer must expose six Sol analysts.")
-        try require(state.agents.filter { $0.model == "gpt-6-astra" }.count == 3,
-                    "The strategy and execution layers must expose three Astra agents.")
+        try require(state.agents.filter { $0.model == "gpt-6.1-sol" }.count == 9,
+                    "The analysis, strategy, and execution layers must expose nine Sol agents.")
+        try require(state.agents.allSatisfy { $0.model != "gpt-6-astra" },
+                    "The active roster must no longer route work to Astra.")
         try require(state.agents.allSatisfy { !($0.instructions ?? "").isEmpty },
                     "Each agent must expose its new layer instructions in the existing disclosure.")
         try require(state.agents.allSatisfy { $0.capabilities != nil && $0.recentTools != nil },

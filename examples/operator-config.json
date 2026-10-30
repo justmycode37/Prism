@@ -44,7 +44,7 @@
       "max_output_tokens": 8192
     },
     "execution": {
-      "model": "gpt-6-astra",
+      "model": "gpt-6.1-sol",
       "reasoning_effort": "high",
       "daily_calls": 240,
       "daily_usd": 150.0,

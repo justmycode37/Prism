@@ -72,6 +72,28 @@ class Store:
             db.execute("UPDATE cascade_calls SET status='unknown',charged=reserved WHERE status='reserved'")
             db.execute("UPDATE cascade_jobs SET status='interrupted' WHERE status='working'")
         self._upgrade_sector_config()
+        self._upgrade_sol_routing()
+
+    def _upgrade_sol_routing(self):
+        """Replace former Astra role settings without touching evidence or budgets."""
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT value FROM cascade_meta WHERE key='config'").fetchone()
+            if row is None:
+                return
+            saved = json.loads(row['value'])
+            updated = copy.deepcopy(saved)
+            roles = [updated.get('resources', {}).get('execution')]
+            roles.extend(updated.get('layers', {}).get(role) for role in ('strategist', 'executor'))
+            for role in roles:
+                if isinstance(role, dict) and role.get('model') == 'gpt-6-astra':
+                    role['model'] = 'gpt-6.1-sol'
+            if updated == saved:
+                return
+            db.execute('INSERT OR IGNORE INTO cascade_meta VALUES (?,?)',
+                       ('config_before_sol_routing', encoded(saved)))
+            db.execute("UPDATE cascade_meta SET value=? WHERE key='config'", (encoded(updated),))
+        self.event('configuration', 'Migrated execution and strategy-review model routing to GPT-6.1 Sol.')
 
     def _now_ms(self):
         value = self._clock()
