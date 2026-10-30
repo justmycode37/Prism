@@ -29,6 +29,7 @@ class OfflineResponses:
         self._lock = threading.Lock()
         self._execution_payload = None
         self._trader_decisions = 0
+        self.next_trader_tool = None
         self.review_decision = 'approve'
         self.review_error = False
 
@@ -67,13 +68,19 @@ class OfflineResponses:
                 'usage': {'input_tokens': 120, 'output_tokens': 20}}
 
         self._trader_decisions += 1
+        self._execution_payload = json.loads(body['input'][1]['content'])
+        if self.next_trader_tool is not None:
+            name, arguments = self.next_trader_tool
+            self.next_trader_tool = None
+            return {'status': 'completed', 'output': [{'type': 'function_call', 'name': name,
+                'arguments': json.dumps(arguments), 'call_id': 'sol-fixture-next-tool'}],
+                'usage': {'input_tokens': 150, 'output_tokens': 30}}
         if self._trader_decisions > 1:
             return {'status': 'completed', 'output': [{'type': 'function_call',
                 'name': 'hold', 'arguments': json.dumps({'strategy_id': self._execution_payload['strategy']['id'],
                     'rationale': 'Hold on the next offline minute.'}),
                 'call_id': 'sol-fixture-hold'}], 'usage': {'input_tokens': 120, 'output_tokens': 20}}
 
-        self._execution_payload = json.loads(body['input'][1]['content'])
         payload = self._execution_payload
         args = {'strategy_id': payload['strategy']['id'],
             'snapshot_id': payload['decision_snapshot']['snapshot_id'], 'side': 'Buy',
@@ -308,6 +315,221 @@ class SolSwarmEndToEndTests(unittest.TestCase):
         self.assertEqual(len([request for request in self.responses.requests if
             request.get('text', {}).get('format', {}).get('name') == 'prism_trade_review']), review_count)
         self.assertEqual(len(self.adapter.orders(category='linear', symbol='SOLUSDT')), 1)
+
+    def test_new_primary_candle_during_sol_response_stops_before_review_or_order(self):
+        original = self.provider.transport
+
+        def superseding_response(body, key):
+            result = original(body, key)
+            if (body.get('model') == 'gpt-6.1-sol' and
+                    not any(item.get('type') == 'function_call_output' for item in body.get('input', []))):
+                self.market.publish(self.strategy_id, self.registered_at_ms + 60_000)
+            return result
+
+        self.provider.transport = superseding_response
+        result = self.controller.handle_event({'id': 'superseded-during-sol', 'kind': 'candle_closed',
+            'strategy_id': self.strategy_id, 'snapshot_id': self.snapshot['snapshot_id']})
+        self.assertEqual(result['status'], 'superseded')
+        self.assertIn('newer primary market observation', result['rationale'])
+        self.assertEqual(len([request for request in self.responses.requests
+            if request.get('model') == 'gpt-6.1-sol']), 1)
+        self.assertEqual(len([request for request in self.responses.requests
+            if request.get('text', {}).get('format', {}).get('name') == 'prism_trade_review']), 0)
+        self.assertEqual(self.adapter.orders(category='linear', symbol='SOLUSDT'), [])
+
+    def test_pause_during_sol_response_stops_tool_dispatch(self):
+        original = self.provider.transport
+
+        def pausing_response(body, key):
+            result = original(body, key)
+            if (body.get('model') == 'gpt-6.1-sol' and
+                    not any(item.get('type') == 'function_call_output' for item in body.get('input', []))):
+                self.controller.permission_check = lambda: False
+            return result
+
+        self.provider.transport = pausing_response
+        result = self.controller.handle_event({'id': 'paused-during-sol', 'kind': 'candle_closed',
+            'strategy_id': self.strategy_id, 'snapshot_id': self.snapshot['snapshot_id']})
+        self.assertEqual(result['status'], 'blocked')
+        self.assertIn('permission is paused', result['rationale'])
+        self.assertEqual(len([request for request in self.responses.requests
+            if request.get('model') == 'gpt-6.1-sol']), 1)
+        self.assertEqual(len([request for request in self.responses.requests
+            if request.get('text', {}).get('format', {}).get('name') == 'prism_trade_review']), 0)
+        self.assertEqual(self.adapter.orders(category='linear', symbol='SOLUSDT'), [])
+
+    def test_attention_deadline_during_sol_response_stops_tool_dispatch(self):
+        original = self.provider.transport
+
+        def late_response(body, key):
+            result = original(body, key)
+            if (body.get('model') == 'gpt-6.1-sol' and
+                    not any(item.get('type') == 'function_call_output' for item in body.get('input', []))):
+                self.now[0] = self.snapshot['attention_deadline_ms'] / 1000 + 1
+            return result
+
+        self.provider.transport = late_response
+        result = self.controller.handle_event({'id': 'deadline-during-sol', 'kind': 'candle_closed',
+            'strategy_id': self.strategy_id, 'snapshot_id': self.snapshot['snapshot_id']})
+        self.assertEqual(result['status'], 'superseded')
+        self.assertIn('decision deadline passed', result['rationale'])
+        self.assertEqual(len([request for request in self.responses.requests
+            if request.get('model') == 'gpt-6.1-sol']), 1)
+        self.assertEqual(len([request for request in self.responses.requests
+            if request.get('text', {}).get('format', {}).get('name') == 'prism_trade_review']), 0)
+        self.assertEqual(self.adapter.orders(category='linear', symbol='SOLUSDT'), [])
+
+    def test_pause_after_submission_stops_continuation_but_preserves_submitted_status(self):
+        original_dispatch = self.controller._dispatch_tool
+
+        def pause_after_submit(*args, **kwargs):
+            result = original_dispatch(*args, **kwargs)
+            if result.get('status') == 'acknowledged':
+                self.controller.permission_check = lambda: False
+            return result
+
+        self.controller._dispatch_tool = pause_after_submit
+        result = self.controller.handle_event({'id': 'paused-after-submit', 'kind': 'candle_closed',
+            'strategy_id': self.strategy_id, 'snapshot_id': self.snapshot['snapshot_id']})
+        self.assertEqual(result['status'], 'submitted')
+        self.assertEqual(result['result']['tools'][0]['result']['status'], 'acknowledged')
+        self.assertEqual(len([request for request in self.responses.requests
+            if request.get('model') == 'gpt-6.1-sol']), 1)
+        self.assertEqual(len(self.adapter.orders(category='linear', symbol='SOLUSDT')), 1)
+
+    def test_pause_during_sol_response_still_allows_safe_order_cancellation(self):
+        opening = self.controller.handle_event({'id': 'open-before-pause-cancel', 'kind': 'candle_closed',
+            'strategy_id': self.strategy_id, 'snapshot_id': self.snapshot['snapshot_id']})
+        self.assertEqual(opening['status'], 'submitted')
+        order = self.adapter.orders(category='linear', symbol='SOLUSDT')[0]
+        before_sol = len([request for request in self.responses.requests if request.get('model') == 'gpt-6.1-sol'])
+        before_review = len([request for request in self.responses.requests
+            if request.get('text', {}).get('format', {}).get('name') == 'prism_trade_review'])
+        self.responses.next_trader_tool = ('cancel_order', {'order_link_id': order['order_link_id'],
+            'rationale': 'Cancel the resting paper order while paused.'})
+        original = self.provider.transport
+
+        def pausing_response(body, key):
+            result = original(body, key)
+            if (body.get('model') == 'gpt-6.1-sol' and
+                    not any(item.get('type') == 'function_call_output' for item in body.get('input', []))):
+                self.controller.permission_check = lambda: False
+            return result
+
+        self.provider.transport = pausing_response
+        cancelled = self.controller.handle_event({'id': 'cancel-during-pause', 'kind': 'order',
+            'strategy_id': self.strategy_id, 'snapshot_id': self.snapshot['snapshot_id']})
+        self.assertEqual(cancelled['status'], 'cancel_requested')
+        self.assertEqual(self.adapter.orders(category='linear', symbol='SOLUSDT')[0]['status'], 'cancelled')
+        self.assertEqual(len([request for request in self.responses.requests if request.get('model') == 'gpt-6.1-sol']),
+            before_sol + 1)
+        self.assertEqual(len([request for request in self.responses.requests
+            if request.get('text', {}).get('format', {}).get('name') == 'prism_trade_review']), before_review)
+
+    def test_full_ledger_cache_tracks_backdated_fill_and_owner_changes_with_bounded_history(self):
+        mode = self.adapter.mode
+        now_ms = round(self.clock() * 1000)
+        rows = []
+        for index in range(70):
+            link = f'history-{index:03d}'
+            status = 'open' if index == 69 else 'filled'
+            intent = {'category': 'linear', 'symbol': 'SOLUSDT', 'side': 'Buy',
+                'orderType': 'Market', 'qty': '0.1', 'strategy_id': self.strategy_id,
+                'reduceOnly': False}
+            rows.append((mode, link, f'exchange-{index:03d}', 'linear', 'SOLUSDT', status,
+                json.dumps(intent), '0.1' if index == 0 else '0', '100', '0', '0', None, 0,
+                status, None, now_ms + index, now_ms + index, '{}'))
+        with self.store.connection() as db:
+            db.executemany('''INSERT INTO bybit_orders(mode,order_link_id,order_id,category,symbol,status,
+                intent,filled_qty,average_price,fee_total,realized_pnl,stop_loss,protection_verified,
+                exchange_status,last_mutation,created_at_ms,updated_at_ms,fee_breakdown)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', rows)
+            value = {'execId': 'old-fill', 'orderLinkId': 'history-000', 'orderId': 'exchange-000',
+                'category': 'linear', 'symbol': 'SOLUSDT', 'side': 'Buy', 'execQty': '0.1',
+                'execPrice': '100', 'execFee': '0', 'feeCurrency': 'USDT', 'execTime': '10',
+                'execType': 'Trade'}
+            db.execute('''INSERT INTO bybit_executions(mode,exec_id,order_link_id,order_id,category,symbol,
+                qty,price,fee,fee_currency,realized_pnl,exec_time_ms,value)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''', (mode, 'old-fill', 'history-000', 'exchange-000',
+                'linear', 'SOLUSDT', '0.1', '100', '0', 'USDT', '0', 10, json.dumps(value)))
+
+        iter_order = self.adapter.iter_orders
+        iter_execution = self.adapter.iter_executions
+        scans = {'orders': 0, 'executions': 0}
+        def orders(**kwargs):
+            scans['orders'] += 1
+            return iter_order(**kwargs)
+        def executions(**kwargs):
+            scans['executions'] += 1
+            return iter_execution(**kwargs)
+        self.adapter.iter_orders = orders
+        self.adapter.iter_executions = executions
+
+        first = self.controller._accounting_snapshot()
+        self.assertEqual(first['order_count'], 70)
+        self.assertEqual(first['active_order_count'], 1)
+        self.assertEqual(first['terminal_omitted'], 5)
+        state = self.controller._state_value({'orders': first['orders'], 'order_count': 70,
+            'active_order_count': 1, 'account': {'reconciliation_required': False,
+                'risk_halted': False, 'halt_reasons': []}, 'positions': []})
+        self.assertEqual(len(state['orders']), 65)
+        self.assertEqual(state['orders'][0]['order_link_id'], 'history-069')
+        self.assertEqual(state['order_history_truncated'], 5)
+        self.assertEqual(scans, {'orders': 1, 'executions': 1})
+        self.controller._accounting_snapshot()
+        self.assertEqual(scans, {'orders': 1, 'executions': 1}, 'unchanged revision should reuse derived inventory')
+
+        changed_owner = {'category': 'linear', 'symbol': 'SOLUSDT', 'side': 'Buy',
+            'orderType': 'Market', 'qty': '0.1', 'strategy_id': 'updated-owner', 'reduceOnly': False}
+        late_value = {**value, 'execQty': '0.2', 'execPrice': '110', 'execTime': '1'}
+        with self.store.connection() as db:
+            db.execute('UPDATE bybit_orders SET intent=?,filled_qty=?,updated_at_ms=? WHERE mode=? AND order_link_id=?',
+                (json.dumps(changed_owner), '0.2', now_ms + 100, mode, 'history-000'))
+            db.execute('UPDATE bybit_executions SET qty=?,price=?,exec_time_ms=?,value=? WHERE mode=? AND exec_id=?',
+                ('0.2', '110', 1, json.dumps(late_value), mode, 'old-fill'))
+        refreshed = self.controller._accounting_snapshot()
+        self.assertEqual(scans, {'orders': 2, 'executions': 2})
+        self.assertNotIn(self.strategy_id, refreshed['fills'][('linear', 'SOLUSDT')])
+        self.assertAlmostEqual(refreshed['fills'][('linear', 'SOLUSDT')]['updated-owner']['quantity'], 0.2)
+        self.assertAlmostEqual(refreshed['fills'][('linear', 'SOLUSDT')]['updated-owner']['cost'], 22.)
+        self.assertEqual(refreshed['executions'][0]['execId'], 'old-fill')
+
+        # Spot fee coin classification participates in the cache identity even
+        # though instrument metadata is outside the order/execution revision.
+        self.adapter.config['allowed_categories'] = ['linear', 'spot']
+        spot_mode = self.adapter.metadata_mode
+        metadata = {'venue': 'bybit', 'category': 'spot', 'symbol': 'BTCUSDT',
+            'base_coin': 'BTC', 'quote_coin': 'USDT'}
+        spot_intent = {'category': 'spot', 'symbol': 'BTCUSDT', 'side': 'Buy',
+            'orderType': 'Market', 'qty': '1', 'strategy_id': self.strategy_id,
+            'reduceOnly': False}
+        spot_exec = {'execId': 'spot-fee-fill', 'orderLinkId': 'spot-fee-order',
+            'orderId': 'spot-fee-id', 'category': 'spot', 'symbol': 'BTCUSDT',
+            'side': 'Buy', 'execQty': '1', 'execPrice': '10', 'execFee': '0.01',
+            'feeCurrency': 'BTC', 'execTime': '20', 'execType': 'Trade'}
+        with self.store.connection() as db:
+            db.execute('INSERT INTO bybit_instruments(mode,category,symbol,updated_at_ms,value) VALUES (?,?,?,?,?)',
+                (spot_mode, 'spot', 'BTCUSDT', now_ms, json.dumps(metadata)))
+            db.execute('''INSERT INTO bybit_orders(mode,order_link_id,order_id,category,symbol,status,
+                intent,filled_qty,average_price,fee_total,realized_pnl,stop_loss,protection_verified,
+                exchange_status,last_mutation,created_at_ms,updated_at_ms,fee_breakdown)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (mode, 'spot-fee-order', 'spot-fee-id',
+                'spot', 'BTCUSDT', 'filled', json.dumps(spot_intent), '1', '10', '0.01', '0', None,
+                0, 'filled', None, now_ms + 1000, now_ms + 1000, '{"BTC":"0.01"}'))
+            db.execute('''INSERT INTO bybit_executions(mode,exec_id,order_link_id,order_id,category,symbol,
+                qty,price,fee,fee_currency,realized_pnl,exec_time_ms,value)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''', (mode, 'spot-fee-fill', 'spot-fee-order', 'spot-fee-id',
+                'spot', 'BTCUSDT', '1', '10', '0.01', 'BTC', '0', 20, json.dumps(spot_exec)))
+        with_fee = self.controller._accounting_snapshot()
+        self.assertAlmostEqual(with_fee['fills'][('spot', 'BTCUSDT')][self.strategy_id]['quantity'], 0.99)
+        metadata['base_coin'] = 'OTHER'
+        with self.store.connection() as db:
+            db.execute('UPDATE bybit_instruments SET value=? WHERE mode=? AND category=? AND symbol=?',
+                (json.dumps(metadata), spot_mode, 'spot', 'BTCUSDT'))
+        reclassified = self.controller._accounting_snapshot()
+        self.assertNotEqual(with_fee['metadata_signature'], reclassified['metadata_signature'])
+        self.assertTrue(reclassified['incomplete'])
+        self.assertAlmostEqual(reclassified['fills'][('spot', 'BTCUSDT')][self.strategy_id]['quantity'], 1.)
 
 
 if __name__ == '__main__':

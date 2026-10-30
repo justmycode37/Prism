@@ -40,3 +40,5 @@ jobs:
         with:
           python-version: '3.12'
       - run: scripts/check-ui-contract.sh
+      - run: scripts/check-workspace-contract.sh
+      - run: scripts/check-runtime-client-actions.sh

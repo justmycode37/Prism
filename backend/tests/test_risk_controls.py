@@ -43,6 +43,39 @@ class RiskControlsTests(unittest.TestCase):
         with self.assertRaisesRegex(IntentRejected, 'Mainnet'):
             self.validate()
 
+    def test_truthy_nonboolean_eligibility_and_budget_cannot_grant_entry_authority(self):
+        for value in (1, 'true', 'false', [True], {'approved': True}, None):
+            with self.subTest(value=value), self.assertRaisesRegex(IntentRejected, 'eligibility'):
+                self.validate(eligibility={'eligible': value})
+            with self.subTest(budget=value), self.assertRaisesRegex(IntentRejected, 'budget'):
+                self.validate(budget_available=value)
+
+    def test_expiry_and_host_timestamps_require_integer_milliseconds(self):
+        self.intent['expires_at_ms'] = self.now + 10000.5
+        with self.assertRaisesRegex(IntentRejected, 'integer millisecond'):
+            self.validate()
+        self.intent['expires_at_ms'] = str(self.now + 10000)
+        with self.assertRaisesRegex(IntentRejected, 'integer millisecond'):
+            self.validate()
+        self.intent['expires_at_ms'] = self.now + 10000
+        self.intent['expires_at_ms'] = self.market['captured_at_ms'] + 30_001
+        with self.assertRaisesRegex(IntentRejected, 'validity window'):
+            self.validate()
+        self.intent['expires_at_ms'] = self.now + 10000
+        self.market['quote']['timestamp_ms'] = self.now + .5
+        with self.assertRaisesRegex(IntentRejected, 'integer millisecond'):
+            self.validate()
+
+    def test_malformed_host_aggregates_and_order_counts_fail_closed(self):
+        self.account.pop('positions')
+        with self.assertRaisesRegex(IntentRejected, 'positions are unavailable'):
+            self.validate()
+        self.account['positions'] = []
+        with self.assertRaisesRegex(IntentRejected, 'order count'):
+            self.validate(recent_order_count=float('nan'))
+        with self.assertRaisesRegex(IntentRejected, 'Order state'):
+            self.validate(orders=None)
+
     def test_forming_candle_reconciliation_and_snapshot_mismatch(self):
         self.market['candles'][0]['closed'] = False
         with self.assertRaisesRegex(IntentRejected, 'forming'):
@@ -74,6 +107,98 @@ class RiskControlsTests(unittest.TestCase):
         self.intent['quantity'] = 2.
         with self.assertRaisesRegex(IntentRejected, 'Reduction exceeds'):
             self.validate()
+
+    def test_reduction_reserves_only_same_instrument_orders_and_rejects_invalid_fills(self):
+        self.account['positions'] = [{'strategy_id': 's', 'category': 'spot', 'symbol': 'BTCUSDT',
+            'quantity': 1., 'mark_price': 100.}]
+        self.intent.update(side='Sell', reduce_only=True)
+        other_instrument = [{'strategy_id': 's', 'category': 'spot', 'symbol': 'ETHUSDT',
+            'status': 'open', 'quantity': 1., 'filled_quantity': 0., 'reduce_only': True}]
+        self.assertEqual(self.validate(orders=other_instrument)['quantity'], 1.)
+        malformed = [{'strategy_id': 's', 'category': 'spot', 'symbol': 'BTCUSDT',
+            'status': 'open', 'quantity': 1., 'filled_quantity': -1., 'reduce_only': True}]
+        with self.assertRaisesRegex(IntentRejected, 'fill is outside'):
+            self.validate(orders=malformed)
+
+    def test_aggregates_reject_overflow_and_attributed_short_positions(self):
+        self.account['positions'] = [
+            {'strategy_id': 's', 'category': 'spot', 'symbol': 'BTCUSDT', 'quantity': 1e308, 'mark_price': 100.},
+            {'strategy_id': 's', 'category': 'spot', 'symbol': 'BTCUSDT', 'quantity': 1e308, 'mark_price': 100.},
+        ]
+        with self.assertRaisesRegex(IntentRejected, 'not finite'):
+            self.validate()
+        self.account['positions'] = [{'strategy_id': 's', 'category': 'spot', 'symbol': 'BTCUSDT',
+            'quantity': -1., 'mark_price': 100.}]
+        with self.assertRaisesRegex(IntentRejected, 'short position'):
+            self.validate()
+
+    def test_multiple_open_orders_are_aggregated_for_strategy_allocation(self):
+        pending = [{'strategy_id': 's', 'category': 'spot', 'symbol': 'BTCUSDT', 'status': 'unknown',
+                    'quantity': .8, 'filled_quantity': 0., 'reference_price': 100., 'reduce_only': False}
+                   for _ in range(2)]
+        with self.assertRaisesRegex(IntentRejected, 'allocation'):
+            self.validate(orders=pending)
+
+    def test_reduction_notional_overflow_fails_closed(self):
+        self.account['positions'] = [{'strategy_id': 's', 'category': 'spot', 'symbol': 'BTCUSDT',
+            'quantity': 1e308, 'mark_price': 100.}]
+        self.intent.update(side='Sell', reduce_only=True, quantity=1e308)
+        with self.assertRaisesRegex(IntentRejected, 'not finite'):
+            self.validate()
+
+    def test_margin_uses_aggregated_account_positions_and_pending_orders(self):
+        self.config['live_execution'].update(max_portfolio_notional=1_000_000.,
+            max_position_notional=1_000_000., max_margin_fraction=.2)
+        self.config['live_execution']['allocations']['s'] = 1_000_000.
+        self.account['positions'] = [
+            {'strategy_id': 'other-a', 'category': 'spot', 'symbol': 'ETHUSDT', 'quantity': 60., 'mark_price': 100.},
+            {'strategy_id': 'other-b', 'category': 'spot', 'symbol': 'SOLUSDT', 'quantity': 60., 'mark_price': 100.},
+        ]
+        pending = [{'strategy_id': 'other', 'category': 'linear', 'symbol': 'SOLUSDT', 'status': 'open',
+                    'quantity': 3., 'filled_quantity': 1., 'price': 100., 'reduce_only': False}]
+        self.account['equity'] = 10_000.
+        self.account['available_balance'] = 10_000.
+        self.account['leverage'] = 10.  # Account-wide leverage must not margin spot holdings.
+        self.account['leverage_by_instrument'] = {'linear:SOLUSDT': 1.}
+        with self.assertRaisesRegex(IntentRejected, 'margin fraction'):
+            self.validate(orders=pending)
+
+    def test_sol_margin_uses_exact_instrument_leverage_not_account_maximum(self):
+        self.strategy['market_policy'].update(category='linear', symbol='SOLUSDT')
+        self.market.update(category='linear', symbol='SOLUSDT')
+        self.market['quote']['ask_size'] = 10.
+        self.account.update(leverage=10., leverage_by_instrument={
+            'linear:SOLUSDT': 1., 'linear:BTCUSDT': 10.}, position_mode='one_way',
+            protection_supported=True, available_balance=50.)
+        self.config['bybit']['allowed_categories'] = ['spot', 'linear']
+        self.config['bybit']['allowed_instruments'].append({'category': 'linear', 'symbol': 'SOLUSDT'})
+        self.config['live_execution'].update(max_leverage=10., max_portfolio_notional=1000.,
+            max_position_notional=250., max_margin_fraction=.2)
+        with self.assertRaisesRegex(IntentRejected, 'balance or margin'):
+            self.validate()
+
+        self.account['available_balance'] = 100.
+        self.assertEqual(self.validate()['checked_notional'], 100.)
+        del self.account['leverage_by_instrument']['linear:SOLUSDT']
+        with self.assertRaisesRegex(IntentRejected, 'instrument leverage is unavailable'):
+            self.validate()
+
+    def test_linear_margin_uses_each_position_and_pending_instrument_leverage(self):
+        self.strategy['market_policy'].update(category='linear', symbol='SOLUSDT')
+        self.market.update(category='linear', symbol='SOLUSDT')
+        self.account.update(leverage=10., leverage_by_instrument={
+            'linear:SOLUSDT': 1., 'linear:BTCUSDT': 10.}, position_mode='one_way',
+            protection_supported=True, equity=10_000., available_balance=1_000.,
+            positions=[{'strategy_id': 'other', 'category': 'linear', 'symbol': 'BTCUSDT',
+                'quantity': 9., 'mark_price': 100., 'leverage': 10.}])
+        self.config['bybit']['allowed_categories'] = ['spot', 'linear']
+        self.config['bybit']['allowed_instruments'].append({'category': 'linear', 'symbol': 'SOLUSDT'})
+        self.config['live_execution'].update(max_leverage=10., max_portfolio_notional=10_000.,
+            max_position_notional=250., max_margin_fraction=.025)
+        pending = [{'strategy_id': 'other', 'category': 'linear', 'symbol': 'BTCUSDT', 'status': 'open',
+            'quantity': 10., 'filled_quantity': 0., 'price': 100., 'reduce_only': False}]
+        with self.assertRaisesRegex(IntentRejected, 'margin fraction'):
+            self.validate(orders=pending)
 
     def test_loss_margin_and_rate_limits_are_host_authoritative(self):
         self.account['daily_pnl'] = -25.

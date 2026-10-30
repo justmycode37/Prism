@@ -3,6 +3,13 @@ import Foundation
 import LocalAuthentication
 import Security
 
+struct RuntimeHTTPResponse: Sendable {
+    let data: Data
+    let statusCode: Int
+}
+
+typealias RuntimeRequestSender = @Sendable (URLRequest) async throws -> RuntimeHTTPResponse
+
 @MainActor
 final class RuntimeClient: ObservableObject {
     @Published private(set) var state: RuntimeState?
@@ -16,16 +23,26 @@ final class RuntimeClient: ObservableObject {
     private let endpoint = "http://127.0.0.1:8787"
     private var token: String
     private var hasToken = false
-    private let session: URLSession
+    private let requestSender: RuntimeRequestSender
     private var isFetching = false
+    private var stateFetchGeneration: UInt64 = 0
+    private var mutationFeedback: String?
 
-    init() {
-        token = ""
+    init(requestSender: RuntimeRequestSender? = nil, controlToken: String? = nil) {
+        token = controlToken ?? ""
+        hasToken = !(controlToken ?? "").isEmpty
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 8
         configuration.timeoutIntervalForResource = 12
         configuration.waitsForConnectivity = false
-        session = URLSession(configuration: configuration, delegate: RuntimeRedirectPolicy(), delegateQueue: nil)
+        let urlSession = URLSession(configuration: configuration, delegate: RuntimeRedirectPolicy(), delegateQueue: nil)
+        self.requestSender = requestSender ?? { request in
+            let (data, response) = try await urlSession.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw RuntimeError.message("The runtime returned an invalid response.")
+            }
+            return RuntimeHTTPResponse(data: data, statusCode: http.statusCode)
+        }
     }
 
     func monitor() async {
@@ -55,8 +72,11 @@ final class RuntimeClient: ObservableObject {
     }
 
     private func fetchState() async {
+        stateFetchGeneration &+= 1
+        let generation = stateFetchGeneration
         do {
             let data = try await send(path: "/v1/state")
+            guard !Task.isCancelled, generation == stateFetchGeneration else { return }
             let previousPortfolio = state?.portfolio
             let previousSamples = pnlSamples
             let (value, samples) = try await Task.detached(priority: .utility) {
@@ -71,16 +91,16 @@ final class RuntimeClient: ObservableObject {
                 // timestamps away from the UI thread when a valuation arrives.
                 return (value, unchanged ? previousSamples : portfolio.pnlSamples)
             }.value
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, generation == stateFetchGeneration else { return }
             pnlSamples = samples
             state = value
             isConnected = true
             lastUpdated = .now
-            errorMessage = nil
+            errorMessage = mutationFeedback
         } catch is CancellationError {
             return
         } catch {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, generation == stateFetchGeneration else { return }
             isConnected = false
             errorMessage = readable(error)
         }
@@ -93,8 +113,11 @@ final class RuntimeClient: ObservableObject {
         do {
             let body = try JSONSerialization.data(withJSONObject: ["action": action])
             _ = try await send(path: "/v1/control", method: "POST", body: body)
-            await refresh()
-        } catch { errorMessage = readable(error) }
+            // Force a post-mutation read even when the monitor already has a
+            // request in flight. The generation check prevents that older
+            // response from replacing this confirmed state afterward.
+            await refreshAfterMutation()
+        } catch { reportMutationFailure(error) }
     }
 
     func updateConfiguration(_ configuration: RuntimeConfiguration) async -> Bool {
@@ -105,10 +128,10 @@ final class RuntimeClient: ObservableObject {
             let encoder = JSONEncoder()
             encoder.keyEncodingStrategy = .convertToSnakeCase
             _ = try await send(path: "/v1/config", method: "POST", body: encoder.encode(configuration))
-            await refresh()
+            await refreshAfterMutation()
             return true
         } catch {
-            errorMessage = readable(error)
+            reportMutationFailure(error)
             return false
         }
     }
@@ -122,10 +145,10 @@ final class RuntimeClient: ObservableObject {
         do {
             let body = try JSONSerialization.data(withJSONObject: ["trading_mode": ["selected": mode]])
             _ = try await send(path: "/v1/config", method: "POST", body: body)
-            await refresh()
+            await refreshAfterMutation()
             return true
         } catch {
-            errorMessage = readable(error)
+            reportMutationFailure(error)
             return false
         }
     }
@@ -133,7 +156,7 @@ final class RuntimeClient: ObservableObject {
     func updateDailySpendCeiling(_ amount: Double?) async -> Bool {
         guard !isBusy, isConnected else { return false }
         if let amount, !amount.isFinite || amount <= 0 {
-            errorMessage = "Enter a USD amount greater than zero."
+            reportMutationFailure(RuntimeError.message("Enter a USD amount greater than zero."))
             return false
         }
         isBusy = true
@@ -142,10 +165,10 @@ final class RuntimeClient: ObservableObject {
             let value: Any = amount.map { $0 as Any } ?? NSNull()
             let body = try JSONSerialization.data(withJSONObject: ["daily_limit_usd": value])
             _ = try await send(path: "/v1/config", method: "POST", body: body)
-            await refresh()
+            await refreshAfterMutation()
             return true
         } catch {
-            errorMessage = readable(error)
+            reportMutationFailure(error)
             return false
         }
     }
@@ -172,19 +195,18 @@ final class RuntimeClient: ObservableObject {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
-        let (data, response) = try await session.data(for: request)
-        guard let response = response as? HTTPURLResponse else { throw RuntimeError.message("The runtime returned an invalid response.") }
+        let response = try await requestSender(request)
         guard (200..<300).contains(response.statusCode) else {
             if response.statusCode == 401 || response.statusCode == 403 {
-                throw RuntimeError.message("The local control token was rejected. Reinstall the Prism service to relink it.")
+                throw RuntimeError.authentication("The local control token was rejected. Reinstall the Prism service to relink it.")
             }
-            if let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            if let value = try? JSONSerialization.jsonObject(with: response.data) as? [String: Any],
                let message = value["error"] as? String {
                 throw RuntimeError.message(message)
             }
             throw RuntimeError.message("Runtime request failed (HTTP \(response.statusCode)).")
         }
-        return data
+        return response.data
     }
 
     private func readable(_ error: Error) -> String {
@@ -197,11 +219,42 @@ final class RuntimeClient: ObservableObject {
         }
         return error.localizedDescription
     }
+
+    private func reportMutationFailure(_ error: Error) {
+        // A failed local transport means the last projected status is only an
+        // offline snapshot. Keep it visible, but disable further operator actions.
+        let authenticationRejected = (error as? RuntimeError)?.invalidatesConnection == true
+        if error is URLError || authenticationRejected {
+            mutationFeedback = nil
+            stateFetchGeneration &+= 1
+            isConnected = false
+        } else {
+            // Monitoring does not acknowledge an operator refusal. Keep its
+            // explanation visible until a subsequent mutation succeeds.
+            mutationFeedback = readable(error)
+        }
+        errorMessage = readable(error)
+    }
+
+    private func refreshAfterMutation() async {
+        mutationFeedback = nil
+        await fetchState()
+    }
 }
 
 private enum RuntimeError: LocalizedError {
     case message(String)
-    var errorDescription: String? { if case let .message(message) = self { message } else { nil } }
+    case authentication(String)
+
+    var invalidatesConnection: Bool {
+        if case .authentication = self { true } else { false }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case let .message(message), let .authentication(message): message
+        }
+    }
 }
 
 private final class RuntimeRedirectPolicy: NSObject, URLSessionTaskDelegate, @unchecked Sendable {

@@ -187,7 +187,8 @@ struct PrismHomeView: View {
 
     private var connectionNotice: some View {
         HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "wifi.slash").font(.system(size: 12)).foregroundStyle(.secondary)
+            Image(systemName: runtime.isConnected ? "info.circle" : "wifi.slash")
+                .font(.system(size: 12)).foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 4) {
                 Text(runtime.isConnected ? "Runtime notice" : (runtime.state == nil ? "Runtime offline" : "Offline · showing last snapshot"))
                     .font(.system(size: 11, weight: .medium))

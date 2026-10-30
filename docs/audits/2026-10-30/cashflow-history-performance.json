@@ -1,0 +1,54 @@
+{
+  "external_io": false,
+  "fixture": "Temporary SQLite journal; synthetic same-day TRADE rows with zero cash flow.",
+  "method": "Compare repeated uncached complete iterator scans with one cold revision-keyed scan plus unchanged-revision reads.",
+  "qualification": "Not evaluated; this measures only transaction history classification.",
+  "results": [
+    {
+      "ledger_rows": 0,
+      "legacy_uncached": {
+        "full_scans": 10,
+        "mean_seconds": 0.003926179104018957,
+        "total_seconds": 0.039261791040189564
+      },
+      "revisioned_cache": {
+        "cold_seconds": 0.0059694580268114805,
+        "full_scans": 1,
+        "warm_mean_seconds": 0.004831820807885379,
+        "warm_total_seconds": 0.048318208078853786
+      },
+      "warm_reads": 10
+    },
+    {
+      "ledger_rows": 10000,
+      "legacy_uncached": {
+        "full_scans": 10,
+        "mean_seconds": 0.04050287492573261,
+        "total_seconds": 0.4050287492573261
+      },
+      "revisioned_cache": {
+        "cold_seconds": 0.03900158393662423,
+        "full_scans": 1,
+        "warm_mean_seconds": 0.0076526541961357,
+        "warm_total_seconds": 0.076526541961357
+      },
+      "warm_reads": 10
+    },
+    {
+      "ledger_rows": 50000,
+      "legacy_uncached": {
+        "full_scans": 10,
+        "mean_seconds": 0.2301508749020286,
+        "total_seconds": 2.301508749020286
+      },
+      "revisioned_cache": {
+        "cold_seconds": 0.21395100001245737,
+        "full_scans": 1,
+        "warm_mean_seconds": 0.005149195890408009,
+        "warm_total_seconds": 0.05149195890408009
+      },
+      "warm_reads": 10
+    }
+  ],
+  "schema_version": 1
+}

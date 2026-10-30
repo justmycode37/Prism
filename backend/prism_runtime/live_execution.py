@@ -27,6 +27,64 @@ from .trading_modes import is_sol_mode, mode_settings
 _TERMINAL = {"filled", "cancelled", "rejected"}
 _PROTECTED_EVENT_KINDS = {"candle_closed", "intrabar", "signal", "fill", "order", "position",
                           "risk", "scheduled_event", "decision_deadline", "data_health"}
+_MAX_SAME_MILLISECOND_FILLS = 10_000
+
+
+def _execution_sequence(item):
+    value = item.get('seq')
+    if type(value) is int and value >= 0:
+        return value
+    # Old local paper ledgers predate the explicit seq field. Their execution
+    # suffix is the durable simulator counter, not a lexicographic identifier.
+    ident = item.get('execId', '')
+    if value is None and isinstance(ident, str) and ident.startswith('paper-exec-'):
+        suffix = ident[len('paper-exec-'):]
+        if suffix.isascii() and suffix.isdigit() and len(suffix) <= 20:
+            return int(suffix)
+    return None
+
+
+def _inventory_timeline(rows):
+    """Order timestamp ties using measured sequence, with bounded buffering.
+
+    Input rows are time-sorted normalized (time,item,owner,qty,price) tuples.
+    Opposing fills for one owner/instrument require an actual total order;
+    random execution IDs provide a stable fallback, never verification.
+    """
+    from itertools import chain, groupby
+    for _, same_time in groupby(rows, key=lambda row: row[0]):
+        first = next(same_time)
+        second = next(same_time, None)
+        if second is None:
+            yield (*first, False)
+            continue
+        groups = {}
+        count = 0
+        for row in chain((first, second), same_time):
+            count += 1
+            if count > _MAX_SAME_MILLISECOND_FILLS:
+                raise BybitError('Too many same-millisecond executions to verify bounded inventory')
+            owner = row[2]
+            key = tuple(str(owner.get(field, '')) for field in ('strategy_id', 'category', 'symbol'))
+            groups.setdefault(key, []).append(row)
+        for key in sorted(groups):
+            group = groups[key]
+            sequenced = [(_execution_sequence(row[1]), row) for row in group]
+            complete_sequence = all(seq is not None for seq, _ in sequenced)
+            operations = {}
+            for seq, row in sequenced:
+                item, owner = row[1:3]
+                operation = (item.get('side', owner.get('side')),
+                             item.get('reduce_only') is True or owner.get('reduce_only') is True)
+                operations.setdefault(operation, set()).add(seq)
+            ambiguous = len(operations) > 1 and (not complete_sequence or
+                len(set.union(*operations.values())) < sum(map(len, operations.values())))
+            if complete_sequence:
+                sequenced.sort(key=lambda pair: (pair[0], str(pair[1][1].get('execId', ''))))
+            else:
+                sequenced.sort(key=lambda pair: str(pair[1][1].get('execId', '')))
+            for _, row in sequenced:
+                yield (*row, ambiguous)
 
 
 def _finite(value):
@@ -76,6 +134,10 @@ class ExecutionController:
         self.support_context_provider = None
         self.trade_reviewer = trade_reviewer or TradeReviewer(agents, store, clock=self.clock)
         self._mutation_lock = threading.RLock()
+        self._accounting_cache_lock = threading.RLock()
+        self._accounting_cache = None
+        self._cashflow_cache_lock = threading.RLock()
+        self._cashflow_cache = None
         self._schema()
 
     def _schema(self):
@@ -92,6 +154,8 @@ class ExecutionController:
                     ON execution_decisions(strategy_id,fingerprint,created_at_ms DESC);
                 CREATE INDEX IF NOT EXISTS idx_execution_decision_recent
                     ON execution_decisions(strategy_id,created_at_ms DESC);
+                CREATE INDEX IF NOT EXISTS idx_execution_decision_global_recent
+                    ON execution_decisions(created_at_ms DESC);
                 CREATE TABLE IF NOT EXISTS execution_mutations (
                     tool_id TEXT PRIMARY KEY, action TEXT NOT NULL, args_hash TEXT NOT NULL,
                     status TEXT NOT NULL, order_link_id TEXT, value TEXT, created_at_ms INTEGER NOT NULL,
@@ -124,9 +188,17 @@ class ExecutionController:
         return hashlib.sha256(encoded([self._environment(), account_id]).encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _strategy_map(store):
+    def _strategy_map(store, strategy_ids=None):
         with store.connection() as db:
-            rows = db.execute("SELECT value FROM cascade_strategies ORDER BY rowid DESC").fetchall()
+            if strategy_ids is None:
+                rows = db.execute("SELECT value FROM cascade_strategies ORDER BY rowid DESC").fetchall()
+            else:
+                ids = list({value for value in strategy_ids if isinstance(value, str) and value})
+                rows = []
+                for offset in range(0, len(ids), 400):
+                    batch = ids[offset:offset + 400]
+                    rows.extend(db.execute('SELECT value FROM cascade_strategies WHERE id IN (' +
+                        ','.join('?' for _ in batch) + ') ORDER BY rowid DESC', batch).fetchall())
         result = {}
         for row in rows:
             value = json.loads(row[0])
@@ -137,7 +209,7 @@ class ExecutionController:
     def _strategy(self, strategy_id):
         if not isinstance(strategy_id, str) or not strategy_id:
             return None
-        strategy = self._strategy_map(self.store).get(strategy_id)
+        strategy = self._strategy_map(self.store, [strategy_id]).get(strategy_id)
         from .trading_modes import is_sol_mode
         if strategy:
             selected = is_sol_mode(self._config())
@@ -158,7 +230,7 @@ class ExecutionController:
         category, symbol = policy.get("category"), policy.get("symbol")
         if category not in {"spot", "linear"} or not symbol:
             return 0
-        lots, _ = self._attributed_inventory(self._orders(), self._executions())
+        lots = self._accounting_snapshot()["fills"]
         owned = lots.get((category, symbol), {}).get(strategy_id, {})
         quantity = owned.get("quantity", 0.)
         return int(_finite(quantity) and quantity > 1e-12)
@@ -233,12 +305,18 @@ class ExecutionController:
             raise IntentRejected("Market service returned no current protection quote")
         return value
 
-    def _orders(self):
-        orders = self.adapter.orders(limit=5000)
+    def _orders(self, *, accounting=None):
+        orders = (self._accounting_snapshot() if accounting is None else accounting)["orders"]
         controls = {}
         with self.store.connection() as db:
-            controls = {row["order_link_id"]: dict(row) for row in db.execute(
-                "SELECT * FROM execution_order_controls").fetchall()}
+            # Read deadlines for current/projected orders without scanning
+            # controls belonging only to compacted closed history.
+            links = [row['order_link_id'] for row in orders if row.get('order_link_id')]
+            for offset in range(0, len(links), 400):
+                batch = links[offset:offset + 400]
+                controls.update({row['order_link_id']: dict(row) for row in db.execute(
+                    'SELECT * FROM execution_order_controls WHERE order_link_id IN (' +
+                    ','.join('?' for _ in batch) + ')', batch)})
         result = []
         for order in orders:
             row = dict(order)
@@ -250,10 +328,249 @@ class ExecutionController:
         return result
 
     def _executions(self):
-        try:
-            return self.adapter.executions(limit=10000)
-        except (AttributeError, TypeError):
-            return []
+        return self._accounting_snapshot()["executions"]
+
+    def _accounting_metadata_signature(self, instruments):
+        """Read only fee-classification metadata; never trigger a network refresh."""
+        if not instruments:
+            return ()
+        mode = getattr(self.adapter, "metadata_mode", self._environment())
+        signature = []
+        with self.store.connection() as db:
+            for category, symbol in sorted(instruments):
+                row = db.execute("SELECT value FROM bybit_instruments WHERE mode=? AND category=? AND symbol=?",
+                                 (mode, category, symbol)).fetchone()
+                if not row:
+                    return None
+                value = json.loads(row[0])
+                signature.append((category, symbol, value.get("base_coin"), value.get("quote_coin")))
+        return tuple(signature)
+
+    def _accounting_snapshot(self):
+        """Return a revision-checked, compact full-ledger accounting snapshot.
+
+        The durable order/execution iterators are consumed once after each
+        accounting-relevant revision. The cache retains derived lots, all
+        unresolved orders, 64 recent terminal orders, and 64 recent fills per
+        owner; it never retains the unbounded execution/order history.
+        """
+        revision_reader = getattr(self.adapter, "accounting_revision", None)
+        order_reader = getattr(self.adapter, "iter_orders", None)
+        execution_reader = getattr(self.adapter, "iter_executions", None)
+        if not callable(revision_reader) or not callable(order_reader) or not callable(execution_reader):
+            # Compatibility with small injected adapters. Their legacy methods
+            # are already bounded and cannot provide a safe revision cache.
+            try:
+                orders = self.adapter.orders(limit=5000)
+            except (AttributeError, TypeError):
+                orders = []
+            try:
+                executions = self.adapter.executions(limit=10000)
+            except (AttributeError, TypeError):
+                executions = []
+            fills, incomplete = self._attributed_inventory(orders, executions)
+            projected, recent_fills = self._accounting_projection(orders, executions)
+            return {"revision": None, "orders": projected,
+                    "executions": [item for rows in recent_fills.values() for item in rows],
+                    "recent_fills": recent_fills, "fills": fills, "incomplete": incomplete,
+                    "order_count": len(orders),
+                    "active_order_count": sum(self._active_order(row) for row in orders),
+                    "terminal_omitted": max(0, len(orders) - len(projected))}
+
+        mode = str(getattr(self.adapter, "mode", self._environment()))
+        with self._accounting_cache_lock:
+            for _attempt in range(3):
+                before = revision_reader()
+                cached = self._accounting_cache
+                if cached and cached["mode"] == mode and cached["revision"] == before:
+                    signature = self._accounting_metadata_signature(cached["spot_instruments"])
+                    if signature is not None and signature == cached["metadata_signature"]:
+                        return cached
+                rebuilt = self._rebuild_accounting_snapshot(order_reader, execution_reader,
+                    revision_reader, mode, before)
+                if rebuilt is not None:
+                    self._accounting_cache = rebuilt
+                    return rebuilt
+        raise BybitError("Order or execution ledger kept changing during accounting reconciliation")
+
+    def _accounting_projection(self, orders, executions):
+        """Build bounded display orders and per-owner recent fills for legacy adapters."""
+        active = [row for row in orders if self._active_order(row)]
+        terminal = [row for row in orders if not self._active_order(row)]
+        terminal.sort(key=lambda row: (row.get("updated_at_ms", 0), row.get("created_at_ms", 0),
+                                       str(row.get("order_link_id", ""))), reverse=True)
+        projected = [*active, *terminal[:64]]
+        order_owner = {row.get("order_link_id"): row.get("strategy_id") for row in orders if row.get("order_link_id")}
+        order_owner.update({row.get("order_id"): row.get("strategy_id") for row in orders if row.get("order_id")})
+        recent = {}
+        for item in executions:
+            if not isinstance(item, dict) or item.get("execType", "Trade") != "Trade":
+                continue
+            sid = order_owner.get(item.get("orderLinkId")) or order_owner.get(item.get("orderId"))
+            if not sid:
+                continue
+            rows = recent.setdefault(sid, [])
+            rows.append({**copy.deepcopy(item), "_strategy_id": sid})
+            if len(rows) > 64:
+                del rows[0]
+        return projected, recent
+
+    def _rebuild_accounting_snapshot(self, order_reader, execution_reader, revision_reader, mode, expected_revision):
+        """Stream a stable ledger into owner lots without retaining history rows."""
+        import heapq
+        from collections import deque
+
+        owners_by_link, owners_by_id = {}, {}
+        owner_rows = []
+        active_orders = []
+        recent_terminal = []
+        spot_instruments = set()
+        total_orders = 0
+        for row in order_reader(batch_size=1000):
+            total_orders += 1
+            if self._active_order(row):
+                active_orders.append(dict(row))
+            else:
+                updated = row.get("updated_at_ms", 0)
+                created = row.get("created_at_ms", 0)
+                link = str(row.get("order_link_id", ""))
+                key = (updated if type(updated) is int else 0,
+                       created if type(created) is int else 0, link)
+                item = dict(row)
+                if len(recent_terminal) < 64:
+                    heapq.heappush(recent_terminal, (*key, item))
+                elif key > recent_terminal[0][:3]:
+                    heapq.heapreplace(recent_terminal, (*key, item))
+
+            strategy_id = row.get("strategy_id")
+            link = row.get("order_link_id")
+            order_id = row.get("order_id")
+            if not strategy_id or not link:
+                continue
+            info = {"strategy_id": strategy_id, "category": row.get("category"),
+                "symbol": row.get("symbol"), "side": row.get("side"),
+                "reduce_only": row.get("reduce_only") is True,
+                "order_link_id": link, "order_id": order_id,
+                "created_at_ms": row.get("created_at_ms", 0),
+                "filled_quantity": row.get("filled_quantity", 0.), "volume": 0.}
+            owners_by_link[link] = info
+            if order_id:
+                owners_by_id[order_id] = info
+            owner_rows.append(info)
+            if row.get("category") == "spot" and row.get("symbol"):
+                spot_instruments.add(("spot", row["symbol"]))
+
+        starting_metadata_signature = self._accounting_metadata_signature(spot_instruments)
+        metadata = {}
+        for key in sorted(spot_instruments):
+            try:
+                value = self.adapter.metadata(*key)
+                metadata[key] = (value.get("base_coin"), value.get("quote_coin"))
+            except Exception:
+                metadata[key] = None
+        # Bind the identity to the exact values used below, not just a later
+        # cache read. A refresh can change and revert during a long rebuild.
+        used_metadata_signature = tuple((category, symbol, *(metadata[(category, symbol)] or (None, None)))
+                                        for category, symbol in sorted(spot_instruments))
+
+        lots, recent_fills = {}, {}
+        incomplete = False
+        fill_buffers = {}
+        def normalized_rows():
+            nonlocal incomplete
+            for item in execution_reader(batch_size=1000):
+                if not isinstance(item, dict) or item.get("execType", "Trade") != "Trade":
+                    continue
+                owner = owners_by_link.get(item.get("orderLinkId")) or owners_by_id.get(item.get("orderId"))
+                if not owner:
+                    continue
+                try:
+                    qty, price = float(item.get("execQty")), float(item.get("execPrice"))
+                    timestamp_ms = int(item.get("execTime") or item.get("execTimeMs") or owner.get("created_at_ms", 0))
+                except (TypeError, ValueError, OverflowError):
+                    incomplete = True
+                    continue
+                if not _finite(qty) or qty <= 0 or not _finite(price) or price <= 0:
+                    incomplete = True
+                    continue
+                owner["volume"] += qty
+                yield timestamp_ms, item, owner, qty, price
+
+        for timestamp_ms, item, owner, qty, price, ambiguous in _inventory_timeline(normalized_rows()):
+            incomplete |= ambiguous
+            category, symbol = owner.get("category"), owner.get("symbol")
+            if category not in {"spot", "linear"} or not symbol:
+                incomplete = True
+                continue
+            side = item.get("side", owner.get("side"))
+            reduce_only = item.get("reduce_only") is True or owner.get("reduce_only") is True
+            key = (category, symbol)
+            base_fee, quote_fee = 0., 0.
+            if category == "spot":
+                fee_key = metadata.get(key)
+                try:
+                    fee = float(item.get("execFee", 0.) or 0.)
+                    if not fee_key or not _finite(fee):
+                        raise ValueError("Spot fee metadata is unavailable")
+                    if item.get("feeCurrency") == fee_key[0]:
+                        base_fee = fee
+                    elif item.get("feeCurrency") == fee_key[1]:
+                        quote_fee = fee
+                    elif fee:
+                        incomplete = True
+                except (ValueError, TypeError, OverflowError):
+                    incomplete = True
+            current = lots.setdefault(key, {}).setdefault(owner["strategy_id"],
+                {"quantity": 0., "cost": 0., "opened_at_ms": 0})
+            if side == "Buy" and not reduce_only:
+                if qty - base_fee <= 0:
+                    incomplete = True
+                    continue
+                if current["quantity"] <= 1e-12:
+                    current["opened_at_ms"] = timestamp_ms
+                current["cost"] += qty * price + quote_fee
+                current["quantity"] += qty - base_fee
+            elif side == "Sell" and reduce_only:
+                if qty + base_fee > current["quantity"] + 1e-8:
+                    incomplete = True
+                removed = min(max(0., qty + base_fee), current["quantity"])
+                if current["quantity"] > 0:
+                    current["cost"] *= max(0., 1. - removed / current["quantity"])
+                current["quantity"] = max(0., current["quantity"] - removed)
+                if current["quantity"] <= 1e-12:
+                    current["cost"], current["opened_at_ms"] = 0., 0
+            else:
+                incomplete = True
+                continue
+            rows = fill_buffers.setdefault(owner["strategy_id"], deque(maxlen=64))
+            rows.append({**copy.deepcopy(item), "_strategy_id": owner["strategy_id"]})
+
+        for owner in owner_rows:
+            filled = owner.get("filled_quantity")
+            if _finite(filled) and filled > owner["volume"] + 1e-8:
+                incomplete = True
+        terminal_orders = [entry[3] for entry in sorted(recent_terminal, key=lambda item: item[:3], reverse=True)]
+        projected_orders = [*active_orders, *terminal_orders]
+        if total_orders > len(projected_orders):
+            # This counter supports native UI disclosure; active orders are not
+            # capped, and the full history remains in the adapter ledger.
+            terminal_omitted = max(0, total_orders - len(active_orders) - len(terminal_orders))
+        else:
+            terminal_omitted = 0
+        recent_fills = {sid: list(rows) for sid, rows in fill_buffers.items()}
+        metadata_signature = self._accounting_metadata_signature(spot_instruments)
+        after = revision_reader()
+        if (expected_revision != after or metadata_signature is None or
+                starting_metadata_signature != metadata_signature or
+                used_metadata_signature != metadata_signature):
+            return None
+        return {"mode": mode, "revision": expected_revision,
+            "orders": projected_orders, "executions": [item for rows in recent_fills.values() for item in rows],
+            "recent_fills": recent_fills, "fills": lots, "incomplete": incomplete,
+            "order_count": total_orders, "active_order_count": len(active_orders),
+            "terminal_omitted": terminal_omitted,
+            "spot_instruments": tuple(sorted(spot_instruments)),
+            "metadata_signature": metadata_signature}
 
     @staticmethod
     def _summary_order(order):
@@ -262,13 +579,29 @@ class ExecutionController:
                   "order_filter", "spot_protection", "parent_order_link_id", "expires_at_ms",
                   "average_price", "fees", "fee_currency", "fees_by_currency", "realized_pnl",
                   "unprotected_dust_quantity", "unprotected_dust_notional",
-                  "protection_verified", "snapshot_id", "rationale")
+                  "protection_verified", "snapshot_id", "rationale", "created_at_ms", "updated_at_ms")
         result = {key: order[key] for key in fields if key in order}
         if isinstance(result.get("rationale"), str):
             result["rationale"] = _bounded_text(result["rationale"], 400)
         return result
 
-    def _actual_spot_positions(self, raw, strategy_map, orders, executions):
+    def _order_history_projection(self, orders, *, terminal_limit=64):
+        """Bound history while retaining every active or unresolved order."""
+        def recent_key(row):
+            updated = row.get("updated_at_ms", 0)
+            created = row.get("created_at_ms", 0)
+            return (updated if type(updated) is int else 0,
+                    created if type(created) is int else 0,
+                    str(row.get("order_link_id", "")))
+
+        active = [row for row in orders if self._active_order(row)]
+        terminal = [row for row in orders if not self._active_order(row)]
+        active.sort(key=recent_key, reverse=True)
+        terminal.sort(key=recent_key, reverse=True)
+        selected = [*active, *terminal[:terminal_limit]]
+        return [self._summary_order(row) for row in selected]
+
+    def _actual_spot_positions(self, raw, strategy_map, orders, executions, attributed=None):
         """Create portfolio rows from configured base-coin wallet balances.
 
         Bybit's account snapshot reports linear positions but spot inventory is
@@ -280,7 +613,7 @@ class ExecutionController:
                       if isinstance(item, dict) and isinstance(item.get("currency"), str)}
         instruments = self._config()["bybit"].get("allowed_instruments", [])
         covered = {"USDT"}
-        fills, attribution_incomplete = self._attributed_inventory(orders, executions)
+        fills, attribution_incomplete = attributed or self._attributed_inventory(orders, executions)
         incomplete |= attribution_incomplete
         for instrument in instruments:
             if instrument.get("category") != "spot":
@@ -359,7 +692,9 @@ class ExecutionController:
         incomplete = any(_finite(order.get("filled_quantity")) and order.get("filled_quantity", 0.) >
             volume_by_link.get(order.get("order_link_id"), 0.) + 1e-8
             for order in orders if order.get("strategy_id"))
-        for timestamp_ms, item, order, qty, price in sorted(normalized_execs, key=lambda row: (row[0], row[1].get("execId", ""))):
+        for timestamp_ms, item, order, qty, price, ambiguous in _inventory_timeline(
+                sorted(normalized_execs, key=lambda row: row[0])):
+            incomplete |= ambiguous
             sid, category, symbol = order.get("strategy_id"), order.get("category"), order.get("symbol")
             if category not in {"spot", "linear"} or not symbol:
                 incomplete = True
@@ -405,9 +740,11 @@ class ExecutionController:
                 incomplete = True
         return lots, incomplete
 
-    def _account_rows(self, raw, orders, executions):
-        strategy_map = self._strategy_map(self.store)
-        fills, incomplete = self._attributed_inventory(orders, executions)
+    def _account_rows(self, raw, orders, executions, *, attributed=None):
+        fills, incomplete = attributed or self._attributed_inventory(orders, executions)
+        owners = {sid for instrument in fills.values() for sid, lot in instrument.items()
+                  if lot.get('quantity', 0) > 1e-12}
+        strategy_map = self._strategy_map(self.store, owners)
         positions = []
         for actual in raw.get("positions", []):
             if not isinstance(actual, dict):
@@ -455,7 +792,8 @@ class ExecutionController:
                                   "leverage": actual.get("leverage"), "stop_loss": actual.get("stop_loss", 0.)})
         # ``incomplete`` above includes attribution gaps; preserve them while
         # adding any account-side mark or spot-wallet gaps.
-        spot, spot_incomplete = self._actual_spot_positions(raw, strategy_map, orders, executions)
+        spot, spot_incomplete = self._actual_spot_positions(raw, strategy_map, orders, executions,
+            attributed=(fills, incomplete))
         positions.extend(spot)
         incomplete |= spot_incomplete
         return positions, incomplete
@@ -485,43 +823,117 @@ class ExecutionController:
             hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
         external_cashflow = False
         cashflow_state_known = True
-        transaction_reader = getattr(self.adapter, "transactions", None)
+        transaction_reader = getattr(self.adapter, "iter_transactions", None)
+        if not callable(transaction_reader):
+            transaction_reader = getattr(self.adapter, "transactions", None)
         if callable(transaction_reader):
-            try:
-                for transaction in transaction_reader(since_ms=day_start_ms):
-                    if not isinstance(transaction, dict):
-                        continue
-                    kind = str(transaction.get("type", "")).upper()
-                    raw_flow = transaction.get("cash_flow", transaction.get("cashFlow", 0))
-                    try:
-                        flow = float(raw_flow or 0)
-                    except (TypeError, ValueError, OverflowError):
-                        cashflow_state_known = False
-                        break
-                    if any(token in kind for token in ("TRANSFER", "DEPOSIT", "WITHDRAW", "CASH_IN", "CASH_OUT")):
-                        external_cashflow = True
-                        break
-                    # Bybit's transaction log documents cashFlow for transfers
-                    # as well as internal realized P&L. Unknown nonzero types
-                    # are treated as external to avoid claiming an unadjusted
-                    # equity delta as daily strategy P&L.
-                    if flow and kind not in {"TRADE", "SETTLEMENT", "CLOSE", "DELIVERY", "LIQUIDATION", "ADL", "BLOCK_TRADE"}:
-                        external_cashflow = True
-                        break
-            except Exception:
-                cashflow_state_known = False
+            def scan_transaction_history():
+                external = False
+                known = True
+                failed = False
+                try:
+                    for transaction in transaction_reader(since_ms=day_start_ms):
+                        if not isinstance(transaction, dict):
+                            continue
+                        kind = str(transaction.get("type", "")).upper()
+                        raw_flow = transaction.get("cash_flow", transaction.get("cashFlow", 0))
+                        try:
+                            flow = float(raw_flow or 0)
+                        except (TypeError, ValueError, OverflowError):
+                            known = False
+                            break
+                        if not math.isfinite(flow):
+                            # Decimal source fields can be finite yet overflow
+                            # a float. Even an internal transaction type cannot
+                            # make invalid amounts verify a daily P&L baseline.
+                            known = False
+                            break
+                        if any(token in kind for token in ("TRANSFER", "DEPOSIT", "WITHDRAW", "CASH_IN", "CASH_OUT")):
+                            external = True
+                            break
+                        # Bybit's transaction log documents cashFlow for transfers
+                        # as well as internal realized P&L. Unknown nonzero types
+                        # are treated as external to avoid claiming an unadjusted
+                        # equity delta as daily strategy P&L.
+                        if flow and kind not in {"TRADE", "SETTLEMENT", "CLOSE", "DELIVERY", "LIQUIDATION", "ADL", "BLOCK_TRADE"}:
+                            external = True
+                            break
+                except Exception:
+                    known = False
+                    failed = True
+                return external, known, failed
+
+            revision_reader = getattr(self.adapter, "transaction_revision", None)
+            revision = None
+            if callable(revision_reader):
+                try:
+                    revision = revision_reader()
+                except Exception:
+                    # A broken revision API disables caching for this read;
+                    # retain the original full-reader fail-closed behavior.
+                    revision = None
+                if type(revision) is not int or revision < 0:
+                    revision = None
+            if revision is None:
+                with self._cashflow_cache_lock:
+                    self._cashflow_cache = None
+                external_cashflow, cashflow_state_known, _failed = scan_transaction_history()
+            else:
+                mode = str(getattr(self.adapter, "mode", self._environment()))
+                cache_key = (mode, self._environment(), scope, day, day_start_ms, revision)
+                with self._cashflow_cache_lock:
+                    cached = self._cashflow_cache
+                    if cached is not None and cached[0] == cache_key:
+                        external_cashflow, cashflow_state_known = cached[1], cached[2]
+                    else:
+                        self._cashflow_cache = None
+                        for _attempt in range(3):
+                            external_cashflow, cashflow_state_known, failed = scan_transaction_history()
+                            try:
+                                revision_after = revision_reader()
+                            except Exception:
+                                revision_after = None
+                            if type(revision_after) is not int or revision_after < 0:
+                                revision_after = None
+                            if revision_after == revision:
+                                if not failed:
+                                    self._cashflow_cache = (cache_key, external_cashflow,
+                                                            cashflow_state_known)
+                                break
+                            # A reconnect can append an ordinary trade while
+                            # the complete day scan is running. Retry a bounded
+                            # number of times before persisting an uncertainty
+                            # halt; never accept the mixed-revision result.
+                            if revision_after is None:
+                                cashflow_state_known = False
+                                break
+                            revision = revision_after
+                            cache_key = (*cache_key[:-1], revision)
+                        else:
+                            cashflow_state_known = False
         else:
+            with self._cashflow_cache_lock:
+                self._cashflow_cache = None
             cashflow_state_known = False
         equity = raw.get("equity")
-        if not _finite(equity) or equity <= 0:
+        if not _finite(equity):
             equity = None
+        saved_baseline = saved.get("daily_baseline_equity") if saved.get("day") == day else None
+        if not _finite(saved_baseline) or saved_baseline <= 0:
+            saved_baseline = None
+        saved_peak = saved.get("peak_equity")
+        if not _finite(saved_peak) or saved_peak <= 0:
+            saved_peak = None
         if equity is not None:
-            baseline = saved.get("daily_baseline_equity") if saved.get("day") == day else equity
-            peak = max(float(saved.get("peak_equity", equity)), equity)
+            baseline = saved_baseline if saved_baseline is not None else equity
+            peak = max(saved_peak if saved_peak is not None else equity, equity)
             daily_pnl = equity - baseline
             drawdown = max(0., 1. - equity / peak) if peak > 0 else None
         else:
-            baseline, peak, daily_pnl, drawdown = None, saved.get("peak_equity"), None, None
+            # An unavailable wallet read cannot erase a loss baseline or a
+            # lifetime high-water mark. Retain valid checkpoints and let a
+            # later verified reading recover without hiding intervening loss.
+            baseline, peak, daily_pnl, drawdown = saved_baseline, saved_peak, None, None
         reasons = list(saved.get("halt_reasons", []))
         if external_cashflow or not cashflow_state_known:
             daily_pnl = None
@@ -535,8 +947,19 @@ class ExecutionController:
             reasons = list(dict.fromkeys([*reasons, *current_reasons]))
         halted = bool(saved.get("risk_halted")) or bool(current_reasons) or external_cashflow or not cashflow_state_known
         reconciliation_required = (bool(raw.get("reconciliation_required")) or incomplete or not binding_ok or
-                                   equity is None or not cashflow_state_known)
+                                   equity is None or equity <= 0 or not cashflow_state_known)
         leverage = raw.get("leverage")
+        leverage_by_instrument = raw.get("leverage_by_instrument")
+        if not isinstance(leverage_by_instrument, dict):
+            leverage_by_instrument = {}
+        else:
+            verified = {}
+            for key, value in leverage_by_instrument.items():
+                category, separator, symbol = key.partition(":") if isinstance(key, str) else ("", "", "")
+                if (separator and category in {"spot", "linear"} and symbol and
+                        _finite(value) and value > 0):
+                    verified[key] = value
+            leverage_by_instrument = verified
         if any(position.get("category") == "spot" for position in positions) and (not _finite(leverage) or leverage <= 0):
             # Bybit spot here is nonmargin base-coin only; risk_controls accepts
             # a verified cash leverage of one for this supported protocol.
@@ -546,6 +969,7 @@ class ExecutionController:
             "equity": equity, "available_balance": raw.get("available_balance"), "daily_pnl": daily_pnl,
             "drawdown_fraction": drawdown, "peak_equity": peak, "daily_baseline_equity": baseline,
             "day": day, "positions": positions, "leverage": leverage,
+            "leverage_by_instrument": leverage_by_instrument,
             "position_mode": raw.get("position_mode"), "protection_supported": raw.get("protection_supported") is True,
             "protection_verified": raw.get("protection_verified") is True,
             "risk_halted": halted, "halt_reasons": reasons,
@@ -571,19 +995,33 @@ class ExecutionController:
         raw = result.get("account") if isinstance(result, dict) else None
         if not isinstance(raw, dict):
             raise BybitError("Bybit reconciliation returned no account")
-        orders = self._orders()
-        executions = self._executions()
-        positions, incomplete = self._account_rows(raw, orders, executions)
+        accounting = self._accounting_snapshot()
+        orders = self._orders(accounting=accounting)
+        executions = accounting["executions"]
+        positions, incomplete = self._account_rows(raw, orders, executions,
+            attributed=(accounting["fills"], accounting["incomplete"]))
         account, scope = self._account_metrics(raw, positions, orders, incomplete)
         return {"raw": raw, "account": account, "orders": orders, "positions": positions,
-                "executions": executions, "scope": scope,
+                "executions": executions, "recent_fills": accounting.get("recent_fills", {}),
+                "ledger_revision": accounting.get("revision"),
+                "order_count": accounting.get("order_count", len(orders)),
+                "active_order_count": accounting.get("active_order_count",
+                    sum(self._active_order(row) for row in orders)),
+                "terminal_orders_omitted": accounting.get("terminal_omitted", 0),
+                "scope": scope,
                 "reconciliation_required": account["reconciliation_required"]}
 
     def _state_value(self, world):
-        return {"environment": self._environment(), "updated_at_ms": self._now_ms(),
+        orders = self._order_history_projection(world["orders"])
+        total_orders = world.get("order_count", len(world["orders"]))
+        return {"environment": self._environment(), "account_scope": world.get('scope'),
+                "updated_at_ms": self._now_ms(),
                 "account": self._account_projection(world["account"]),
                 "positions": copy.deepcopy(world["positions"]),
-                "orders": [self._summary_order(order) for order in world["orders"]],
+                "orders": orders, "order_count": total_orders,
+                "active_order_count": world.get("active_order_count",
+                    sum(self._active_order(row) for row in world["orders"])),
+                "order_history_truncated": max(0, total_orders - len(orders)),
                 "reconciliation_required": world["account"]["reconciliation_required"],
                 "risk_halted": world["account"]["risk_halted"],
                 "halt_reasons": list(world["account"].get("halt_reasons", []))}
@@ -594,18 +1032,28 @@ class ExecutionController:
                 "available_balance", "daily_pnl", "daily_baseline_equity", "drawdown_fraction", "peak_equity", "day", "leverage",
                 "position_mode", "protection_supported", "protection_verified", "risk_halted",
                 "halt_reasons", "portfolio_notional", "account_binding_verified",
-                "external_cashflow_detected", "daily_pnl_verified")
+                "external_cashflow_detected", "daily_pnl_verified", "leverage_by_instrument")
         value = {key: account.get(key) for key in keys}
         return value
 
     def _record_memory(self, world, decision=None):
         orders = world["orders"]
+        sol = is_sol_mode(self._config())
+        selected = self.store.get_document('sol_mode_strategy_id') if sol else None
+        if sol:
+            if not isinstance(selected, str) or not selected:
+                return
+            # Other SOL versions are rejected by _strategy below. Filter before
+            # history grouping and lookups so old owners do not add database
+            # work to every account/protection poll.
+            orders = [row for row in orders if row.get('strategy_id') == selected]
         link_owner = {row.get("order_link_id"): row.get("strategy_id") for row in orders if row.get("strategy_id")}
         order_owner = {row.get("order_id"): row.get("strategy_id") for row in orders if row.get("strategy_id")}
         fills_by_strategy = {}
         for item in world.get("executions", []):
-            sid = link_owner.get(item.get("orderLinkId")) or order_owner.get(item.get("orderId"))
-            if not sid:
+            sid = (item.get("_strategy_id") or link_owner.get(item.get("orderLinkId")) or
+                   order_owner.get(item.get("orderId")))
+            if not sid or sol and sid != selected:
                 continue
             safe = {key: item.get(key) for key in ("execId", "orderLinkId", "orderId", "category", "symbol",
                     "side", "execQty", "execPrice", "execFee", "feeCurrency", "execPnl", "execTime", "execType") if key in item}
@@ -615,10 +1063,13 @@ class ExecutionController:
         active_ids.update(row.get("strategy_id") for row in world["positions"] if row.get("strategy_id"))
         if decision and decision.get("strategy_id"):
             active_ids.add(decision["strategy_id"])
+        if sol:
+            active_ids.intersection_update({selected})
         for sid in active_ids:
             if not self._strategy(sid):
                 continue
-            selected_orders = [self._summary_order(row) for row in orders if row.get("strategy_id") == sid]
+            selected_orders = self._order_history_projection(
+                [row for row in orders if row.get("strategy_id") == sid])
             selected_positions = [copy.deepcopy(row) for row in world["positions"] if row.get("strategy_id") == sid]
             latest = copy.deepcopy(decision) if decision and decision.get("strategy_id") == sid else {
                 "id": "reconcile-" + identity([self._environment(), sid, world["raw"].get("updated_at_ms")]),
@@ -692,7 +1143,7 @@ class ExecutionController:
         safety = {key: copy.deepcopy(account.get(key)) for key in (
             "venue", "mode", "account_type", "reconciliation_required", "risk_halted",
             "halt_reasons", "external_cashflow_detected", "daily_pnl_verified",
-            "account_binding_verified", "position_mode", "leverage", "protection_supported",
+            "account_binding_verified", "position_mode", "leverage", "leverage_by_instrument", "protection_supported",
             "protection_verified")}
         currencies = [{key: copy.deepcopy(row.get(key)) for key in
             ("currency", "wallet_balance", "spot_borrow")} for row in raw.get("currencies", [])
@@ -704,7 +1155,8 @@ class ExecutionController:
                 "wallet_balances": {key: raw.get(key) for key in
                     ("usdt_wallet_balance", "usdt_available_balance")},
                 "currencies": currencies, "positions": stable_positions,
-                "orders": [ExecutionController._summary_order(row) for row in world.get("orders", [])]}
+                "orders": [ExecutionController._summary_order(row) for row in world.get("orders", [])],
+                "ledger_revision": world.get("ledger_revision")}
 
     def _trade_review_binding(self, *, strategy_id, snapshot_id, world, config, permission):
         return identity({"mode": "sol_perpetual" if is_sol_mode(config) else "research",
@@ -717,7 +1169,8 @@ class ExecutionController:
             "eligibility": self._eligibility_projection(strategy_id),
             "constraints": self._constraints(strategy_id)})
 
-    def _prepare_trade_review(self, name, args, tool_id, *, strategy_id, decision_snapshot):
+    def _prepare_trade_review(self, name, args, tool_id, *, strategy_id, decision_snapshot,
+                              decision_world=None, decision_config=None, decision_eligibility=None):
         """Call the reviewer with immutable measured evidence, outside the mutation lock."""
         config = self._config()
         if not is_sol_mode(config):
@@ -747,6 +1200,27 @@ class ExecutionController:
                 return block("Strategy version is unavailable")
             snapshot_id = args.get("snapshot_id")
             snapshot = self._approve_snapshot(strategy_id, snapshot_id, {snapshot_id})
+            latest = self._fresh_market(strategy_id)
+            reviewed_signal = snapshot.get("signal_input_id")
+            latest_signal = latest.get("signal_input_id")
+            reviewed_candles = snapshot.get("candles", [])
+            latest_candles = latest.get("candles", [])
+            reviewed_end = reviewed_candles[-1].get("end_ms") if reviewed_candles else None
+            latest_end = latest_candles[-1].get("end_ms") if latest_candles else None
+            if (reviewed_signal is not None and latest_signal != reviewed_signal) or (
+                    reviewed_signal is None and (reviewed_end is None or latest_end != reviewed_end)):
+                return block("A newer primary market observation superseded this proposal")
+            if decision_world is not None:
+                original_config = decision_config if isinstance(decision_config, dict) else config
+                original_binding = self._trade_review_binding(strategy_id=strategy_id,
+                    snapshot_id=snapshot_id, world=decision_world,
+                    config=original_config, permission=True)
+                current_binding = self._trade_review_binding(strategy_id=strategy_id,
+                    snapshot_id=snapshot_id, world=review_world, config=config, permission=True)
+                if (current_binding != original_binding or
+                        (isinstance(decision_eligibility, dict) and
+                         self._eligibility_projection(strategy_id) != decision_eligibility)):
+                    return block("Account, orders, positions, config, or eligibility changed during Sol deliberation")
             now = self._now_ms()
             expiry = args.get("expires_at_ms")
             lifetime = min(config["live_execution"]["max_decision_age_seconds"],
@@ -757,7 +1231,7 @@ class ExecutionController:
                 bounds.append(attention)
             if type(expiry) is int:
                 bounds.append(expiry)
-            valid_until = min(bounds)
+            valid_until = int(min(bounds))
             if type(expiry) is not int or now >= valid_until or now < snapshot["captured_at_ms"]:
                 return block("Trade proposal snapshot or expiry is stale")
             binding = self._trade_review_binding(strategy_id=strategy_id, snapshot_id=snapshot_id,
@@ -771,7 +1245,7 @@ class ExecutionController:
                 "decision_snapshot": self._market_projection(snapshot),
                 "account": self._account_projection(review_world["account"]),
                 "positions": copy.deepcopy(review_world["positions"]),
-                "orders": [self._summary_order(row) for row in review_world["orders"]],
+                "orders": self._order_history_projection(review_world["orders"]),
                 "constraints": self._constraints(strategy_id),
                 "eligibility": self._eligibility_projection(strategy_id),
                 "runtime_permission": True, "state_binding": binding,
@@ -784,7 +1258,7 @@ class ExecutionController:
             # One durable review slot per model tool identity. An exact replay
             # reuses the record; changed arguments or evidence hit the same slot
             # and are rejected without another paid request.
-            result = reviewer.review(evidence, task_id=review_task)
+            result = reviewer.review(evidence, task_id=review_task, deadline_ms=valid_until)
             if not isinstance(result, dict):
                 return {"status": "blocked", "reason": "Trade reviewer returned no decision"}
             result = copy.deepcopy(result)
@@ -834,12 +1308,13 @@ class ExecutionController:
     def _eligibility(self, strategy_id):
         try:
             result = self.eligibility(strategy_id)
-            return result if isinstance(result, dict) else {"eligible": False, "reasons": ["Eligibility service returned invalid state"]}
+            return result if (isinstance(result, dict) and type(result.get('eligible')) is bool) else {
+                "eligible": False, "reasons": ["Eligibility service returned invalid state"]}
         except Exception as error:
             return {"eligible": False, "reasons": ["Eligibility unavailable (" + type(error).__name__ + ")"]}
 
-    def _eligibility_projection(self, strategy_id):
-        result = self._eligibility(strategy_id)
+    def _eligibility_projection(self, strategy_id, result=None):
+        result = result if isinstance(result, dict) else self._eligibility(strategy_id)
         keys = ("eligible", "status", "allocation", "policy_version", "observation_unit",
                 "verified_observations", "sessions", "trades", "net_return", "drawdown",
                 "benchmark_return", "cost_complete")
@@ -848,6 +1323,147 @@ class ExecutionController:
         projected["reasons"] = [_bounded_text(item, 400) for item in result.get("reasons", [])[:12]]
         return projected
 
+    def support_preflight(self, strategy_id):
+        """Cheap, host-only support fanout gate for the continuous SOL worker.
+
+        ``needed`` stays true whenever reconciliation or qualification is
+        uncertain. It is false only when SOL is inactive, execution permission
+        is definitively off, the strategy is unavailable, or the reconciled
+        flat strategy cannot make a discretionary mutation.
+        """
+        config = self._config()
+        if not is_sol_mode(config):
+            return {"needed": False, "reason": "SOL Perpetual mode is not selected"}
+        if not config["bybit"].get("enabled"):
+            return {"needed": False, "reason": "Bybit is disabled by the operator"}
+        if not config["live_execution"].get("enabled"):
+            return {"needed": False, "reason": "Live execution is disabled by the operator"}
+        if not self._permission_allowed():
+            return {"needed": False, "reason": "Runtime permission is paused"}
+        try:
+            strategy = self._strategy(strategy_id)
+        except Exception as error:
+            return {"needed": True, "reason": "Strategy state is uncertain (" + type(error).__name__ + ")"}
+        if not strategy:
+            return {"needed": False, "reason": "Strategy version is unavailable"}
+        try:
+            world = self._world()
+            eligibility = self._eligibility(strategy_id)
+        except Exception as error:
+            return {"needed": True, "reason": "Host state is uncertain (" + type(error).__name__ + ")"}
+        try:
+            no_action = self._flat_no_action_preflight(strategy_id, world, eligibility, config,
+                                                       budget_available=self._budget_available())
+        except Exception as error:
+            return {"needed": True, "reason": "Host preflight is uncertain (" + type(error).__name__ + ")"}
+        if no_action:
+            return {"needed": False,
+                "reason": "Host controls block discretionary mutations and no position or active order needs management"}
+        return {"needed": True, "reason": "A discretionary decision may be actionable"}
+
+    def _continuation_stop_reason(self, strategy_id, strategy, snapshot, config, eligibility):
+        """Lightweight authorization and source freshness check between model rounds."""
+        current = self._config()
+        if not is_sol_mode(current):
+            return "Authorization changed: SOL Perpetual mode is no longer selected"
+        if not self._permission_allowed():
+            return "Authorization changed: runtime permission is paused"
+        if not current["bybit"].get("enabled") or not current["live_execution"].get("enabled"):
+            return "Authorization changed: exchange or execution permission is disabled"
+        if (current["bybit"].get("mode") != config["bybit"].get("mode") or
+                current["bybit"].get("account_id") != config["bybit"].get("account_id") or
+                current["bybit"].get("mainnet_enabled") != config["bybit"].get("mainnet_enabled") or
+                current["bybit"].get("allowed_categories") != config["bybit"].get("allowed_categories") or
+                current["bybit"].get("allowed_instruments") != config["bybit"].get("allowed_instruments") or
+                current["live_execution"] != config["live_execution"]):
+            return "Authorization changed: execution configuration changed during the decision"
+        current_strategy = self._strategy(strategy_id)
+        if not current_strategy or self._strategy_projection(current_strategy) != self._strategy_projection(strategy):
+            return "Authorization changed: strategy version changed during the decision"
+        current_eligibility = self._eligibility_projection(strategy_id)
+        if current_eligibility != eligibility:
+            return "Authorization changed: strategy eligibility changed during the decision"
+
+        now = self._now_ms()
+        captured = snapshot.get("captured_at_ms")
+        if not isinstance(captured, int) or isinstance(captured, bool):
+            return "Decision expired or superseded: source snapshot capture time is unavailable"
+        lifetime = min(config["live_execution"]["max_decision_age_seconds"],
+                       strategy["market_policy"]["max_decision_latency_seconds"]) * 1000
+        deadline = captured + lifetime
+        attention = snapshot.get("attention_deadline_ms")
+        if type(attention) is int:
+            deadline = min(deadline, attention)
+        if now < captured or now >= deadline:
+            return "Decision expired or superseded: decision deadline passed"
+        try:
+            status = self.market.snapshot_status(snapshot.get("snapshot_id"))
+            if not isinstance(status, dict) or status.get("valid") is not True:
+                return "Decision expired or superseded: source snapshot is no longer current"
+            sampler = getattr(self.market, "sample", None)
+            latest = sampler(strategy_id) if callable(sampler) else self._fresh_market(strategy_id)
+            if not isinstance(latest, dict) or latest.get("strategy_id") != strategy_id:
+                return "Decision expired or superseded: current market state is unavailable"
+        except Exception:
+            return "Decision expired or superseded: current market state is unavailable"
+        reviewed_signal = snapshot.get("signal_input_id")
+        if reviewed_signal is not None:
+            if latest.get("signal_input_id") != reviewed_signal:
+                return "Decision expired or superseded: a newer primary market observation arrived"
+        else:
+            old_bars, new_bars = snapshot.get("candles", []), latest.get("candles", [])
+            if (not old_bars or not new_bars or
+                    old_bars[-1].get("end_ms") != new_bars[-1].get("end_ms")):
+                return "Decision expired or superseded: a newer primary market observation arrived"
+        return None
+
+    def _flat_no_action_preflight(self, strategy_id, world, eligibility, config, *, budget_available=None):
+        """Whether host facts rule out every discretionary mutation for this event.
+
+        This deliberately does not inspect the market signal: an otherwise
+        qualified flat SOL strategy may still choose leverage. It only skips
+        when a deterministic host eligibility, instrument, risk, or budget
+        gate prevents discretionary mutation. Any owned inventory or live
+        order keeps the model lane available for management.
+        """
+        if (not isinstance(eligibility, dict) or
+                (eligibility.get("eligible") is not True and eligibility.get("eligible") is not False)):
+            return False
+        limits = config.get("live_execution", {})
+        operator_approved = strategy_id in limits.get("eligible_strategy_versions", [])
+        strategy = self._strategy(strategy_id)
+        policy = strategy.get("market_policy", {}) if strategy else {}
+        instrument_allowed = (policy.get("category") in config.get("bybit", {}).get("allowed_categories", []) and
+            {"category": policy.get("category"), "symbol": policy.get("symbol")} in
+                config.get("bybit", {}).get("allowed_instruments", []))
+        account = world.get("account", {})
+        try:
+            risk_blocked = (limits.get("kill_switch") is True or account.get("risk_halted") is True or
+                account.get("daily_pnl") is None or account.get("drawdown_fraction") is None or
+                bool(protective_reasons(account, config)))
+        except Exception:
+            return False
+        hard_gate_blocks = (eligibility["eligible"] is not True or not operator_approved or
+            not instrument_allowed or risk_blocked or budget_available is False)
+        if not hard_gate_blocks:
+            return False
+        reasons = eligibility.get("reasons", [])
+        if eligibility["eligible"] is False and any(
+               isinstance(reason, str) and reason.startswith(("Eligibility unavailable",
+                   "Eligibility service returned invalid state"))
+               for reason in reasons):
+            return False
+        if world.get("account", {}).get("reconciliation_required") is True:
+            return False
+        if any(row.get("strategy_id") == strategy_id and
+               (not _finite(row.get("quantity")) or abs(row.get("quantity")) > 1e-12)
+               for row in world.get("positions", [])):
+            return False
+        if any(row.get("strategy_id") == strategy_id and self._active_order(row)
+               for row in world.get("orders", [])):
+            return False
+        return True
+
     @staticmethod
     def _active_order(order):
         return order.get("status") in ACTIVE_ORDERS
@@ -855,8 +1471,10 @@ class ExecutionController:
     def _risk_check(self, intent, *, strategy, decision_snapshot, current_market, world, orders,
                     eligibility, budget_available):
         now = self._now_ms()
-        recent = sum(1 for order in world["orders"] if
-                     isinstance(order.get("created_at_ms"), int) and order["created_at_ms"] >= now - 60_000)
+        counter = getattr(self.adapter, 'recent_order_count', None)
+        recent = (counter(since_ms=max(0, now - 60_000)) if callable(counter) else
+                  sum(1 for order in world["orders"] if
+                      type(order.get("created_at_ms")) is int and order["created_at_ms"] >= now - 60_000))
         config = self._config()
         if is_sol_mode(config) and intent.get('reduce_only') is not True:
             config = copy.deepcopy(config)
@@ -931,7 +1549,7 @@ class ExecutionController:
             if not isinstance(args.get('rationale'), str) or not args['rationale'].strip():
                 raise IntentRejected('A leverage rationale is required')
             eligibility = self._eligibility(strategy_id)
-            if not eligibility.get('eligible') or strategy_id not in config['live_execution']['eligible_strategy_versions']:
+            if eligibility.get('eligible') is not True or strategy_id not in config['live_execution']['eligible_strategy_versions']:
                 raise IntentRejected('Qualified strategy and explicit operator approval are required')
             if not self._budget_available():
                 raise IntentRejected('Model budget blocks discretionary leverage changes')
@@ -1337,7 +1955,8 @@ class ExecutionController:
                     "foreign_position_notional": sum(abs(float(row.get("quantity", 0.)) * float(row.get("mark_price", 0.))) for row in foreign)}
         if name == "inspect_orders":
             current = self.reconcile()
-            own = [row for row in current["orders"] if row.get("strategy_id") == strategy_id][-64:]
+            own = self._order_history_projection(
+                [row for row in current["orders"] if row.get("strategy_id") == strategy_id])
             foreign_active = sum(row.get("strategy_id") != strategy_id and row.get("status") in ACTIVE_ORDERS
                                  for row in current["orders"])
             return {"orders": own, "foreign_active_order_count": foreign_active,
@@ -1361,7 +1980,8 @@ class ExecutionController:
                     "rationale": args.get("rationale", "")}
         raise IntentRejected("Execution tool is not permitted")
 
-    def _dispatch_tool(self, name, args, tool_id, *, strategy_id, approved_snapshots, decision_snapshot, world):
+    def _dispatch_tool(self, name, args, tool_id, *, strategy_id, approved_snapshots, decision_snapshot, world,
+                       decision_config=None, decision_eligibility=None):
         try:
             trade_approval = None
             reviewed_tools = {"submit_order_intent", "amend_order", "reduce_exposure", "set_leverage"}
@@ -1370,7 +1990,9 @@ class ExecutionController:
                 # replay/reconciliation semantics and never trigger a new review.
                 if self._mutation_row(tool_id) is None:
                     trade_approval = self._prepare_trade_review(name, args, tool_id,
-                        strategy_id=strategy_id, decision_snapshot=decision_snapshot)
+                        strategy_id=strategy_id, decision_snapshot=decision_snapshot,
+                        decision_world=world, decision_config=decision_config,
+                        decision_eligibility=decision_eligibility)
                     if not isinstance(trade_approval, dict) or trade_approval.get("status") != "approved":
                         return {"status": "blocked", "reason": _bounded_text(
                             (trade_approval or {}).get("reason", "Dedicated trade approval is required")),
@@ -1464,7 +2086,7 @@ class ExecutionController:
     def _duplicate_decision(self, strategy_id, fingerprint):
         with self.store.connection() as db:
             row = db.execute("SELECT value FROM execution_decisions WHERE strategy_id=? AND fingerprint=? "
-                             "AND status IN ('held','completed','submitted','reduction_requested','cancelled','cancel_requested','filled_during_cancel','amended','leverage_set') "
+                             "AND status IN ('held','completed','submitted','reduction_requested','cancelled','cancel_requested','filled_during_cancel','amended','leverage_set','superseded') "
                              "ORDER BY created_at_ms DESC LIMIT 1", (strategy_id, fingerprint)).fetchone()
         return json.loads(row[0]) if row else None
 
@@ -1549,7 +2171,6 @@ class ExecutionController:
         try:
             world = self._world()
             snapshot = self._fresh_market(strategy_id)
-            dossier = self.memory.dossier(strategy_id, task='execution', max_bytes=16000)
         except Exception as error:
             value = self._decision_value(decision_id=decision_id, event_id=event_id, strategy_id=strategy_id,
                 fingerprint=identity([strategy_id, event.get("kind"), event.get("snapshot_id"), "unavailable"]),
@@ -1569,10 +2190,11 @@ class ExecutionController:
         controls = {"bybit": {key: config["bybit"].get(key) for key in
             ("mode", "enabled", "mainnet_enabled", "allowed_categories", "allowed_instruments")},
             "live_execution": config["live_execution"]}
-        eligibility = self._eligibility_projection(strategy_id)
+        eligibility_result = self._eligibility(strategy_id)
+        eligibility = self._eligibility_projection(strategy_id, eligibility_result)
         budget_available = self._budget_available()
         fingerprint = identity([strategy_id, snapshot_id, event_payload, account_fingerprint,
-            order_fingerprint, controls, eligibility, budget_available])
+            order_fingerprint, controls, eligibility, budget_available, world.get("ledger_revision")])
         previous = self._duplicate_decision(strategy_id, fingerprint)
         if previous:
             return {"status": "unchanged", "strategy_id": strategy_id,
@@ -1582,6 +2204,29 @@ class ExecutionController:
             value = self._decision_value(decision_id=decision_id, event_id=event_id, strategy_id=strategy_id,
                 fingerprint=fingerprint, status="blocked", snapshot_id=snapshot_id,
                 rationale="Runtime permission is paused; discretionary Sol execution is blocked.")
+            self._record_memory(world, value)
+            return value
+        try:
+            no_action = is_sol_mode(config) and self._flat_no_action_preflight(strategy_id, world,
+                eligibility_result, config, budget_available=budget_available)
+        except Exception:
+            no_action = False
+        if no_action:
+            rationale = ("Host preflight held this event: qualification, operator, instrument, risk, or budget "
+                         "controls block discretionary mutations and there is no position or active "
+                         "order requiring management.")
+            value = self._decision_value(decision_id=decision_id, event_id=event_id,
+                strategy_id=strategy_id, fingerprint=fingerprint, status="held",
+                snapshot_id=snapshot_id, rationale=rationale,
+                result={"summary": rationale, "tools": []})
+            self._record_memory(world, value)
+            return value
+        try:
+            dossier = self.memory.dossier(strategy_id, task='execution', max_bytes=16000)
+        except Exception as error:
+            value = self._decision_value(decision_id=decision_id, event_id=event_id, strategy_id=strategy_id,
+                fingerprint=fingerprint, status="blocked", snapshot_id=snapshot_id,
+                rationale="Execution memory unavailable (" + type(error).__name__ + ")")
             self._record_memory(world, value)
             return value
         approved_snapshots = {snapshot_id}
@@ -1594,10 +2239,11 @@ class ExecutionController:
             "foreign_exposure": {"position_count": sum(row.get("strategy_id") is None for row in world["positions"]),
                 "notional": sum(abs(float(row.get("quantity", 0.)) * float(row.get("mark_price", 0.)))
                     for row in world["positions"] if row.get("strategy_id") is None)},
-            "strategy_orders": [self._summary_order(row) for row in world["orders"] if row.get("strategy_id") == strategy_id][-64:],
+            "strategy_orders": self._order_history_projection(
+                [row for row in world["orders"] if row.get("strategy_id") == strategy_id]),
             "portfolio_active_order_count": sum(row.get("status") in ACTIVE_ORDERS for row in world["orders"]),
             "previous_outcomes": self._recent_outcomes(strategy_id),
-            "eligibility": self._eligibility_projection(strategy_id),
+            "eligibility": eligibility,
             "runtime_permission": True, "account_reconciliation_required": world["account"]["reconciliation_required"],
             "protection_state": safe_state["account"]}
         if callable(self.support_context_provider):
@@ -1606,11 +2252,32 @@ class ExecutionController:
             except Exception:
                 payload['support_swarm'] = {'status': 'unavailable', 'reports': []}
         payload['experiment_id'] = strategy.get('experiment_id', strategy_id)
+        request_check = None
+        tool_check = None
+        if is_sol_mode(config):
+            request_check = lambda: self._continuation_stop_reason(
+                strategy_id, strategy, snapshot, config, eligibility)
+            safe_tools = {"inspect_strategies", "inspect_market", "inspect_account",
+                          "inspect_orders", "hold", "cancel_order"}
+            tool_check = lambda name, args: (None if name in safe_tools else
+                self._continuation_stop_reason(strategy_id, strategy, snapshot, config, eligibility))
+        decision_deadline_ms = None
+        if is_sol_mode(config):
+            captured = snapshot.get("captured_at_ms")
+            if type(captured) is int:
+                lifetime_ms = min(config["live_execution"]["max_decision_age_seconds"],
+                    strategy["market_policy"]["max_decision_latency_seconds"]) * 1000
+                decision_deadline_ms = int(captured + lifetime_ms)
+                attention = snapshot.get("attention_deadline_ms")
+                if type(attention) is int:
+                    decision_deadline_ms = min(decision_deadline_ms, attention)
         try:
             result = self.agents.tools(payload, SOL_EXECUTION_TOOLS if is_sol_mode(config) else EXECUTION_TOOLS,
                 lambda name, args, key: self._dispatch_tool(name, args, key, strategy_id=strategy_id,
-                    approved_snapshots=approved_snapshots, decision_snapshot=snapshot, world=world),
-                task_id="execution-" + decision_id)
+                    approved_snapshots=approved_snapshots, decision_snapshot=snapshot, world=world,
+                    decision_config=copy.deepcopy(config), decision_eligibility=copy.deepcopy(eligibility)),
+                task_id="execution-" + decision_id, request_check=request_check,
+                tool_check=tool_check, deadline_ms=decision_deadline_ms)
         except BudgetExceeded as error:
             status = "blocked"
             reason = "Sol execution budget unavailable (" + type(error).__name__ + ")"
@@ -1621,6 +2288,21 @@ class ExecutionController:
             self._record_memory(world, value)
             return value
         except Exception as error:
+            stopped_reason = None
+            if callable(request_check):
+                try:
+                    stopped_reason = request_check()
+                except Exception:
+                    stopped_reason = None
+            if isinstance(stopped_reason, str) and stopped_reason:
+                status = "superseded" if stopped_reason.startswith("Decision expired or superseded:") else "blocked"
+                reason = stopped_reason
+                value = self._decision_value(decision_id=decision_id, event_id=event_id,
+                    strategy_id=strategy_id, fingerprint=fingerprint, status=status,
+                    snapshot_id=snapshot_id, rationale=reason, result={"summary": reason})
+                self.store.event("execution", reason, "warning")
+                self._record_memory(world, value)
+                return value
             status = "blocked"
             reason = "Sol execution unavailable (" + type(error).__name__ + ")"
             value = self._decision_value(decision_id=decision_id, event_id=event_id, strategy_id=strategy_id,
@@ -1658,6 +2340,10 @@ class ExecutionController:
                 rationale = "Sol recorded a hold."
         else:
             rationale = summary or "Sol made no execution proposal; the host recorded a hold."
+        if result.get("status") == "stopped" and action is None:
+            stop_reason = _bounded_text(result.get("reason") or summary)
+            status = "superseded" if stop_reason.startswith("Decision expired or superseded") else "blocked"
+            rationale = stop_reason or "Host stopped the decision before any tool action."
         rationale = _bounded_text(rationale)
         decision_snapshot_id = (action_result.get("decision_snapshot_id") or action_result.get("snapshot_id")
             or snapshot_id)
@@ -2004,13 +2690,13 @@ class ExecutionController:
             account = world["account"]
             risk_reasons = protective_reasons(account, config)
             data_bad = {}
-            strategy_map = self._strategy_map(self.store)
             snapshots = {}
             relevant_strategies = {row.get("strategy_id") for row in world["orders"]
                 if row.get("strategy_id") and self._active_order(row) and not row.get("reduce_only")}
             relevant_strategies.update(row.get("strategy_id") for row in world["orders"]
                 if row.get("strategy_id") and row.get("spot_protection") is True and self._active_order(row))
             relevant_strategies.update(row.get("strategy_id") for row in world["positions"] if row.get("strategy_id"))
+            strategy_map = self._strategy_map(self.store, relevant_strategies)
             for sid in relevant_strategies:
                 strategy = strategy_map.get(sid)
                 if not strategy:

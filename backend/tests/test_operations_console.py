@@ -1,6 +1,7 @@
 import unittest
 
 from prism_runtime.operations_console import projection
+from prism_runtime.domain import timestamp
 
 
 def project(execution):
@@ -9,6 +10,38 @@ def project(execution):
 
 
 class OperationsConsoleTests(unittest.TestCase):
+    def test_controller_millisecond_timestamps_are_projected_and_invalid_values_are_unavailable(self):
+        stamp = 1_793_361_600_123
+        result = project({'orders': [{'order_link_id': 'timed-order', 'status': 'filled', 'updated_at_ms': stamp}],
+                          'decisions': [{'id': 'timed-decision', 'status': 'held', 'created_at_ms': stamp}]})
+        for section in result['sections']:
+            if section['id'] in {'orders', 'decisions'}:
+                self.assertEqual(section['items'][0]['time'], timestamp(stamp / 1000))
+        for value in (float('nan'), float('inf'), 10 ** 1000, True):
+            result = project({'orders': [{'order_link_id': 'invalid-time', 'updated_at_ms': value}]})
+            orders = next(section for section in result['sections'] if section['id'] == 'orders')
+            self.assertIsNone(orders['items'][0]['time'])
+
+    def test_order_view_is_bounded_but_exposes_complete_counts_and_prioritizes_unresolved(self):
+        orders = [{'order_link_id': f'active-{index}', 'symbol': 'SOLUSDT', 'status': 'unknown',
+                   'created_at_ms': index + 1} for index in range(120)]
+        orders.append({'order_link_id': 'newest-terminal', 'symbol': 'SOLUSDT', 'status': 'filled',
+                       'created_at_ms': 1000})
+        result = project({'orders': orders, 'order_count': 10000, 'active_order_count': 120,
+                          'order_history_truncated': True})
+        section = next(section for section in result['sections'] if section['id'] == 'orders')
+        self.assertEqual(len(section['items']), 60)
+        self.assertEqual(section['items'][0]['id'], 'active-119')
+        self.assertTrue(all(row['status'] == 'unknown' for row in section['items']))
+        self.assertEqual(result['order_count'], 10000)
+        self.assertEqual(result['active_order_count'], 120)
+        self.assertTrue(result['orders_truncated'])
+
+    def test_absent_order_measurements_do_not_invent_zero_counts(self):
+        result = project({})
+        self.assertIsNone(result['order_count'])
+        self.assertIsNone(result['active_order_count'])
+
     def test_real_controller_account_shape_is_healthy_and_does_not_invent_pnl(self):
         result = project({
             'environment': 'mainnet', 'risk_halted': False, 'reconciliation_required': False,

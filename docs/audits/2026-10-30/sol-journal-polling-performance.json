@@ -1,0 +1,221 @@
+{
+  "benchmark": "sol_durable_journal_polling",
+  "fixture": "offline SolSwarmEndToEndTests + temp SQLite/PaperExchange",
+  "repeated_polls": 20,
+  "results": [
+    {
+      "after": {
+        "events_state": {
+          "first_read_ms": 1.305,
+          "polls": 20,
+          "steady_mean_ms": 1.2798,
+          "steady_median_ms": 1.1442
+        },
+        "execution_state": {
+          "first_read_ms": 1.1766,
+          "polls": 20,
+          "steady_mean_ms": 1.1425,
+          "steady_median_ms": 1.1266
+        },
+        "global_reviews_state": {
+          "first_read_ms": 0.6339,
+          "polls": 20,
+          "steady_mean_ms": 0.6533,
+          "steady_median_ms": 0.6268
+        },
+        "review_for_tool": {
+          "first_read_ms": 1.118,
+          "polls": 20,
+          "steady_mean_ms": 1.1403,
+          "steady_median_ms": 1.0931
+        }
+      },
+      "before": {
+        "events_state": {
+          "first_read_ms": 4.8968,
+          "polls": 20,
+          "steady_mean_ms": 4.5163,
+          "steady_median_ms": 4.4987
+        },
+        "execution_state": {
+          "first_read_ms": 2.6289,
+          "polls": 20,
+          "steady_mean_ms": 2.5701,
+          "steady_median_ms": 2.4665
+        },
+        "global_reviews_state": {
+          "first_read_ms": 6.147,
+          "polls": 20,
+          "steady_mean_ms": 6.5367,
+          "steady_median_ms": 6.4237
+        },
+        "review_for_tool": {
+          "first_read_ms": 2.638,
+          "polls": 20,
+          "steady_mean_ms": 2.4407,
+          "steady_median_ms": 2.4302
+        }
+      },
+      "bounded_output_rows": {
+        "events": 100,
+        "execution_decisions": 32,
+        "global_reviews": 100
+      },
+      "index_build_seconds": 0.010072,
+      "provider_requests": 0,
+      "query_plans_after": {
+        "event_status_counts": [
+          "SCAN attention_events USING COVERING INDEX attention_due"
+        ],
+        "events_state": [
+          "SCAN attention_events USING INDEX idx_attention_recent"
+        ],
+        "execution_state": [
+          "SCAN execution_decisions USING INDEX idx_execution_decision_global_recent"
+        ],
+        "global_reviews_state": [
+          "SCAN trade_reviews USING INDEX idx_trade_review_global_recent"
+        ],
+        "review_for_tool": [
+          "SEARCH trade_reviews USING INDEX idx_trade_review_tool_recent (tool_id=?)"
+        ]
+      },
+      "query_plans_before": {
+        "event_status_counts": [
+          "SCAN attention_events USING COVERING INDEX attention_due"
+        ],
+        "events_state": [
+          "SCAN attention_events",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "execution_state": [
+          "SCAN execution_decisions",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "global_reviews_state": [
+          "SCAN trade_reviews",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "review_for_tool": [
+          "SCAN trade_reviews",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ]
+      },
+      "rows_per_journal": 10000,
+      "scope": "synthetic local SQLite journal rows; UI methods/queries only; no model, eligibility or trading work",
+      "source_counts": {
+        "attention_events": 10000,
+        "execution_decisions": 10000,
+        "trade_reviews": 10000
+      },
+      "tool_id_rows": 39
+    },
+    {
+      "after": {
+        "events_state": {
+          "first_read_ms": 2.3607,
+          "polls": 20,
+          "steady_mean_ms": 2.1297,
+          "steady_median_ms": 2.1088
+        },
+        "execution_state": {
+          "first_read_ms": 1.1302,
+          "polls": 20,
+          "steady_mean_ms": 1.1324,
+          "steady_median_ms": 1.1226
+        },
+        "global_reviews_state": {
+          "first_read_ms": 0.6247,
+          "polls": 20,
+          "steady_mean_ms": 0.6096,
+          "steady_median_ms": 0.6025
+        },
+        "review_for_tool": {
+          "first_read_ms": 1.1381,
+          "polls": 20,
+          "steady_mean_ms": 1.1009,
+          "steady_median_ms": 1.0933
+        }
+      },
+      "before": {
+        "events_state": {
+          "first_read_ms": 20.358,
+          "polls": 20,
+          "steady_mean_ms": 19.8719,
+          "steady_median_ms": 19.3461
+        },
+        "execution_state": {
+          "first_read_ms": 8.0602,
+          "polls": 20,
+          "steady_mean_ms": 8.0118,
+          "steady_median_ms": 7.8125
+        },
+        "global_reviews_state": {
+          "first_read_ms": 37.6383,
+          "polls": 20,
+          "steady_mean_ms": 32.3221,
+          "steady_median_ms": 31.1431
+        },
+        "review_for_tool": {
+          "first_read_ms": 8.2002,
+          "polls": 20,
+          "steady_mean_ms": 8.9559,
+          "steady_median_ms": 8.2355
+        }
+      },
+      "bounded_output_rows": {
+        "events": 100,
+        "execution_decisions": 32,
+        "global_reviews": 100
+      },
+      "index_build_seconds": 0.050745,
+      "provider_requests": 0,
+      "query_plans_after": {
+        "event_status_counts": [
+          "SCAN attention_events USING COVERING INDEX attention_due"
+        ],
+        "events_state": [
+          "SCAN attention_events USING INDEX idx_attention_recent"
+        ],
+        "execution_state": [
+          "SCAN execution_decisions USING INDEX idx_execution_decision_global_recent"
+        ],
+        "global_reviews_state": [
+          "SCAN trade_reviews USING INDEX idx_trade_review_global_recent"
+        ],
+        "review_for_tool": [
+          "SEARCH trade_reviews USING INDEX idx_trade_review_tool_recent (tool_id=?)"
+        ]
+      },
+      "query_plans_before": {
+        "event_status_counts": [
+          "SCAN attention_events USING COVERING INDEX attention_due"
+        ],
+        "events_state": [
+          "SCAN attention_events",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "execution_state": [
+          "SCAN execution_decisions",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "global_reviews_state": [
+          "SCAN trade_reviews",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "review_for_tool": [
+          "SCAN trade_reviews",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ]
+      },
+      "rows_per_journal": 50000,
+      "scope": "synthetic local SQLite journal rows; UI methods/queries only; no model, eligibility or trading work",
+      "source_counts": {
+        "attention_events": 50000,
+        "execution_decisions": 50000,
+        "trade_reviews": 50000
+      },
+      "tool_id_rows": 195
+    }
+  ]
+}

@@ -15,6 +15,10 @@ class Clock:
     def __call__(self):
         return self.value
 
+    @property
+    def ms(self):
+        return round(self.value * 1000)
+
 
 class SOLChartProjectionTests(unittest.TestCase):
     def setUp(self):
@@ -44,7 +48,7 @@ class SOLChartProjectionTests(unittest.TestCase):
         self.market._write_bar(self.series, bar)
 
     def test_memory_projection_sorts_bounds_and_keeps_real_forming_candle(self):
-        base = 1_799_000_000_000 - (1_799_000_000_000 % 60_000)
+        base = (self.clock.ms // 60_000) * 60_000 - 125 * 60_000
         # More than the UI limit, inserted out of order.
         for offset in reversed(range(125)):
             start = base + offset * 60_000
@@ -54,6 +58,11 @@ class SOLChartProjectionTests(unittest.TestCase):
         self.series['forming'] = self.bar(forming_start, closed=False,
                                           open_=225., high=229., low=224., close=228.)
 
+        # A service that has not started cannot present persisted intrabar
+        # state as live. Once running, a recent current interval is authoritative.
+        self.assertNotIn(False, [row['closed'] for row in sol_chart_projection(self.store, self.market)['candles']])
+        self.series['forming']['updated_at_ms'] = self.clock.ms
+        self.market._running = True
         result = sol_chart_projection(self.store, self.market)
 
         self.assertEqual({key: result[key] for key in ('symbol', 'category', 'timeframe', 'environment')},
@@ -66,6 +75,27 @@ class SOLChartProjectionTests(unittest.TestCase):
         self.assertEqual(candles[-1], {'start_ms': forming_start, 'open': 225., 'high': 229.,
                                       'low': 224., 'close': 228., 'closed': False})
         self.assertTrue(all(row['closed'] for row in candles[:-1]))
+
+    def test_stopped_or_expired_forming_bar_is_not_projected_as_live(self):
+        base = (self.clock.ms // 60_000) * 60_000
+        self.put_closed(base - 60_000)
+        self.series['forming'] = self.bar(base, closed=False)
+        self.series['forming']['updated_at_ms'] = self.clock.ms - 20_000
+
+        # Stopped services expose durable closed candles only.
+        result = sol_chart_projection(self.store, self.market)
+        self.assertEqual(len(result['candles']), 1)
+        self.assertTrue(result['candles'][0]['closed'])
+
+        # Even an active service must not present an expired update as live.
+        self.market._running = True
+        result = sol_chart_projection(self.store, self.market)
+        self.assertEqual(len(result['candles']), 1)
+        self.assertTrue(result['candles'][0]['closed'])
+
+        self.series['forming']['updated_at_ms'] = self.clock.ms
+        result = sol_chart_projection(self.store, self.market)
+        self.assertFalse(result['candles'][-1]['closed'])
 
     def test_offline_reads_only_matching_persisted_series_and_environment(self):
         base = 1_799_000_000_000 - (1_799_000_000_000 % 60_000)
@@ -93,6 +123,11 @@ class SOLChartProjectionTests(unittest.TestCase):
     def test_invalid_candle_is_omitted(self):
         base = 1_799_000_000_000 - (1_799_000_000_000 % 60_000)
         self.series['bars'][base] = self.bar(base, high=99.)
+        self.assertIsNone(sol_chart_projection(self.store, self.market))
+
+    def test_future_persisted_candle_is_omitted(self):
+        start = (self.clock.ms // 60_000 + 1) * 60_000
+        self.put_closed(start)
         self.assertIsNone(sol_chart_projection(self.store, self.market))
 
     def test_runtime_state_includes_optional_chart_projection(self):

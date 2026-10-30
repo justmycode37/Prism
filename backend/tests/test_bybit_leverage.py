@@ -20,6 +20,9 @@ class LeverageTransport:
     def __init__(self):
         self.calls = []
         self.position = {'symbol': 'SOLUSDT', 'positionIdx': 0, 'leverage': '1', 'size': '0', 'side': ''}
+        self.other_position = {'symbol': 'BTCUSDT', 'positionIdx': 0, 'leverage': '10', 'size': '2',
+            'side': 'Buy', 'avgPrice': '100', 'markPrice': '110', 'unrealisedPnl': '20',
+            'stopLoss': '90', 'liqPrice': '0'}
         self.orders = []
         self.set_readback = True
 
@@ -36,10 +39,20 @@ class LeverageTransport:
         if path in {'/v5/order/realtime', '/v5/order/history'}:
             rows = self.orders if params.get('category', [''])[0] == 'linear' and params.get('symbol', [''])[0] == 'SOLUSDT' else []
             return api({'list': rows})
+        if path == '/v5/account/info':
+            return api({'list': [{'unifiedMarginStatus': 3, 'marginMode': 'REGULAR_MARGIN',
+                                  'accountType': 'UNIFIED'}]})
+        if path == '/v5/account/wallet-balance':
+            return api({'list': [{'accountType': 'UNIFIED', 'totalEquity': '10000',
+                'totalWalletBalance': '10000', 'totalAvailableBalance': '9500', 'totalPerpUPL': '20',
+                'coin': [{'coin': 'USDT', 'walletBalance': '10000', 'equity': '10000',
+                         'availableToWithdraw': '9500', 'spotBorrow': '0'}]}]})
         if path in {'/v5/execution/list', '/v5/account/transaction-log'}:
             return api({'list': []})
         if path == '/v5/position/list':
-            return api({'list': [dict(self.position)]})
+            symbol = params.get('symbol', [''])[0]
+            rows = [self.position] if symbol == 'SOLUSDT' else [self.other_position] if symbol == 'BTCUSDT' else [self.position, self.other_position]
+            return api({'list': [dict(row) for row in rows]})
         if path == '/v5/position/set-leverage' and method == 'POST':
             if self.set_readback:
                 self.position['leverage'] = payload['buyLeverage']
@@ -126,6 +139,17 @@ class BybitLeverageTests(unittest.TestCase):
             self.adapter.set_leverage('linear', 'SOLUSDT', 2)
         self.assertEqual(self.posts(), [])
 
+    def test_account_leverage_map_is_instrument_specific_despite_higher_unrelated_leverage(self):
+        account = self.adapter._account_snapshot(reconcile=False)
+        self.assertEqual(account['leverage'], 10.)  # Legacy account-wide maximum.
+        self.assertEqual(next(row for row in account['positions'] if row['symbol'] == 'BTCUSDT')['leverage'], 10.)
+        self.assertEqual(account['leverage_by_instrument'], {'linear:SOLUSDT': 1.})
+
+    def test_unreadable_configured_instrument_leverage_is_not_defaulted_into_map(self):
+        self.transport.position.pop('leverage')
+        account = self.adapter._account_snapshot(reconcile=False)
+        self.assertNotIn('linear:SOLUSDT', account['leverage_by_instrument'])
+
 
 class PaperLeverageTests(unittest.TestCase):
     def setUp(self):
@@ -161,7 +185,7 @@ class PaperLeverageTests(unittest.TestCase):
         self.assertEqual(float(position['unrealisedPnl']), -2.)
         wallet = restarted.request('GET', 'https://paper.bybit.invalid/v5/account/wallet-balance')['result']['list'][0]
         self.assertEqual(float(wallet['totalPerpUPL']), -2.)
-        self.assertEqual(float(wallet['totalAvailableBalance']), 9960.)
+        self.assertEqual(float(wallet['totalAvailableBalance']), 9958.)
 
     def test_paper_route_rejects_position_and_open_order_mutations(self):
         response = self.request('POST', '/v5/order/create', {'category': 'linear', 'symbol': 'SOLUSDT',

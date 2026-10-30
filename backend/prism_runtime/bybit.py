@@ -24,6 +24,7 @@ import uuid
 
 from .credentials import get_bybit_credentials
 from .market_policy import timeframe
+from .risk_controls import ACTIVE_ORDERS
 from .websocket_transport import WebSocketTransport
 
 
@@ -43,6 +44,7 @@ SUPPORTED_CATEGORIES = {"spot", "linear"}
 MAX_CURSOR_PAGES = 1000
 DAY_MS = 86_400_000
 SEVEN_DAYS_MS = 7 * DAY_MS
+RECONCILIATION_ORDER_STATUSES = {'unknown', 'submitting', 'cancel_pending', 'acknowledged'}
 
 
 class BybitError(RuntimeError):
@@ -209,6 +211,10 @@ class BybitAdapter:
                     ON bybit_orders(mode, order_id) WHERE order_id IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_bybit_orders_status
                     ON bybit_orders(mode, status, category, symbol);
+                CREATE INDEX IF NOT EXISTS idx_bybit_orders_mode_created_link
+                    ON bybit_orders(mode, created_at_ms, order_link_id);
+                CREATE INDEX IF NOT EXISTS idx_bybit_orders_instrument_created
+                    ON bybit_orders(mode, category, symbol, created_at_ms, order_link_id);
                 CREATE TABLE IF NOT EXISTS bybit_executions (
                     mode TEXT NOT NULL,
                     exec_id TEXT NOT NULL,
@@ -227,6 +233,10 @@ class BybitAdapter:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bybit_executions_link
                     ON bybit_executions(mode, order_link_id, exec_time_ms);
+                CREATE INDEX IF NOT EXISTS idx_bybit_executions_mode_time_id
+                    ON bybit_executions(mode, exec_time_ms, exec_id);
+                CREATE INDEX IF NOT EXISTS idx_bybit_executions_instrument_time
+                    ON bybit_executions(mode, category, symbol, exec_time_ms, exec_id);
                 CREATE TABLE IF NOT EXISTS bybit_transactions (
                     mode TEXT NOT NULL,
                     transaction_id TEXT NOT NULL,
@@ -241,8 +251,8 @@ class BybitAdapter:
                     value TEXT NOT NULL,
                     PRIMARY KEY(mode, transaction_id)
                 );
-                CREATE INDEX IF NOT EXISTS idx_bybit_transactions_time
-                    ON bybit_transactions(mode, transaction_time_ms);
+                CREATE INDEX IF NOT EXISTS idx_bybit_transactions_mode_time_id
+                    ON bybit_transactions(mode, transaction_time_ms, transaction_id);
                 CREATE TABLE IF NOT EXISTS bybit_instruments (
                     mode TEXT NOT NULL,
                     category TEXT NOT NULL,
@@ -283,6 +293,85 @@ class BybitAdapter:
             columns = {row[1] for row in db.execute('PRAGMA table_info(bybit_orders)')}
             if 'fee_breakdown' not in columns:
                 db.execute('ALTER TABLE bybit_orders ADD COLUMN fee_breakdown TEXT')
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS bybit_ledger_revision (
+                    mode TEXT PRIMARY KEY,
+                    orders INTEGER NOT NULL DEFAULT 0,
+                    executions INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TRIGGER IF NOT EXISTS bybit_orders_revision_insert
+                AFTER INSERT ON bybit_orders BEGIN
+                    INSERT INTO bybit_ledger_revision(mode,orders,executions) VALUES (NEW.mode,1,0)
+                    ON CONFLICT(mode) DO UPDATE SET orders=orders+1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS bybit_orders_revision_update
+                AFTER UPDATE ON bybit_orders
+                WHEN OLD.mode IS NOT NEW.mode OR OLD.order_link_id IS NOT NEW.order_link_id OR
+                     OLD.order_id IS NOT NEW.order_id OR OLD.category IS NOT NEW.category OR
+                     OLD.symbol IS NOT NEW.symbol OR OLD.status IS NOT NEW.status OR
+                     OLD.intent IS NOT NEW.intent OR OLD.filled_qty IS NOT NEW.filled_qty OR
+                     OLD.average_price IS NOT NEW.average_price OR OLD.fee_total IS NOT NEW.fee_total OR
+                     OLD.realized_pnl IS NOT NEW.realized_pnl OR OLD.stop_loss IS NOT NEW.stop_loss OR
+                     OLD.protection_verified IS NOT NEW.protection_verified OR
+                     OLD.exchange_status IS NOT NEW.exchange_status OR OLD.last_mutation IS NOT NEW.last_mutation OR
+                     OLD.created_at_ms IS NOT NEW.created_at_ms OR OLD.fee_breakdown IS NOT NEW.fee_breakdown
+                BEGIN
+                    INSERT INTO bybit_ledger_revision(mode,orders,executions) VALUES (OLD.mode,1,0)
+                    ON CONFLICT(mode) DO UPDATE SET orders=orders+1;
+                    INSERT INTO bybit_ledger_revision(mode,orders,executions) VALUES (NEW.mode,1,0)
+                    ON CONFLICT(mode) DO UPDATE SET orders=orders+CASE WHEN NEW.mode IS OLD.mode THEN 0 ELSE 1 END;
+                END;
+                CREATE TRIGGER IF NOT EXISTS bybit_orders_revision_delete
+                AFTER DELETE ON bybit_orders BEGIN
+                    INSERT INTO bybit_ledger_revision(mode,orders,executions) VALUES (OLD.mode,1,0)
+                    ON CONFLICT(mode) DO UPDATE SET orders=orders+1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS bybit_executions_revision_insert
+                AFTER INSERT ON bybit_executions BEGIN
+                    INSERT INTO bybit_ledger_revision(mode,orders,executions) VALUES (NEW.mode,0,1)
+                    ON CONFLICT(mode) DO UPDATE SET executions=executions+1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS bybit_executions_revision_update
+                AFTER UPDATE ON bybit_executions BEGIN
+                    INSERT INTO bybit_ledger_revision(mode,orders,executions) VALUES (OLD.mode,0,1)
+                    ON CONFLICT(mode) DO UPDATE SET executions=executions+1;
+                    INSERT INTO bybit_ledger_revision(mode,orders,executions) VALUES (NEW.mode,0,1)
+                    ON CONFLICT(mode) DO UPDATE SET executions=executions+CASE WHEN NEW.mode IS OLD.mode THEN 0 ELSE 1 END;
+                END;
+                CREATE TRIGGER IF NOT EXISTS bybit_executions_revision_delete
+                AFTER DELETE ON bybit_executions BEGIN
+                    INSERT INTO bybit_ledger_revision(mode,orders,executions) VALUES (OLD.mode,0,1)
+                    ON CONFLICT(mode) DO UPDATE SET executions=executions+1;
+                END;
+                CREATE TABLE IF NOT EXISTS bybit_transaction_revision (
+                    mode TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TRIGGER IF NOT EXISTS bybit_transactions_revision_insert
+                AFTER INSERT ON bybit_transactions BEGIN
+                    INSERT INTO bybit_transaction_revision(mode,revision) VALUES (NEW.mode,1)
+                    ON CONFLICT(mode) DO UPDATE SET revision=revision+1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS bybit_transactions_revision_update
+                AFTER UPDATE ON bybit_transactions
+                WHEN OLD.mode IS NOT NEW.mode OR OLD.transaction_id IS NOT NEW.transaction_id OR
+                     OLD.category IS NOT NEW.category OR OLD.symbol IS NOT NEW.symbol OR
+                     OLD.currency IS NOT NEW.currency OR OLD.transaction_time_ms IS NOT NEW.transaction_time_ms OR
+                     OLD.funding IS NOT NEW.funding OR OLD.fee IS NOT NEW.fee OR
+                     OLD.cash_flow IS NOT NEW.cash_flow OR OLD.change_amount IS NOT NEW.change_amount OR
+                     OLD.value IS NOT NEW.value
+                BEGIN
+                    INSERT INTO bybit_transaction_revision(mode,revision) VALUES (OLD.mode,1)
+                    ON CONFLICT(mode) DO UPDATE SET revision=revision+1;
+                    INSERT INTO bybit_transaction_revision(mode,revision) VALUES (NEW.mode,1)
+                    ON CONFLICT(mode) DO UPDATE SET revision=revision+CASE WHEN NEW.mode IS OLD.mode THEN 0 ELSE 1 END;
+                END;
+                CREATE TRIGGER IF NOT EXISTS bybit_transactions_revision_delete
+                AFTER DELETE ON bybit_transactions BEGIN
+                    INSERT INTO bybit_transaction_revision(mode,revision) VALUES (OLD.mode,1)
+                    ON CONFLICT(mode) DO UPDATE SET revision=revision+1;
+                END;
+            """)
 
     def _now_ms(self):
         return round(_clock_value(self.clock) * 1000)
@@ -700,6 +789,32 @@ class BybitAdapter:
             return db.execute("SELECT * FROM bybit_orders WHERE mode=? AND order_link_id=?",
                               (self.mode, order_link_id)).fetchone()
 
+    def local_order(self, order_link_id):
+        """Look up one locally journaled order without reconciling the venue."""
+        if not isinstance(order_link_id, str) or not order_link_id:
+            return None
+        return self._order_view(self._order_row(order_link_id))
+
+    def accounting_revision(self):
+        """Return durable per-mode order and execution revisions for safe cache keys.
+
+        SQLite triggers advance these counters for supported writes and direct
+        durable row changes. Timestamp-only order refreshes do not invalidate
+        accounting reconstruction; late executions and ownership/fill updates do.
+        """
+        with self.store.connection() as db:
+            row = db.execute('SELECT orders,executions FROM bybit_ledger_revision WHERE mode=?',
+                             (self.mode,)).fetchone()
+        return {'orders': int(row['orders']), 'executions': int(row['executions'])} if row else {
+            'orders': 0, 'executions': 0}
+
+    def transaction_revision(self):
+        """Return the durable transaction-ledger revision for this adapter mode."""
+        with self.store.connection() as db:
+            row = db.execute('SELECT revision FROM bybit_transaction_revision WHERE mode=?',
+                             (self.mode,)).fetchone()
+        return int(row['revision']) if row else 0
+
     def orders(self, *, status=None, category=None, symbol=None, limit=500):
         """Inspect the durable order ledger, including unknown outcomes."""
         if type(limit) is not int or not 1 <= limit <= 5000:
@@ -714,6 +829,88 @@ class BybitAdapter:
         with self.store.connection() as db:
             rows = db.execute(query, values).fetchall()
         return [self._order_view(row) for row in rows]
+
+    def active_orders(self, *, category=None, symbol=None):
+        """Read every unresolved local order using the status/instrument index.
+
+        This complete internal view is intentionally separate from the bounded
+        ``orders`` inspection API used by the UI.
+        """
+        statuses = sorted(ACTIVE_ORDERS)
+        clauses = ['mode=?', 'status IN (' + ','.join('?' for _ in statuses) + ')']
+        values = [self.mode, *statuses]
+        for field, value in (('category', category), ('symbol', symbol)):
+            if value is not None:
+                clauses.append(field + '=?')
+                values.append(value)
+        query = ('SELECT * FROM bybit_orders WHERE ' + ' AND '.join(clauses) +
+                 ' ORDER BY created_at_ms,order_link_id')
+        with self.store.connection() as db:
+            rows = db.execute(query, values).fetchall()
+        return [self._order_view(row) for row in rows]
+
+    def recent_order_count(self, *, since_ms):
+        """Count the complete local order window independently of display history."""
+        if type(since_ms) is not int or since_ms < 0:
+            raise ValueError('Order rate boundary must be a nonnegative millisecond timestamp')
+        with self.store.connection() as db:
+            return db.execute('SELECT COUNT(*) FROM bybit_orders WHERE mode=? AND created_at_ms>=?',
+                              (self.mode, since_ms)).fetchone()[0]
+
+    @staticmethod
+    def _ledger_batch_size(value):
+        if type(value) is not int or not 1 <= value <= 5000:
+            raise ValueError('Ledger page size must be from 1 to 5000')
+        return value
+
+    @staticmethod
+    def _ledger_cursor(value, label):
+        if value is None:
+            return None
+        if (not isinstance(value, (tuple, list)) or len(value) != 2 or
+                type(value[0]) is not int or value[0] < 0 or
+                not isinstance(value[1], str) or not value[1]):
+            raise ValueError(f'{label} cursor must be a (timestamp_ms, id) pair')
+        return value[0], value[1]
+
+    def _iter_ledger_rows(self, table, time_column, id_column, clauses, values,
+                          *, batch_size, after, decode):
+        """Keyset-page rows at a fixed insertion watermark; release DB locks before yields."""
+        batch_size = self._ledger_batch_size(batch_size)
+        cursor = self._ledger_cursor(after, f'{table} ledger')
+        with self.store.connection() as db:
+            # rowid is globally monotonic for these append-oriented ledgers;
+            # taking the table high-water mark uses SQLite's rowid index.
+            watermark = db.execute(f'SELECT COALESCE(MAX(rowid),0) FROM {table}').fetchone()[0]
+        while watermark:
+            page_clauses = [*clauses, 'rowid<=?']
+            page_values = [*values, watermark]
+            if cursor is not None:
+                page_clauses.append(f'({time_column},{id_column})>(?,?)')
+                page_values.extend(cursor)
+            query = (f'SELECT * FROM {table} WHERE ' +
+                     ' AND '.join(page_clauses) + f' ORDER BY {time_column},{id_column} LIMIT ?')
+            with self.store.connection() as db:
+                rows = db.execute(query, [*page_values, batch_size]).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                cursor = (int(row[time_column]), str(row[id_column]))
+                yield decode(row)
+            if len(rows) < batch_size:
+                return
+
+    def iter_orders(self, *, batch_size=1000, category=None, symbol=None, after=None):
+        """Iterate rows present at start, in creation order; mutable fields may refresh per page."""
+        batch_size = self._ledger_batch_size(batch_size)
+        self._ledger_cursor(after, 'bybit_orders ledger')
+        clauses, values = ['mode=?'], [self.mode]
+        for field, value in (('category', category), ('symbol', symbol)):
+            if value is not None:
+                clauses.append(field + '=?')
+                values.append(value)
+        return self._iter_ledger_rows('bybit_orders', 'created_at_ms', 'order_link_id',
+            clauses, values, batch_size=batch_size, after=after, decode=self._order_view)
 
     def submit_order(self, intent=None, **kwargs):
         """Persist an orderLinkId intent, then issue exactly one create request.
@@ -1193,6 +1390,19 @@ class BybitAdapter:
                                   (self.mode, limit)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def iter_executions(self, *, batch_size=1000, category=None, symbol=None, after=None):
+        """Iterate the complete local execution snapshot by (time, execId)."""
+        batch_size = self._ledger_batch_size(batch_size)
+        self._ledger_cursor(after, 'bybit_executions ledger')
+        clauses, values = ['mode=?'], [self.mode]
+        for field, value in (('category', category), ('symbol', symbol)):
+            if value is not None:
+                clauses.append(field + '=?')
+                values.append(value)
+        return self._iter_ledger_rows('bybit_executions', 'exec_time_ms', 'exec_id',
+            clauses, values, batch_size=batch_size, after=after,
+            decode=lambda row: json.loads(row['value']))
+
     def _apply_transaction(self, item):
         ident = item.get("id") or item.get("transactionId")
         if not isinstance(ident, str) or not ident:
@@ -1222,6 +1432,20 @@ class BybitAdapter:
                 rows = db.execute("SELECT value FROM bybit_transactions WHERE mode=? AND transaction_time_ms>=? ORDER BY transaction_time_ms LIMIT ?",
                                   (self.mode, since_ms, limit)).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def iter_transactions(self, *, batch_size=1000, since_ms=None, after=None):
+        """Iterate the complete local transaction snapshot by (time, transactionId)."""
+        batch_size = self._ledger_batch_size(batch_size)
+        self._ledger_cursor(after, 'bybit_transactions ledger')
+        clauses, values = ['mode=?'], [self.mode]
+        if since_ms is not None:
+            if type(since_ms) is not int or since_ms < 0:
+                raise ValueError('Transaction lower bound must be nonnegative milliseconds')
+            clauses.append('transaction_time_ms>=?')
+            values.append(since_ms)
+        return self._iter_ledger_rows('bybit_transactions', 'transaction_time_ms', 'transaction_id',
+            clauses, values, batch_size=batch_size, after=after,
+            decode=lambda row: json.loads(row['value']))
 
     def _pages(self, path, params, *, private=False, list_key="list", limit=200):
         cursor = None
@@ -1257,11 +1481,8 @@ class BybitAdapter:
             for page in self._pages("/v5/order/realtime", {"category": category, "openOnly": 0}, private=True, limit=50):
                 for item in page.get("list", []):
                     order_count += bool(self._apply_exchange_order(item))
-        with self.store.connection() as db:
-            tracked = db.execute("SELECT order_link_id,category,status FROM bybit_orders WHERE mode=? AND status!='rejected'",
-                                 (self.mode,)).fetchall()
-        for row in tracked:
-            if row["status"] in {"unknown", "submitting", "cancel_pending", "acknowledged", "open", "partially_filled"}:
+        for row in self.active_orders():
+            if row["status"] in RECONCILIATION_ORDER_STATUSES | {"open", "partially_filled"}:
                 self.query_order(row["order_link_id"], reconcile=False)
         # Account-wide execution recovery catches cancellation/fill races and
         # foreign activity without querying every historical order forever.
@@ -1342,7 +1563,7 @@ class BybitAdapter:
         # orders and includes orders created outside Prism in the direct query.
         self._reconcile_trades_and_orders()
         active_local = {'unknown', 'submitting', 'cancel_pending', 'acknowledged', 'open', 'partially_filled'}
-        if any(row['status'] in active_local for row in self.orders(category='linear', symbol=symbol, limit=5000)):
+        if any(row['status'] in active_local for row in self.active_orders(category='linear', symbol=symbol)):
             raise BybitError('Unresolved local linear orders prevent leverage changes')
 
         # No orderFilter includes active and conditional futures orders, while
@@ -1411,8 +1632,8 @@ class BybitAdapter:
         result = self._reconcile_trades_and_orders()
         account = self._account_snapshot(reconcile=False)
         result["account"] = account
-        result["reconciliation_required"] = any(order["status"] in {"unknown", "submitting", "cancel_pending", "acknowledged"}
-                                                  for order in self.orders(limit=5000))
+        result["reconciliation_required"] = any(order["status"] in RECONCILIATION_ORDER_STATUSES
+                                                  for order in self.active_orders())
         return result
 
     def _account_snapshot(self, *, reconcile):
@@ -1467,6 +1688,7 @@ class BybitAdapter:
         configured_linear = sorted({row["symbol"] for row in self.config.get("allowed_instruments", [])
                                     if row.get("category") == "linear"})
         mode_indices = {}
+        leverage_by_instrument = {}
         observed_leverages = [row["leverage"] for row in positions if row["quantity"] > 0 and row["leverage"] > 0]
         for position in positions:
             if position["quantity"] > 0:
@@ -1475,11 +1697,26 @@ class BybitAdapter:
             mode_result = self._request("GET", "/v5/position/list",
                                         params={"category": "linear", "symbol": symbol},
                                         private=self.mode != "paper")
-            mode_indices.setdefault(symbol, set()).update(int(row.get("positionIdx", -1))
-                                                           for row in mode_result.get("list", []))
-            observed_leverages.extend(value for value in
-                                     (_float(row.get("leverage"), "configured leverage", default=0)
-                                      for row in mode_result.get("list", [])) if value > 0)
+            mode_rows = mode_result.get("list")
+            if isinstance(mode_rows, list):
+                exact_rows = [row for row in mode_rows if isinstance(row, dict) and row.get("symbol") == symbol]
+                returned_rows = [row for row in mode_rows if isinstance(row, dict)]
+                indices = {int(row.get("positionIdx", -1)) for row in returned_rows}
+                if len(returned_rows) != len(mode_rows) or len(exact_rows) != len(mode_rows):
+                    indices.add(-1)
+                mode_indices.setdefault(symbol, set()).update(indices)
+                leverage_values = []
+                for row in exact_rows:
+                    try:
+                        leverage_values.append(float(_number(row.get("leverage"), "configured leverage", positive=True)))
+                    except (ValueError, TypeError, OverflowError):
+                        leverage_values = []
+                        break
+                if (exact_rows and len(exact_rows) == len(mode_rows) and
+                        mode_indices.get(symbol) == {0} and leverage_values and
+                        all(value == leverage_values[0] for value in leverage_values)):
+                    leverage_by_instrument[f"linear:{symbol}"] = leverage_values[0]
+                    observed_leverages.extend(leverage_values)
         now = self._now_ms()
         with self.store.connection() as db:
             db.execute("DELETE FROM bybit_positions WHERE mode=?", (self.mode,))
@@ -1512,10 +1749,11 @@ class BybitAdapter:
                    "usdt_wallet_balance": usdt.get("wallet_balance", 0), "usdt_available_balance": usdt.get("available_to_withdraw", 0),
                    "positions": positions, "currencies": currencies, "position_mode": position_mode,
                    "leverage": max(observed_leverages) if observed_leverages else (1.0 if not configured_linear else None),
+                   "leverage_by_instrument": leverage_by_instrument,
                    "protection_supported": bool(configured_linear) and position_mode == "one_way",
                    "protection_verified": bool(position_rows) and all(row["stop_loss"] > 0 for row in position_rows),
-                   "reconciliation_required": any(row["status"] in {"unknown", "submitting", "cancel_pending", "acknowledged"}
-                                                  for row in self.orders(limit=5000)),
+                   "reconciliation_required": any(row["status"] in RECONCILIATION_ORDER_STATUSES
+                                                  for row in self.active_orders()),
                    "risk_halted": False, "raw_account": account_info, "raw_wallet": wallet}
         with self.store.connection() as db:
             db.execute("INSERT INTO bybit_account_snapshots(mode,captured_at_ms,value) VALUES (?,?,?)",

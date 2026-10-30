@@ -14,6 +14,8 @@ import math
 import re
 import time
 
+from .risk_controls import ACTIVE_ORDERS
+
 
 REVIEW_SCHEMA = {
     'type': 'object',
@@ -196,6 +198,12 @@ class ResearchMemory:
     def record_execution(self, strategy_id, decision, *, positions=(), orders=(), fills=(), risk=None):
         _, _, experiment = self._lookup(strategy_id)
         key = 'strategy_execution_' + experiment['id']
+        orders = list(orders)
+        def order_priority(row):
+            stamp = row.get('updated_at_ms', row.get('created_at_ms', 0))
+            return (row.get('status') in ACTIVE_ORDERS,
+                    stamp if type(stamp) in (int, float) and math.isfinite(stamp) else 0)
+        ordered = sorted(orders, key=order_priority, reverse=True)
         with self.store._lock:
             context = self.store.get_document(key, {})
             history = {row['id']: row for row in context.get('decisions', []) if row.get('id')}
@@ -204,7 +212,10 @@ class ResearchMemory:
                 history[decision['id']] = deepcopy(decision)
             previous = deepcopy(context)
             context.update(decisions=list(history.values())[-32:], positions=list(positions)[:32],
-                           orders=list(orders)[-64:], fills=list(fills)[-64:])
+                           orders=ordered[:64], fills=list(fills)[-64:],
+                           reported_order_count=len(orders),
+                           reported_active_order_count=sum(row.get('status') in ACTIVE_ORDERS for row in orders),
+                           orders_truncated=len(orders) > 64)
             if risk is not None:
                 context['risk'] = deepcopy(risk)
             if not reconciled:

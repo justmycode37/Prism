@@ -1,7 +1,7 @@
 """Cascade-only SQLite journal, checkpoints, and atomic model-call accounting."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import copy
 import json
 import math
@@ -49,6 +49,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS cascade_handoffs (id TEXT PRIMARY KEY,cycle_id TEXT NOT NULL,value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS cascade_strategies (id TEXT PRIMARY KEY,value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS cascade_calls (id TEXT PRIMARY KEY,day TEXT NOT NULL,model TEXT NOT NULL,status TEXT NOT NULL,reserved REAL NOT NULL,charged REAL NOT NULL,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS cascade_call_rates (call_id TEXT PRIMARY KEY,input_per_million REAL NOT NULL,output_per_million REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_cascade_calls_day ON cascade_calls(day);
+                CREATE INDEX IF NOT EXISTS idx_cascade_calls_reserved ON cascade_calls(id) WHERE status='reserved';
                 CREATE TABLE IF NOT EXISTS cascade_events (id INTEGER PRIMARY KEY AUTOINCREMENT,timestamp TEXT NOT NULL,source TEXT NOT NULL,level TEXT NOT NULL,message TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS experiments (id TEXT PRIMARY KEY,ordinal INTEGER UNIQUE,spec TEXT,policy TEXT,context TEXT,status TEXT,registered_at_ms INTEGER,alpha_budget REAL,spec_hash TEXT);
                 CREATE TABLE IF NOT EXISTS experiment_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT,spec_hash TEXT,payload TEXT);
@@ -299,8 +302,8 @@ class Store:
         values = [json.loads(row[0]) for row in rows]
         return [row for row in values if stage is None or row['stage'] == stage]
 
-    def save_strategy(self, value):
-        with self.connection() as db:
+    def save_strategy(self, value, *, _db=None):
+        with self.connection() if _db is None else nullcontext(_db) as db:
             db.execute('INSERT INTO cascade_strategies VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value', (value['id'], encoded(value)))
 
     def commit_validation(self, cycle_id, trial_count, checkpoint):
@@ -319,27 +322,40 @@ class Store:
         config = self.config()
         return {'daily_limit_usd': config['daily_limit_usd'], 'spent_today_usd': row['spent'], 'reserved_usd': row['reserved'], 'calls_today': row['calls'], 'max_calls_per_day': config['max_calls_per_day']}
 
-    def reserve(self, model, input_bytes, output_tokens, now=None, context=None):
+    def reserve(self, model, input_bytes, output_tokens, now=None, context=None, *, _db=None):
+        """Reserve atomically, optionally inside a caller's journal transaction.
+
+        Agent request identity, attribution and all budget ledgers must commit
+        together before transport starts. ``_db`` is an internal transaction
+        boundary; callers must already hold an immediate write transaction.
+        """
+        if any(type(value) is not int or value < 0 for value in (input_bytes, output_tokens)):
+            raise ValueError('Reservation sizes must be nonnegative integers')
         current = time.time() if now is None else now
-        config = self.config()
-        prices = config['model_prices'][model]
-        # At most one token per UTF-8 byte plus prompt/schema overhead.
-        amount = ((input_bytes + 12000) * prices['input'] + output_tokens * prices['output']) / 1_000_000
-        with self._lock:
-            budget = self.budget(current)
-            if budget['max_calls_per_day'] is not None and budget['calls_today'] >= budget['max_calls_per_day']:
+        with self.connection() if _db is None else nullcontext(_db) as db:
+            if _db is None:
+                db.execute('BEGIN IMMEDIATE')
+            config = self.config()
+            prices = config['model_prices'][model]
+            # At most one token per UTF-8 byte plus prompt/schema overhead.
+            amount = ((input_bytes + 12000) * prices['input'] + output_tokens * prices['output']) / 1_000_000
+            day = timestamp(current)[:10]
+            budget = db.execute("SELECT COALESCE(SUM(charged),0) spent,"
+                "COALESCE(SUM(CASE WHEN status='reserved' THEN reserved ELSE 0 END),0) reserved,"
+                'COUNT(*) calls FROM cascade_calls WHERE day=?', (day,)).fetchone()
+            if config['max_calls_per_day'] is not None and budget['calls'] >= config['max_calls_per_day']:
                 raise BudgetExceeded('Daily model-call allowance exhausted.')
-            if budget['daily_limit_usd'] is not None and budget['spent_today_usd'] + budget['reserved_usd'] + amount > budget['daily_limit_usd']:
-                temporary = budget['spent_today_usd'] + amount <= budget['daily_limit_usd'] and budget['reserved_usd'] > 0
+            if config['daily_limit_usd'] is not None and budget['spent'] + budget['reserved'] + amount > config['daily_limit_usd']:
+                temporary = budget['spent'] + amount <= config['daily_limit_usd'] and budget['reserved'] > 0
                 raise BudgetExceeded('Model-spend reservation exceeds the daily ceiling.', temporary=temporary)
             call_id = uuid.uuid4().hex
-            with self.connection() as db:
-                db.execute('INSERT INTO cascade_calls VALUES (?,?,?,?,?,?,?)', (call_id, timestamp(current)[:10], model, 'reserved', amount, 0, timestamp(current)))
-                if context:
-                    db.execute('INSERT INTO attributed_calls VALUES (?,?,?,?)', (call_id, context.get('cycle_id'), context.get('agent_id'), context.get('experiment_id')))
+            db.execute('INSERT INTO cascade_calls VALUES (?,?,?,?,?,?,?)', (call_id, day, model, 'reserved', amount, 0, timestamp(current)))
+            db.execute('INSERT INTO cascade_call_rates VALUES (?,?,?)', (call_id, prices['input'], prices['output']))
+            if context:
+                db.execute('INSERT INTO attributed_calls VALUES (?,?,?,?)', (call_id, context.get('cycle_id'), context.get('agent_id'), context.get('experiment_id')))
         return call_id
 
-    def register_experiment(self, spec, *, policy, context, registered_at_ms=None):
+    def register_experiment(self, spec, *, policy, context, registered_at_ms=None, _db=None):
         from .analytics import canonical_spec
         spec = canonical_spec(spec)
         canon = lambda value: json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)
@@ -350,8 +366,9 @@ class Store:
             (isinstance(registered_at_ms, bool) or not isinstance(registered_at_ms, int)
              or registered_at_ms < 0)):
             raise ValueError('registered_at_ms must be a finite current or past epoch millisecond.')
-        with self.connection() as db:
-            db.execute('BEGIN IMMEDIATE')
+        with self.connection() if _db is None else nullcontext(_db) as db:
+            if _db is None:
+                db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM experiments WHERE spec_hash=?', (digest,)).fetchone()
             now = self._now_ms()
             if registered_at_ms is not None and registered_at_ms > now:
@@ -374,8 +391,8 @@ class Store:
         with self.connection() as db:
             return [self._exp(row) for row in db.execute('SELECT * FROM experiments ORDER BY ordinal DESC LIMIT ?', (limit,))]
 
-    def experiment(self, ident):
-        with self.connection() as db:
+    def experiment(self, ident, *, _db=None):
+        with self.connection() if _db is None else nullcontext(_db) as db:
             row = db.execute('SELECT * FROM experiments WHERE id=?', (ident,)).fetchone()
             if row is None:
                 return None
@@ -858,10 +875,10 @@ class Store:
                 observations.append(value | {'id': row['id']})
         return observations
 
-    def update_experiment_status(self, ident, status, reason):
+    def update_experiment_status(self, ident, status, reason, *, _db=None):
         if status not in {'registered', 'shadow', 'promoted', 'retired', 'rejected', 'inconclusive'}:
             raise ValueError('Invalid experiment status')
-        experiment = self.experiment(ident)
+        experiment = self.experiment(ident, _db=_db)
         if experiment is None:
             raise ValueError('Unknown experiment')
         if experiment['status'] in {'retired', 'rejected'} and status != experiment['status']:
@@ -878,8 +895,9 @@ class Store:
             report = forward_report(observations, {**config, 'research': research})
             if saved.get('phase') != 'forward' or saved.get('report', {}).get('status') != 'promoted' or report['status'] != 'promoted':
                 raise ValueError('Promotion requires reproducible registered prospective evidence')
-        with self.connection() as db:
-            db.execute('BEGIN IMMEDIATE')
+        with self.connection() if _db is None else nullcontext(_db) as db:
+            if _db is None:
+                db.execute('BEGIN IMMEDIATE')
             current = db.execute('SELECT status FROM experiments WHERE id=?', (ident,)).fetchone()
             if current['status'] in {'retired', 'rejected'} and status != current['status']:
                 raise ValueError('Retired experiments cannot be reactivated')
@@ -1012,17 +1030,28 @@ class Store:
                 'attribution': list(by_agent.values()), 'source_attribution': list(source_attribution.values()),
                 'causal_ablation_established': False, 'leaderboard': leaderboard}
 
-    def settle(self, call_id, usage=None):
+    def settle(self, call_id, usage=None, *, request_started=None):
         with self.connection() as db:
-            row = db.execute('SELECT * FROM cascade_calls WHERE id=?', (call_id,)).fetchone()
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT c.*,r.input_per_million,r.output_per_million FROM cascade_calls AS c '
+                'LEFT JOIN cascade_call_rates AS r ON r.call_id=c.id WHERE c.id=?', (call_id,)).fetchone()
             if not row or row['status'] != 'reserved':
                 return
             charge = row['reserved']
             status = 'unknown'
-            if isinstance(usage, dict) and all(isinstance(usage.get(k), int) and not isinstance(usage[k], bool) and usage[k] >= 0 for k in ('input_tokens', 'output_tokens')):
-                prices = self.config()['model_prices'][row['model']]
-                charge = (usage['input_tokens'] * prices['input'] + usage['output_tokens'] * prices['output']) / 1_000_000
-                status = 'settled'
+            # The configured amounts are local estimates, not a billing receipt.
+            # Preserve admission-time rates across config/deployment changes;
+            # a missing legacy receipt cannot justify releasing its ceiling.
+            rates = (row['input_per_million'], row['output_per_million'])
+            if request_started is False:
+                charge, status = 0., 'not_sent'
+            elif (all(isinstance(rate, (int, float)) and math.isfinite(rate) and rate >= 0 for rate in rates)
+                    and isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0 for k in ('input_tokens', 'output_tokens'))):
+                try:
+                    charge = (usage['input_tokens'] * rates[0] + usage['output_tokens'] * rates[1]) / 1_000_000
+                    status = 'settled'
+                except OverflowError:
+                    charge = math.inf
             if not math.isfinite(charge):
-                charge = row['reserved']
+                charge, status = row['reserved'], 'unknown'
             db.execute('UPDATE cascade_calls SET status=?,charged=? WHERE id=?', (status, charge, call_id))

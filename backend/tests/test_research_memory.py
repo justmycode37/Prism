@@ -51,6 +51,20 @@ class ResearchMemoryTests(unittest.TestCase):
         self.store.close()
         self.directory.cleanup()
 
+    def test_execution_context_keeps_unresolved_and_newest_orders_when_bounding_history(self):
+        orders = [{'order_link_id': 'old-unresolved', 'status': 'unknown', 'created_at_ms': 1}]
+        orders += [{'order_link_id': f'closed-{index:03d}', 'status': 'filled',
+                    'created_at_ms': index + 2} for index in range(70)]
+        self.memory.record_execution(self.strategy['id'], {'id': 'bounded-history', 'status': 'held'}, orders=orders)
+        context = self.store.get_document('strategy_execution_' + self.parent['id'])
+        self.assertEqual(len(context['orders']), 64)
+        self.assertEqual(context['orders'][0]['order_link_id'], 'old-unresolved')
+        self.assertEqual(context['orders'][1]['order_link_id'], 'closed-069')
+        self.assertNotIn('closed-000', {row['order_link_id'] for row in context['orders']})
+        self.assertEqual(context['reported_order_count'], 71)
+        self.assertEqual(context['reported_active_order_count'], 1)
+        self.assertTrue(context['orders_truncated'])
+
     def _save_evidence(self, ident, *, observed_at=None, content=None, symbols=None):
         stamp = datetime.fromtimestamp(observed_at if observed_at is not None else self.now, timezone.utc).isoformat()
         self.store.save_evidence([{'id': ident, 'source_url': 'https://example.invalid/' + ident,

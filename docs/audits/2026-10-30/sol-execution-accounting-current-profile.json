@@ -1,0 +1,68 @@
+{
+  "batch_size": 1000,
+  "benchmark": "prism_execution_accounting",
+  "fixture": "temp SQLite + PaperExchange + BybitAdapter",
+  "results": [
+    {
+      "cold_peak_bytes": 9910376,
+      "cold_scan_seconds": 0.895277,
+      "derived_owner_count": 1,
+      "derived_total_cost": 100.00000000001425,
+      "derived_total_quantity": 0.9999999999999062,
+      "insert_seconds": 0.563756,
+      "iterator_batch_size": 1000,
+      "ledger_iterator_scans": {
+        "executions": 1,
+        "orders": 1
+      },
+      "orders_and_executions": 10000,
+      "provider_requests": 0,
+      "retained_execution_projection": 64,
+      "retained_orders": 64,
+      "retained_owner_count": 1,
+      "retained_recent_fills": 64,
+      "revision": {
+        "executions": 10000,
+        "orders": 10000
+      },
+      "scope": "offline paper ledger only; fixture strategy ownership injected; no eligibility decision",
+      "source_execution_count": 10000,
+      "source_order_count": 10000,
+      "warm_mean_ms": 1.739404,
+      "warm_peak_bytes": 45989,
+      "warm_reads": 20,
+      "warm_total_seconds": 0.034788
+    },
+    {
+      "cold_peak_bytes": 40486088,
+      "cold_scan_seconds": 4.495942,
+      "derived_owner_count": 1,
+      "derived_total_cost": 499.99999999969026,
+      "derived_total_quantity": 5.000000000001686,
+      "insert_seconds": 2.958691,
+      "iterator_batch_size": 1000,
+      "ledger_iterator_scans": {
+        "executions": 1,
+        "orders": 1
+      },
+      "orders_and_executions": 50000,
+      "provider_requests": 0,
+      "retained_execution_projection": 64,
+      "retained_orders": 64,
+      "retained_owner_count": 1,
+      "retained_recent_fills": 64,
+      "revision": {
+        "executions": 50000,
+        "orders": 50000
+      },
+      "scope": "offline paper ledger only; fixture strategy ownership injected; no eligibility decision",
+      "source_execution_count": 50000,
+      "source_order_count": 50000,
+      "warm_mean_ms": 1.692194,
+      "warm_peak_bytes": 45989,
+      "warm_reads": 20,
+      "warm_total_seconds": 0.033844
+    }
+  ],
+  "warm_reads_per_count": 20
+}

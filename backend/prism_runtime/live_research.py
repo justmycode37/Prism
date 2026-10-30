@@ -154,10 +154,6 @@ class LiveResearch:
         if not evidence_ids or set(evidence_ids) != {x['id'] for x in sources}:
             raise ValueError('Existing source evidence is required')
         source_cost_usd, source_cost_complete = _source_cost(sources)
-        cap = self.store.config()['research']['max_shadow_candidates']
-        repeated = any(x['spec'] == spec and x['market_policy'] == market_policy for x in self.strategies())
-        if not repeated and sum(x.get('status') in {'shadow', 'paper', 'queued'} for x in self.store.strategies()) >= cap:
-            raise ValueError('Shadow-account capacity exhausted')
         config = self.store.config()
         risk, research = config['risk'], config['research']
         mode = _market_mode(market_policy)
@@ -188,34 +184,65 @@ class LiveResearch:
         if initial_equity != 10_000. or performance_basis != 'operating' or execution_identity is not None:
             policy['performance_basis'] = performance_basis
             policy['execution_identity'] = copy.deepcopy(execution_identity)
-        if parent_id:
-            parent = self.store.experiment(parent_id)
-            if not parent or parent['policy'].get('version') != PROTOCOL_VERSION:
-                raise ValueError('Bybit revisions require a Bybit parent')
-            if parent['spec'] == spec and parent['policy'] == policy:
-                raise ValueError('Revision must change its frozen rule or policy')
-            children = [x for x in self.store.experiments(limit=10000)
-                        if x['context'].get('parent_id', x['context'].get('parent_experiment_id')) == parent_id]
-            if not repeated and len(children) >= config['operations']['max_revisions_per_review']:
-                raise ValueError('Bounded revision branch allowance exhausted')
+        # Capacity is about creating a new frozen candidate, not merely reusing
+        # its signal rule. Equity, accounting basis and execution identity are
+        # part of the registered policy hash, so changing any of them consumes
+        # another shadow slot. Exact re-registration remains idempotent at cap.
+        policy_digest = hashlib.sha256((
+            json.dumps(spec, sort_keys=True, separators=(',', ':'), allow_nan=False) +
+            json.dumps(policy, sort_keys=True, separators=(',', ':'), allow_nan=False)
+        ).encode()).hexdigest()
         context = {
             'hypothesis': hypothesis, 'evidence_ids': list(evidence_ids),
             'historical_phase': 'development', 'information_cutoff_ms': self._now_ms(),
             'parent_id': parent_id, 'revision_rationale': rationale,
             'execution_universe': 'exact_bybit_metadata_required', 'config': config,
         }
-        experiment = self.store.register_experiment(spec, policy=policy, context=context)
-        existing = next((row for row in self.store.strategies() if row['id'] == experiment['id']), None)
-        if existing is None:
-            self.store.save_strategy({
-                'id': experiment['id'], 'version': experiment['id'], 'experiment_id': experiment['id'],
-                'name': hypothesis[:160], 'symbol': spec['symbol'], 'family': spec['kind'], 'spec': spec,
-                'market_policy': market_policy, 'policy_version': PROTOCOL_VERSION,
-                'status': 'shadow', 'phase': 'development', 'parent_id': parent_id,
-                'created_at': timestamp(self.clock()),
-                'reason': 'Awaiting separate development and prospective evidence',
-            })
-            self.store.update_experiment_status(experiment['id'], 'shadow', 'Explicit Bybit v2 prospective protocol')
+        with self.store.connection() as db:
+            # Serialize capacity admission across independent Store instances.
+            # Every following experiment/strategy/status write uses this same
+            # SQLite transaction; no local Python lock is treated as authority.
+            db.execute('BEGIN IMMEDIATE')
+            # The candidate policy stays frozen to its preparation inputs, but
+            # current resource ceilings may have tightened before admission.
+            # Read them after acquiring the write lock so another Store cannot
+            # change those limits between this check and insertion.
+            admission_config = self.store.config()
+            existing = db.execute('SELECT id FROM experiments WHERE spec_hash=?', (policy_digest,)).fetchone()
+            registered = (db.execute('SELECT 1 FROM cascade_strategies WHERE id=?',
+                                      (existing['id'],)).fetchone() is not None) if existing else False
+            active_candidates = db.execute("""SELECT COUNT(*) FROM cascade_strategies
+                WHERE json_extract(value,'$.status') IN ('shadow','paper','queued')""").fetchone()[0]
+            repeated = bool(registered)
+            if not repeated and active_candidates >= admission_config['research']['max_shadow_candidates']:
+                raise ValueError('Shadow-account capacity exhausted')
+            if parent_id:
+                parent = self.store.experiment(parent_id, _db=db)
+                if not parent or parent['policy'].get('version') != PROTOCOL_VERSION:
+                    raise ValueError('Bybit revisions require a Bybit parent')
+                if parent['spec'] == spec and parent['policy'] == policy:
+                    raise ValueError('Revision must change its frozen rule or policy')
+                children = db.execute('''SELECT context FROM experiments
+                    WHERE json_extract(context,'$.parent_id')=?
+                       OR json_extract(context,'$.parent_experiment_id')=?''',
+                    (parent_id, parent_id)).fetchall()
+                if (not repeated and len(children) >=
+                        admission_config['operations']['max_revisions_per_review']):
+                    raise ValueError('Bounded revision branch allowance exhausted')
+            experiment = self.store.register_experiment(spec, policy=policy, context=context, _db=db)
+            existing = db.execute('SELECT value FROM cascade_strategies WHERE id=?',
+                                  (experiment['id'],)).fetchone()
+            if existing is None:
+                self.store.save_strategy({
+                    'id': experiment['id'], 'version': experiment['id'], 'experiment_id': experiment['id'],
+                    'name': hypothesis[:160], 'symbol': spec['symbol'], 'family': spec['kind'], 'spec': spec,
+                    'market_policy': market_policy, 'policy_version': PROTOCOL_VERSION,
+                    'status': 'shadow', 'phase': 'development', 'parent_id': parent_id,
+                    'created_at': timestamp(self.clock()),
+                    'reason': 'Awaiting separate development and prospective evidence',
+                }, _db=db)
+                self.store.update_experiment_status(experiment['id'], 'shadow',
+                    'Explicit Bybit v2 prospective protocol', _db=db)
         return self.store.experiment(experiment['id'])
 
     def strategies(self):
@@ -919,30 +946,8 @@ class LiveResearch:
                                            (strategy_id, snapshot_id)).fetchone()
                 account_row = db.execute('SELECT value FROM live_research_v2_accounts WHERE experiment_id=?',
                                          (strategy_id,)).fetchone()
-                capture_count = db.execute('SELECT COUNT(*) FROM live_research_v2_captures WHERE experiment_id=?',
-                                           (strategy_id,)).fetchone()[0]
             if prior_capture:
                 return json.loads(prior_capture['value'])
-            if capture_count >= MAX_EVENT_CAPTURES:
-                # Long-running intrabar strategies must not stop accounting
-                # before their 60-day horizon. Preserve every daily proof and
-                # summarize only the oldest optional event-level detail.
-                with self.store.connection() as db:
-                    obsolete = db.execute('''SELECT c.snapshot_id,c.captured_at_ms
-                        FROM live_research_v2_captures c
-                        LEFT JOIN live_research_v2_days d ON d.experiment_id=c.experiment_id AND d.snapshot_id=c.snapshot_id
-                        WHERE c.experiment_id=? AND d.snapshot_id IS NULL
-                        ORDER BY c.captured_at_ms LIMIT ?''', (strategy_id, max(1, MAX_EVENT_CAPTURES // 10))).fetchall()
-                    for old in obsolete:
-                        db.execute('DELETE FROM live_research_v2_captures WHERE experiment_id=? AND snapshot_id=?',
-                                   (strategy_id, old['snapshot_id']))
-                        db.execute('DELETE FROM md_snapshot_pins WHERE id=?', (old['snapshot_id'],))
-                if obsolete:
-                    key = 'live_research_retention_' + strategy_id
-                    prior = self.store.get_document(key, {})
-                    self.store.set_document(key, {'omitted_event_captures': prior.get('omitted_event_captures', 0) + len(obsolete),
-                        'through_ms': obsolete[-1]['captured_at_ms'],
-                        'reason': 'Old optional event detail summarized; cumulative account and all UTC daily proofs retained.'})
             book = json.loads(account_row['value']) if account_row else self._new_book(policy)
             if not signal_required and not book.get('last_signal_key'):
                 return None
@@ -1019,6 +1024,34 @@ class LiveResearch:
             with self.store.connection() as db:
                 db.execute('BEGIN IMMEDIATE')
                 if capture:
+                    capture_count = db.execute('SELECT COUNT(*) FROM live_research_v2_captures WHERE experiment_id=?',
+                                               (strategy_id,)).fetchone()[0]
+                    if capture_count >= MAX_EVENT_CAPTURES:
+                        # Count/prune only when an event capture is about to be
+                        # inserted. Ordinary quote marks do not need retained
+                        # history size, and daily proof rows remain protected.
+                        obsolete = db.execute('''SELECT c.snapshot_id,c.captured_at_ms
+                            FROM live_research_v2_captures c
+                            LEFT JOIN live_research_v2_days d ON d.experiment_id=c.experiment_id AND d.snapshot_id=c.snapshot_id
+                            WHERE c.experiment_id=? AND d.snapshot_id IS NULL
+                            ORDER BY c.captured_at_ms LIMIT ?''',
+                            (strategy_id, max(1, MAX_EVENT_CAPTURES // 10))).fetchall()
+                        for old in obsolete:
+                            db.execute('DELETE FROM live_research_v2_captures WHERE experiment_id=? AND snapshot_id=?',
+                                       (strategy_id, old['snapshot_id']))
+                            db.execute('DELETE FROM md_snapshot_pins WHERE id=?', (old['snapshot_id'],))
+                        if obsolete:
+                            key = 'live_research_retention_' + strategy_id
+                            prior_row = db.execute('SELECT value FROM cascade_meta WHERE key=?', (key,)).fetchone()
+                            prior = json.loads(prior_row['value']) if prior_row else {}
+                            retention = {
+                                'omitted_event_captures': prior.get('omitted_event_captures', 0) + len(obsolete),
+                                'through_ms': obsolete[-1]['captured_at_ms'],
+                                'reason': ('Old optional event detail summarized; cumulative account and all UTC '
+                                           'daily proofs retained.'),
+                            }
+                            db.execute('INSERT INTO cascade_meta(key,value) VALUES (?,?) '
+                                'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, encoded(retention)))
                     db.execute('INSERT OR IGNORE INTO md_snapshot_pins VALUES (?)', (snapshot_id,))
                     db.execute('INSERT OR IGNORE INTO live_research_v2_captures VALUES (?,?,?,?)',
                                (strategy_id, snapshot_id, observation['captured_at_ms'], encoded(capture)))
@@ -1114,6 +1147,19 @@ class LiveResearch:
         allowed = config['live_execution']['eligible_strategy_versions']
         allocation = config['live_execution']['allocations'].get(strategy_id, 0.)
         reasons = list(report['reasons'])
+        experiment = self.store.experiment(strategy_id)
+        try:
+            with self.store.connection() as db:
+                row = db.execute('SELECT value FROM cascade_strategies WHERE id=?',
+                                 (strategy_id,)).fetchone()
+            strategy = json.loads(row['value']) if row else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            strategy = None
+        if (not experiment or not strategy or strategy.get('experiment_id') != strategy_id
+                or strategy.get('spec') != experiment.get('spec')
+                or strategy.get('market_policy') != experiment.get('policy', {}).get('market_policy')
+                or strategy.get('policy_version') != experiment.get('policy', {}).get('version')):
+            reasons.append('Selected strategy version does not match its frozen qualification policy')
         if strategy_id not in allowed or not allocation:
             reasons.append('Operator must allow this exact version and allocate capital')
         return {**report, 'eligible': report['eligible'] and not reasons,
