@@ -238,7 +238,9 @@ class SupportSwarmTests(unittest.TestCase):
             states = {row['snapshot_id']: row['status'] for row in db.execute('SELECT snapshot_id,status FROM support_reports')}
         self.assertEqual(states, {'s1': 'timeout', 's2': 'busy'})
         self.agents.delay = 0
-        retried = self.swarm.refresh('one', self.snapshot('s2'))
+        # The successful retry checks slot reuse, not a 5 ms scheduling budget.
+        # Thread scheduling and SQLite writes can exceed that budget on CI.
+        retried = self.swarm.refresh('one', self.snapshot('s2'), settings={'timeout_seconds': 2})
         self.assertTrue(all(item['status'] == 'completed' for item in retried['reports']))
         self.assertEqual(len(self.agents.calls), 8)
         with self.store.connection() as db:

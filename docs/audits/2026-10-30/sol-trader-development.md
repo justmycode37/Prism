@@ -303,6 +303,12 @@ build, and `git diff --check`. The offline renderer produced 53 fixtures.
 GitHub CI also runs the workspace and action-concurrency contracts for this
 change.
 
+The first GitHub run passed Python 3.12 and all native contracts. Python 3.13
+exposed a test timing assumption: a successful support retry reused the 5 ms
+timeout intended for the earlier timeout assertions. That retry now has a
+separate two-second budget; the original timeout and occupied-slot assertions
+remain. The corrected test passed 50 consecutive local runs.
+
 All work remained offline and paper-only. No installed service was started,
 real credential read, paid runtime request or venue order made. The user then
 requested final verification, a pull request and merge to main; those repository
