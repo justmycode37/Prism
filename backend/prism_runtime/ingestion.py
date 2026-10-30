@@ -27,6 +27,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
+from .research_sources import evidence_id, normalize_imported_records
 
 
 DEFAULT_SOURCES = []
@@ -85,9 +86,40 @@ def _iso(timestamp: float | None = None) -> str:
 
 def _canonical(url: str) -> str:
     parts = urlsplit(url)
+    if parts.username is not None or parts.password is not None:
+        raise CollectionError("Credentials in source URLs are blocked")
+    host = (parts.hostname or "").encode("idna").decode("ascii").lower()
+    port = parts.port
+    netloc = f"[{host}]" if ":" in host else host
+    if port and not ((parts.scheme.lower() == "http" and port == 80)
+                    or (parts.scheme.lower() == "https" and port == 443)):
+        netloc += f":{port}"
     query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
              if not k.lower().startswith("utm_") and k.lower() not in _TRACKERS]
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", urlencode(query), ""))
+    return urlunsplit((parts.scheme.lower(), netloc, parts.path or "/", urlencode(query), ""))
+
+
+def _youtube_video_id(url: str) -> str | None:
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if host not in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}:
+            return None
+        if parts.scheme.lower() != "https" or parts.username or parts.password or parts.port not in (None, 443):
+            return None
+        path = [segment for segment in parts.path.split("/") if segment]
+        if host == "youtu.be" and len(path) == 1:
+            value = path[0]
+        elif parts.path == "/watch":
+            ids = [value for key, value in parse_qsl(parts.query, keep_blank_values=True) if key == "v"]
+            value = ids[0] if len(ids) == 1 else ""
+        elif len(path) == 2 and path[0] in {"shorts", "embed", "live"}:
+            value = path[1]
+        else:
+            return None
+        return value if re.fullmatch(r"[A-Za-z0-9_-]{11}", value) else None
+    except ValueError:
+        return None
 
 
 def _number(value, default=None):
@@ -98,31 +130,62 @@ def _number(value, default=None):
         return default
 
 
+def _keyword_score(title: str, content: str, keywords) -> int:
+    title, content = title.casefold(), content.casefold()
+    score = 0
+    for value in keywords or []:
+        term = str(value).strip().casefold()
+        if not term:
+            continue
+        pattern = r"\s+".join(re.escape(part) for part in term.split())
+        matcher = re.compile(r"(?<!\w)" + pattern + r"(?!\w)")
+        score += 2 * bool(matcher.search(title)) + bool(matcher.search(content))
+    return score
+
+
 class _HTML(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.parts, self.links, self.title = [], [], []
         self.hidden = 0
+        self.excluded = 0
         self.in_title = False
+        self.metadata = {}
+        self.dates = []
 
     def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
         if tag in {"script", "style", "noscript", "template", "svg"}:
             self.hidden += 1
+        if tag in {"nav", "footer", "aside", "form", "button", "dialog"}:
+            self.excluded += 1
         if tag == "title":
             self.in_title = True
-        if tag == "a":
-            href = dict(attrs).get("href")
+        if tag == "meta":
+            name = (attributes.get("property") or attributes.get("name") or "").lower()
+            content = attributes.get("content", "").strip()
+            if name and content and name in {
+                "description", "og:title", "og:description", "article:published_time",
+                "date", "datepublished", "dc.date", "parsely-pub-date",
+            }:
+                self.metadata[name] = content
+        if tag == "time" and attributes.get("datetime"):
+            self.dates.append(attributes["datetime"])
+        if tag == "a" and not self.hidden and not self.excluded:
+            href = attributes.get("href")
             if href:
                 self.links.append(href)
 
     def handle_endtag(self, tag):
         if tag in {"script", "style", "noscript", "template", "svg"}:
             self.hidden = max(0, self.hidden - 1)
+        if tag in {"nav", "footer", "aside", "form", "button", "dialog"}:
+            self.excluded = max(0, self.excluded - 1)
         if tag == "title":
             self.in_title = False
 
     def handle_data(self, data):
-        if not self.hidden:
+        if not self.hidden and not self.excluded:
             self.parts.append(data)
             if self.in_title:
                 self.title.append(data)
@@ -259,6 +322,20 @@ class SourceCollector:
                          min(512, max(4, int(self.settings.get("max_requests", 160)))),
                          min(96, max(1, int(self.settings.get("max_pages", 48)))))
         evidence, markets, errors = [], [], []
+        imported = agent.get("imported_sources")
+        if imported is not None:
+            try:
+                normalized = normalize_imported_records(
+                    imported,
+                    provider=agent.get("imported_source_provider", "external"),
+                    max_items=min(32, max(1, int(self.settings.get("max_evidence", 128)))),
+                    max_total_bytes=min(256_000, self.max_bytes),
+                    max_content_chars=self.max_content,
+                )
+                evidence.extend(normalized["evidence"])
+                errors.extend(normalized["errors"])
+            except (TypeError, ValueError) as exc:
+                errors.append(f"Imported evidence: {type(exc).__name__}: {str(exc)[:160]}")
         explicit_agent_sources = agent.get("sources") is not None
         sources = agent.get("sources")
         if sources is None:
@@ -308,10 +385,23 @@ class SourceCollector:
                     errors.append(f"{label[:120]}: {type(exc).__name__}: {str(exc)[:200]}")
         unique = {}
         for item in evidence:
-            key = (item["source_url"], item.get("source_kind"))
+            origin = item.get("source_origin", "public")
+            kind = item.get("source_kind")
+            family_kind = "web" if origin == "public" and kind in {"news", "article"} else kind
+            key = (origin, family_kind, item["source_url"])
             existing = unique.get(key)
-            if existing is None or (len(item["content"]), bool(item.get("published_at"))) > (len(existing["content"]), bool(existing.get("published_at"))):
+            if existing is None:
                 unique[key] = item
+                continue
+            discovered = list(dict.fromkeys(existing.get("discovered_from", []) + item.get("discovered_from", [])))
+            score = lambda value: (value.get("source_kind") == "article", len(value.get("content", "")),
+                                   bool(value.get("published_at")), bool(value.get("primary_source")))
+            selected = item if score(item) > score(existing) else existing
+            selected = dict(selected)
+            if discovered:
+                selected["discovered_from"] = discovered
+            selected["id"] = evidence_id(selected)
+            unique[key] = selected
         max_evidence = min(256, max(1, int(self.settings.get("max_evidence", 128))))
         return {"evidence": list(unique.values())[:max_evidence], "markets": markets,
                 "errors": list(dict.fromkeys(errors))[:32]}
@@ -334,22 +424,25 @@ class SourceCollector:
                             if word not in {"and", "the", "for", "with", "from"}]
             if isinstance(keywords, str):
                 keywords = keywords.split()
-            ranked = []
+            ranked, errors = [], []
             for node in entries:
                 fields, link = {}, ""
                 for child in node:
-                    tag = child.tag.split("}")[-1]
+                    tag = child.tag.split("}")[-1].lower()
                     fields[tag] = "".join(child.itertext())
                     if tag == "link" and child.attrib.get("rel", "alternate") == "alternate":
                         link = child.attrib.get("href") or fields[tag]
                 link = link or fields.get("link", "")
+                if not link and fields.get("videoid"):
+                    link = "https://www.youtube.com/watch?v=" + fields["videoid"].strip()
                 if not link:
                     continue
                 content = fields.get("encoded") or fields.get("content") or fields.get("description") or fields.get("summary", "")
                 title = _plain(fields.get("title", ""), 400)
                 plain = _plain(content, self.max_content)
-                score = sum(str(word).lower() in (title + " " + plain).lower() for word in keywords)
-                published = fields.get("published") or fields.get("pubDate") or fields.get("updated", "")
+                score = _keyword_score(title, plain, keywords)
+                published = (fields.get("published") or fields.get("pubdate") or fields.get("updated")
+                             or fields.get("date") or fields.get("dc:date") or "")
                 article_url = urljoin(response["url"], link)
                 wrapper = urlsplit(article_url)
                 if wrapper.hostname == 'www.bing.com' and wrapper.path == '/news/apiclick.aspx':
@@ -359,26 +452,50 @@ class SourceCollector:
                     publisher = dict(parse_qsl(wrapper.query)).get('url', '')
                     if urlsplit(publisher).scheme == 'https':
                         article_url = publisher
-                ranked.append((score, self._evidence(article_url, "news", title, plain, agent, published)))
+                video_id = _youtube_video_id(article_url) or fields.get("videoid", "").strip()
+                if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                    article_url = "https://www.youtube.com/watch?v=" + video_id
+                    source_kind = "youtube"
+                else:
+                    source_kind = "news"
+                provenance = {"discovered_from": [response["url"]], "source_origin": "public",
+                              "acquisition_method": "public_feed"}
+                try:
+                    item = self._evidence(article_url, source_kind, title, plain, agent, published, provenance)
+                except CollectionError as exc:
+                    errors.append(f"Feed entry skipped: {str(exc)[:120]}")
+                    continue
+                if source_kind == "youtube":
+                    item["transcript_status"] = "not_in_public_feed"
+                    item["id"] = evidence_id(item)
+                ranked.append((score, item))
             ranked.sort(key=lambda row: row[0], reverse=True)
             count = min(32, max(1, int(self.settings.get("items_per_feed", 12))))
             evidence = [item for _, item in ranked[:count]]
-            errors = []
+            article_items = [(index, item) for index, item in enumerate(evidence)
+                             if item.get("source_kind") != "youtube"]
             article_count = min(8, max(0, int(self.settings.get("articles_per_feed", 3))))
             if self.settings.get("crawl_articles", True):
-                for index, item in enumerate(evidence[:article_count]):
+                for index, item in article_items[:article_count]:
                     try:
                         budget.take("pages")
                         article = self._fetch(item["source_url"], budget, respect_robots=True)
                         parser = self._parse_html(article)
                         if parser["content"]:
-                            evidence[index] = self._evidence(article["url"], "article", parser["title"] or item["title"],
-                                                              parser["content"], agent, item.get("published_at", ""))
+                            expanded = self._evidence(
+                                article["url"], "article", parser["title"] or item["title"], parser["content"], agent,
+                                parser.get("published_at") or item.get("published_at", ""),
+                                {"discovered_from": item.get("discovered_from", []), "source_origin": "public",
+                                 "acquisition_method": "public_article"},
+                            )
+                            evidence[index] = expanded
                     except Exception as exc:
                         errors.append(f"Article {item['source_url']}: {str(exc)[:160]}")
             return {"evidence": evidence, "errors": errors}
         parser = self._parse_html(response)
-        evidence = [self._evidence(response["url"], "article", parser["title"], parser["content"], agent)]
+        evidence = [self._evidence(response["url"], "article", parser["title"], parser["content"], agent,
+                                   parser.get("published_at"), {"discovered_from": [response["url"]],
+                                   "source_origin": "public", "acquisition_method": "public_html"})]
         seen = {response["url"]}
         depth = min(2, max(0, int(self.settings.get("crawl_depth", 1))))
         frontier = [(urljoin(response["url"], link), 1) for link in parser["links"]]
@@ -386,8 +503,12 @@ class SourceCollector:
         crawl_count = min(16, max(0, int(self.settings.get("pages_per_site", 6))))
         while frontier and len(evidence) < crawl_count + 1:
             candidate, level = frontier.pop(0)
-            candidate = _canonical(candidate)
-            if level > depth or candidate in seen or urlsplit(candidate).netloc != urlsplit(url).netloc:
+            try:
+                candidate = _canonical(candidate)
+            except (CollectionError, ValueError, UnicodeError):
+                continue
+            if (level > depth or candidate in seen or urlsplit(candidate).netloc != urlsplit(url).netloc
+                    or _youtube_video_id(candidate)):
                 continue
             seen.add(candidate)
             if re.search(r"\.(pdf|zip|png|jpg|gif|mp4|css|js)$", urlsplit(candidate).path, re.I):
@@ -396,7 +517,9 @@ class SourceCollector:
                 budget.take("pages")
                 page = self._fetch(candidate, budget, respect_robots=True)
                 child = self._parse_html(page)
-                evidence.append(self._evidence(page["url"], "article", child["title"], child["content"], agent))
+                evidence.append(self._evidence(page["url"], "article", child["title"], child["content"], agent,
+                                               child.get("published_at"), {"discovered_from": [response["url"]],
+                                               "source_origin": "public", "acquisition_method": "public_html"}))
                 frontier.extend((urljoin(page["url"], link), level + 1) for link in child["links"][:32])
             except Exception as exc:
                 errors.append(f"Page {candidate}: {str(exc)[:160]}")
@@ -408,12 +531,36 @@ class SourceCollector:
             raise CollectionError("Article is not HTML or plain text")
         parser = _HTML()
         parser.feed(response["body"].decode("utf-8", errors="replace"))
-        return {"title": re.sub(r"\s+", " ", " ".join(parser.title)).strip()[:400],
-                "content": re.sub(r"\s+", " ", " ".join(parser.parts)).strip()[:self.max_content],
-                "links": parser.links[:100]}
+        title = re.sub(r"\s+", " ", " ".join(parser.title)).strip()
+        title = title or parser.metadata.get("og:title", "")
+        content = re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
+        content = content or parser.metadata.get("og:description") or parser.metadata.get("description", "")
+        published = (parser.metadata.get("article:published_time") or parser.metadata.get("datepublished")
+                     or parser.metadata.get("parsely-pub-date") or parser.metadata.get("dc.date")
+                     or parser.metadata.get("date") or next(iter(parser.dates), ""))
+        return {"title": title[:400], "content": content[:self.max_content],
+                "published_at": published, "links": parser.links[:100]}
 
-    def _evidence(self, url: str, kind: str, title: str, content: str, agent: dict, published: str = "") -> dict:
-        url = _canonical(url)
+    def _evidence(self, url: str, kind: str, title: str, content: str, agent: dict,
+                  published: str = "", provenance: dict | None = None) -> dict:
+        try:
+            parts = urlsplit(url)
+            if (parts.scheme.lower() not in {"http", "https"} or not parts.hostname
+                    or parts.username is not None or parts.password is not None
+                    or parts.port not in (None, 80, 443)):
+                raise CollectionError("Evidence link is not public HTTP(S)")
+            host = parts.hostname.encode("idna").decode("ascii").lower()
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                address = None
+            if ((address is not None and not address.is_global)
+                    or host in {"localhost", "localhost.localdomain"}
+                    or host.endswith((".localhost", ".local", ".internal"))):
+                raise CollectionError("Evidence link is not a public host")
+            url = _canonical(url)
+        except ValueError as exc:
+            raise CollectionError("Evidence link is not public HTTP(S)") from exc
         if urlsplit(url).scheme not in {"http", "https"}:
             raise CollectionError("Evidence link is not HTTP(S)")
         symbols = [agent["symbol"]] if kind in {"market", "chart"} and agent.get("symbol") else []
@@ -435,8 +582,31 @@ class SourceCollector:
         item['event_identity'] = item['content_hash']
         item['source_family'] = urlsplit(url).hostname or ''
         item['primary_source'] = item['source_family'] == 'sec.gov' or item['source_family'].endswith('.sec.gov') or 'investor' in item['source_family']
-        snapshot = {key: value for key, value in item.items() if key not in {'observed_at', 'first_observed_at', 'available_at'}}
-        item["id"] = "ev_" + sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:24]
+        supplied = dict(provenance or {})
+        discovered = supplied.pop("discovered_from", [])
+        if isinstance(discovered, str):
+            discovered = [discovered]
+        if isinstance(discovered, (tuple, list)):
+            urls = []
+            for value in discovered[:16]:
+                try:
+                    candidate_parts = urlsplit(str(value))
+                    if (candidate_parts.scheme.lower() in {"http", "https"} and candidate_parts.hostname
+                            and candidate_parts.username is None and candidate_parts.password is None
+                            and candidate_parts.port in (None, 80, 443)):
+                        urls.append(_canonical(str(value)))
+                except (ValueError, UnicodeError, CollectionError):
+                    continue
+            if urls:
+                item["discovered_from"] = list(dict.fromkeys(urls))
+        if supplied or kind not in {"market", "chart"}:
+            item["source_origin"] = supplied.pop("source_origin", "public")
+            item["acquisition_method"] = supplied.pop(
+                "acquisition_method", "public_api" if kind in {"market", "chart"} else "public_source")
+        for key, value in supplied.items():
+            if key not in item and isinstance(key, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,39}", key):
+                item[key] = value
+        item["id"] = evidence_id(item)
         return item
 
     def _market(self, symbol: str, budget: _Budget, agent: dict) -> dict:

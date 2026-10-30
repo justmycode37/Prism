@@ -1,0 +1,88 @@
+{
+  "operations": {
+    "watchdog_seconds": 5,
+    "reconcile_seconds": 30,
+    "calendar_refresh_seconds": 300,
+    "max_pending_events": 1000,
+    "event_coalesce_seconds": 2,
+    "calendar_sources": [],
+    "calendar_required_coverage": ["earnings", "market_sessions", "economic"],
+    "review_sessions": 20,
+    "review_trades": 8,
+    "max_revisions_per_review": 2
+  },
+  "scheduler": {
+    "model": "gpt-6-luna",
+    "min_delay_seconds": 5,
+    "max_delay_seconds": 21600,
+    "watchdog_seconds": 60,
+    "max_tasks": 32
+  },
+  "resources": {
+    "scheduler": {
+      "model": "gpt-6-luna",
+      "reasoning_effort": "low",
+      "daily_calls": 96,
+      "daily_usd": 15.0,
+      "concurrency": 1,
+      "max_output_tokens": 4096
+    },
+    "discovery": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "medium",
+      "daily_calls": 96,
+      "daily_usd": 100.0,
+      "concurrency": 8,
+      "max_output_tokens": 8192
+    },
+    "review": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "medium",
+      "daily_calls": 32,
+      "daily_usd": 40.0,
+      "concurrency": 1,
+      "max_output_tokens": 8192
+    },
+    "execution": {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "high",
+      "daily_calls": 240,
+      "daily_usd": 150.0,
+      "concurrency": 1,
+      "max_output_tokens": 4096
+    }
+  },
+  "bybit": {
+    "mode": "paper",
+    "enabled": false,
+    "mainnet_enabled": false,
+    "account_id": "",
+    "account_type": "UNIFIED",
+    "position_mode": "one_way",
+    "allowed_categories": ["spot", "linear"],
+    "allowed_instruments": []
+  },
+  "live_execution": {
+    "policy_version": 2,
+    "enabled": false,
+    "eligible_strategy_versions": [],
+    "allocations": {},
+    "max_portfolio_notional": 1000.0,
+    "max_position_notional": 250.0,
+    "max_leverage": 1.0,
+    "max_margin_fraction": 0.2,
+    "max_daily_loss_usd": 25.0,
+    "max_drawdown_fraction": 0.1,
+    "max_spread_bps": 15.0,
+    "max_slippage_bps": 20.0,
+    "max_participation_fraction": 0.001,
+    "max_quote_age_seconds": 10.0,
+    "max_account_age_seconds": 60.0,
+    "max_decision_age_seconds": 30.0,
+    "max_orders_per_minute": 10,
+    "stop_loss_fraction": 0.03,
+    "position_ttl_seconds": 86400,
+    "kill_switch": false,
+    "require_exchange_protection": true
+  }
+}

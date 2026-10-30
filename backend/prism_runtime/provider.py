@@ -106,6 +106,25 @@ def output_schema(layer: str) -> dict:
 
 
 def _validate(value: Any, schema: dict, path: str = "output") -> None:
+    if 'oneOf' in schema:
+        matched = 0
+        for alternative in schema['oneOf']:
+            try:
+                _validate(value, alternative, path)
+                matched += 1
+            except ProviderError:
+                pass
+        if matched != 1:
+            raise ProviderError(f'Invalid {path}: exactly one alternative required')
+        return
+    if 'anyOf' in schema:
+        for alternative in schema['anyOf']:
+            try:
+                _validate(value, alternative, path)
+                return
+            except ProviderError:
+                pass
+        raise ProviderError(f'Invalid {path}: no permitted alternative')
     types = schema["type"]
     types = [types] if isinstance(types, str) else types
     matches = any(
@@ -113,6 +132,8 @@ def _validate(value: Any, schema: dict, path: str = "output") -> None:
         or (kind == "object" and isinstance(value, dict))
         or (kind == "array" and isinstance(value, list))
         or (kind == "string" and isinstance(value, str))
+        or (kind == "boolean" and type(value) is bool)
+        or (kind == "integer" and type(value) is int)
         or (kind == "number" and isinstance(value, (float, int))
             and not isinstance(value, bool) and math.isfinite(value))
         for kind in types
@@ -122,17 +143,19 @@ def _validate(value: Any, schema: dict, path: str = "output") -> None:
     if "enum" in schema and value not in schema["enum"]:
         raise ProviderError(f"Invalid {path}: unsupported value")
     if isinstance(value, dict):
-        if set(value) != set(schema["properties"]):
+        properties = schema.get('properties', {})
+        if not set(schema.get('required', properties)) <= set(value) or (schema.get('additionalProperties') is False and set(value) - set(properties)):
             raise ProviderError(f"Invalid {path}: missing or unexpected fields")
-        for name, child in schema["properties"].items():
-            _validate(value[name], child, f"{path}.{name}")
+        for name, child in properties.items():
+            if name in value:
+                _validate(value[name], child, f"{path}.{name}")
     elif isinstance(value, list):
         if len(value) > schema.get("maxItems", 100):
             raise ProviderError(f"Invalid {path}: too many items")
         for item in value:
             _validate(item, schema["items"], f"{path}[]")
-    elif isinstance(value, str) and len(value) > schema.get("maxLength", 100_000):
-        raise ProviderError(f"Invalid {path}: text is too long")
+    elif isinstance(value, str) and not schema.get('minLength', 0) <= len(value) <= schema.get("maxLength", 100_000):
+        raise ProviderError(f"Invalid {path}: text length outside allowed range")
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
         if value < schema.get("minimum", -math.inf) or value > schema.get("maximum", math.inf):
             raise ProviderError(f"Invalid {path}: number outside allowed range")

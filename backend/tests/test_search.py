@@ -22,8 +22,26 @@ class StrategySearchTests(unittest.TestCase):
                           'source_url': 'https://example.org/fixture', 'observed_at': cutoff}],
         }
 
+        self.data["markets"][0]["event_features"] = [{"id": "event-fixture", "symbol": "MRVL",
+            "available_at_ms": self.data["markets"][0]["candles"][90]["end_ms"],
+            "evidence_ids": ["fixture-source"], "surprise_z": 2.0}]
+
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_failed_search_releases_claim_and_unrelated_sources_are_only_dataset_lineage(self):
+        with patch('prism_runtime.datasets.analytics.validate_edges', side_effect=RuntimeError('fixture')):
+            with self.assertRaises(RuntimeError):
+                search_dataset(self.store, self.data, max_candidates=1)
+        report = search_dataset(self.store, self.data, max_candidates=1)
+        self.assertEqual(report['status'], 'complete')
+        self.assertEqual(report['results'][0]['evidence_ids'], [])
+        self.assertEqual(report['results'][0]['dataset_evidence_ids'], ['fixture-source'])
+
+    def test_event_grid_requires_event_features(self):
+        market = dict(self.data['markets'][0], event_features=[])
+        rows = generate_candidates([market], evidence_ids=['fixture-source'], max_candidates=100)
+        self.assertNotIn('event_surprise', {row['kind'] for row in rows})
 
     def test_grid_spans_all_families_and_supports_more_than_one_hundred_variants(self):
         rows = generate_candidates(self.data['markets'], evidence_ids=['fixture-source'], max_candidates=100)

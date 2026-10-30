@@ -90,8 +90,8 @@ def _row(record):
         start_date = end_date = None
 
     dataset_id = development.get('dataset_id') or context.get('dataset_id')
-    fingerprint = context.get('data_fingerprint') or validation.get('data_fingerprint')
-    input_snapshot = context.get('input_snapshot')
+    fingerprint = development.get('data_fingerprint') or validation.get('data_fingerprint') or context.get('data_fingerprint')
+    input_snapshot = development.get('input_snapshot') or context.get('input_snapshot')
     provenance_ref = dataset_id or input_snapshot
     missing_provenance = []
     if not provenance_ref:
@@ -146,7 +146,7 @@ def _row(record):
             'dataset_id': dataset_id,
             'input_snapshot': input_snapshot,
             'data_fingerprint': fingerprint,
-            'information_cutoff_ms': context.get('information_cutoff_ms'),
+            'information_cutoff_ms': development.get('information_cutoff_ms', context.get('information_cutoff_ms')),
             'source_families': context.get('source_families'),
             'universe_scope': context.get('universe_scope'),
             'coverage': coverage,
@@ -203,6 +203,8 @@ def _attach_provenance_records(db, rows):
                 provenance['coverage_status'] = 'gaps' if isinstance(gaps, list) and gaps else 'reported'
             if key.startswith('dataset_'):
                 provenance['source'] = record.get('source')
+                provenance['input_snapshot'] = record.get('snapshot_id', provenance['input_snapshot'])
+                provenance['data_fingerprint'] = record.get('fingerprint', provenance['data_fingerprint'])
                 provenance['universe_provenance'] = record.get('universe_provenance')
                 provenance['independently_verified'] = record.get('independently_verified')
 

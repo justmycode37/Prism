@@ -7,6 +7,7 @@ candidate-expansion hook as well as the offline research CLI.
 from __future__ import annotations
 
 from itertools import product
+from copy import deepcopy
 
 from .analytics import KINDS, canonical_spec, spec_hash
 
@@ -24,12 +25,50 @@ THRESHOLDS = {
 }
 
 
+def expand_hypothesis(proposal, *, max_candidates=16):
+    """Freeze nearby parameter variants of one source-supported mechanism.
+
+    Ordering depends only on the proposal and the published grid, never on
+    backtest outcomes. The original rule comes first; generated variants retain
+    its evidence, mechanism, horizon and invalidation, and stay in its family.
+    """
+    if isinstance(max_candidates, bool) or not isinstance(max_candidates, int) or not 1 <= max_candidates <= 128:
+        raise ValueError('Hypothesis breadth must be an integer from 1 to 128')
+    spec = canonical_spec(proposal)
+    anchor = deepcopy(proposal)
+    anchor.update(spec)
+    result = [anchor]
+    if max_candidates == 1:
+        return result
+    lookback, threshold = spec['parameters']['lookback'], spec['parameters']['threshold']
+    windows = sorted(set(DEFAULT_LOOKBACKS) | {lookback}, key=lambda value: (abs(value - lookback), value))
+    thresholds = sorted(set(THRESHOLDS[spec['kind']]) | {threshold}, key=lambda value: (abs(value - threshold), value))
+    coordinates = sorted(product(range(len(windows)), range(len(thresholds))),
+                         key=lambda pair: (sum(pair), max(pair), pair))
+    for window_rank, threshold_rank in coordinates:
+        parameters = {'lookback': windows[window_rank], 'threshold': thresholds[threshold_rank]}
+        if parameters == spec['parameters']:
+            continue
+        variant = deepcopy(anchor)
+        variant['parameters'] = parameters
+        variant['id'] = 'variant_' + spec_hash(variant)[:24]
+        variant['hypothesis'] = (str(anchor.get('hypothesis', 'Source-supported hypothesis'))[:3600]
+            + f" [Development variant: lookback {parameters['lookback']}, threshold {parameters['threshold']:g}.]")
+        variant['search_origin'] = {'method': 'predeclared-local-grid-v1',
+                                  'anchor_spec_hash': spec_hash(spec), 'development_only': True}
+        result.append(variant)
+        if len(result) >= max_candidates:
+            break
+    return result
+
+
 def candidate_space_size(markets, *, families=None, lookbacks=None, exclude_symbols=None):
     """Return the unbounded Cartesian grid size for the selected markets."""
     symbols = _symbols(markets, exclude_symbols=exclude_symbols)
     family_names = _families(families)
     windows = _lookbacks(lookbacks)
-    return len(symbols) * len(windows) * sum(len(THRESHOLDS[name]) for name in family_names)
+    return len(windows) * sum(len(THRESHOLDS[name]) for market in symbols for name in family_names
+                              if name != "event_surprise" or market.get("has_event_features"))
 
 
 def generate_candidates(markets, *, evidence_ids, max_candidates=DEFAULT_MAX_CANDIDATES,
@@ -60,6 +99,8 @@ def generate_candidates(markets, *, evidence_ids, max_candidates=DEFAULT_MAX_CAN
             continue
         threshold = thresholds[threshold_rank]
         for market in symbols:
+            if family == "event_surprise" and not market.get("has_event_features"):
+                continue
             proposal = {
                 "symbol": market["symbol"],
                 "kind": family,
@@ -96,7 +137,7 @@ def _symbols(markets, *, exclude_symbols=None):
         if not isinstance(symbol, str) or not symbol.strip():
             continue
         normalized = symbol.strip().upper()
-        unique.setdefault(normalized, {"symbol": normalized, **(
+        unique.setdefault(normalized, {"symbol": normalized, "has_event_features": bool(market.get("event_features")), **(
             {"security_id": market["security_id"]} if market.get("security_id") else {})})
     if not unique:
         raise ValueError("No eligible market symbols for candidate expansion")

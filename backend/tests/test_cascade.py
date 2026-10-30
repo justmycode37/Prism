@@ -28,7 +28,7 @@ def market_fixture():
                      'open': price, 'high': max(price, close) * 1.0001, 'low': min(price, close) * .9999,
                      'close': close, 'volume': 10, 'closed': True})
         price = close
-    return {'symbol': 'MRVL', 'price': price, 'change_24h': .01, 'funding_rate': None,
+    return {'symbol': 'MRVL', 'asset_class': 'fixture', 'price': price, 'change_24h': .01, 'funding_rate': None,
             'updated_at': timestamp(), 'as_of_ms': int(time.time() * 1000), 'candles': bars}
 
 
@@ -81,6 +81,7 @@ class CascadeTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.directory.name) / 'cascade.sqlite3')
+        self.store.update_config({'research': {'variants_per_hypothesis': 1}})
         self.collector = Collector()
         self.provider = Provider()
         self.runtime = Runtime(self.store, key_loader=lambda: 'test-only', collector=self.collector, provider=self.provider)

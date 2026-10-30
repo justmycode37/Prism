@@ -1,18 +1,20 @@
 # Runtime
 
-Prism is a standard-library Python service behind a SwiftUI macOS console. It researches AI infrastructure equities and simulates trades only. Starting a process begins paused; closing the console does not stop an installed background service.
+Prism is a standard-library Python service behind a SwiftUI macOS console. It contains the existing daily-equity v1 paper-research lane and a separate event-driven Bybit v2 research/execution lane. Bybit mainnet and live execution are disabled by default. Starting or restarting the service leaves it paused; closing the console does not stop an installed background service. See [Continuous runtime](ContinuousRuntime.md) for v2 workers, Bybit controls, source-backed scheduling, credentials, and cost estimates.
 
 ## Operation and research efficiency
 
-Install with `python3 scripts/prismctl.py install`. Use `status`, `start`, `pause`, `resume`, `stop` and `run` for service control. The Mac must remain awake and connected for opening observations and risk checks. Implementation verification does not start this service or use its credentials.
+Install with `python3 scripts/prismctl.py install`; use `status`, `start`, `pause`, `resume`, `stop`, `run`, `configure`, `register`, `calendar`, and `review` as appropriate. Install and every process restart start paused. If Bybit is configured, the runtime still reads and reconciles the account while paused after restart, so activity from downtime can be recovered before discretionary execution resumes. Exposure detection checks the durable order journal as well as the account projection. Operator configuration changes and exchange execution mutations share a lock. The Mac must remain awake and connected for market observations, event handling, and risk checks. This documentation update used no credentials, installed service, or paid research cycle.
 
-The available roster is 24 GPT-6 Luna low collectors, six GPT-6.1 Sol medium analysts, two GPT-6 Astra high strategists and one GPT-6 Astra max executor. Defaults activate six collectors and two analysts. Default concurrency is eight, configurable up to 32. Deterministic selection and authorization avoid strategist/executor calls; optional model reviews are recorded advisory comparisons. They do not drive fills.
+The daily-equity v1 worker still uses six collectors and two analysts by default from its larger fixed roster. Its strategist and executor reviews remain optional advisory comparisons, disabled by default; their outputs do not drive candidate selection or simulated fills. This describes only the v1 research roles. The separate v2 scheduler, Bybit discovery and review workers, and actual GPT-6 Astra Responses execution lane are described in [Continuous runtime](ContinuousRuntime.md) and [Agent procedures](Agents.md).
 
-Research checks for changed information hourly by default, and discovery is cached for one day. Acquisition completes before model fan-out. Content identities, closed daily bars, features, policy and role instructions form a material-input fingerprint. Unchanged cycles reuse prior research without new model calls. Quote refresh and risk processing run independently every 60 seconds while active. The working set and advisory switches are configurable; available roster size is not evidence of investment value.
+There is no hourly primary cadence in the continuous runtime. Durable source events, market boundaries, account changes, review triggers, data freshness, and scheduled deadlines wake independent workers; a watchdog recovers work but does not imply a model call every hour. Unchanged research inputs can still reuse stored results. V1 daily equity rules and qualification gates are unchanged.
 
-Model-call reservations are reconciled against usage. Unknown remote outcomes retain conservative charges. Existing optional spending/call ceilings remain available, and null explicitly disables a ceiling. Model prices are operator-supplied local estimates, not invoices. Costs are attributed to cycles, roles and candidate experiments; candidate outcomes and source attribution are observational, not established causal ablation results.
+Model-call reservations are reconciled against usage; unknown remote outcomes retain conservative charges. The v1 global spending/call ceilings are operator configurable, and `null` disables a ceiling. V2 has separate component call/USD caps plus the same optional shared global caps. Configured model rates are local reservation estimates, not invoices or published pricing. Costs and review outcomes are diagnostics, not causal ablation results.
 
-Example partial configuration:
+### Daily-equity v1 research configuration
+
+Example partial v1 configuration:
 
 ```json
 {
@@ -34,7 +36,7 @@ Example partial configuration:
 
 Save it and use `python3 scripts/prismctl.py configure --config-file /path/to/settings.json`. The actual observation requirement can exceed `min_forward_sessions`: blocks also span at least the lookback and holding horizon, and significance can require more blocks. Defaults are not a promise of admission after 60 days. Changing a rule, execution policy, review protocol or implementation creates a new identity; it cannot rewrite earlier forward evidence.
 
-## Evidence and information availability
+## Daily-equity v1 evidence and information availability
 
 The AI infrastructure catalogue discovers current listed companies up to its configured limit, with observable source failures and seed fallback. Listing checks and topical matches are not verified revenue exposure or a survivorship-safe historical universe. Membership records identify their current observation basis.
 
@@ -44,7 +46,7 @@ Evidence preserves publication, observation, availability, content identity, sou
 
 Supported rule families are momentum, mean reversion, breakout and bounded event surprise. An event feature requires explicit finite numeric actual and nonzero expectation values, a prior expectation timestamp, event/publication times and supporting evidence. Its availability is no earlier than actual observation. Headline sentiment and model confidence cannot become numeric return features.
 
-## Market data and execution
+## Daily-equity v1 market data and execution
 
 The default Yahoo chart endpoint is unofficial and may be delayed or revised. It supplies adjusted development charts, separate vendor OHLC rows, actual quote time, available current regular-session metadata and split/dividend events. Only prior local dates enter closed daily history. Source timestamps are never reset to fetch time.
 
@@ -56,7 +58,7 @@ Default entry budgets are 10% per symbol, 30% gross and 10% correlated exposure,
 
 Splits adjust shares idempotently. Dividend entitlements increase receivables, not spendable cash; known payable dates settle them. Partial exits do not count as completed round trips. A 10% drawdown or kill switch halts entries. Exits still need observed prices and participation capacity; the console distinguishes a halt from complete liquidation and marks incomplete valuations.
 
-## Experiments and prospective admission
+## Daily-equity v1 experiments and prospective admission
 
 Every canonical candidate is registered with a frozen rule, policy, input snapshot, lineage, code/model/prompt/config versions and start time. Repeated equivalent proposals append attempts without resetting that start. Development evaluations, including failures and stress reports, are append-only. Current history is development data, regardless of chronological partitions.
 
@@ -84,4 +86,6 @@ Universe rows carry `security_id`, `symbol`, `valid_from`, optional `valid_to`, 
 
 `PRISM_STATE_DIR` and `PRISM_CONTROL_TOKEN_FILE` choose the state/token locations. The default journal is `.prism-runtime/cascade.sqlite3`; private files retain restricted permissions. `/v1/state`, `/v1/control` and `/v1/config` remain bearer-authenticated on `127.0.0.1:8787` and reject browser origins.
 
-The OpenAI key comes from `PRISM_OPENAI_KEY_FILE`, `OPENAI_API_KEY`, the private runtime key file or existing Keychain integration. Models never receive credentials. On protocol upgrade, prior research and any nonempty simulated account are archived before a separate prospective account begins. No broker adapter or real-order capability is added.
+The daily-equity OpenAI key comes from `PRISM_OPENAI_KEY_FILE`, `OPENAI_API_KEY`, the private runtime key file or existing Keychain integration. Models never receive credentials. On protocol upgrade, prior research and any nonempty simulated account are archived before a separate prospective account begins. This legacy v1 equity lane is still paper-only.
+
+The distinct Bybit v2 credential schema, UID checks, mainnet activation gates, mode-namespaced ledgers, and flat/paused/restart requirements are documented in [Continuous runtime](ContinuousRuntime.md). Cash Spot uses a verified exchange conditional sell stop for protection, and linear positions use verified exchange-side stops. Mainnet and live execution remain disabled by default unless an operator configures every gate and presses Start. Current offline request-size and workload estimates are in [OperationalCosts.json](OperationalCosts.json); they use local rate assumptions and are not a provider bill.

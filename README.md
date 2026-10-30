@@ -1,60 +1,53 @@
 # Prism
 
-Prism is a native macOS console for a paper-only research harness focused on public equities involved in AI infrastructure. It gathers public reporting, company material, market charts and other evidence, then routes that material through a fixed reverse cascade. Example symbols include MRVL, NBIS, APLD, CRWV, IREN and MU; they are discovery seeds, not an allowlist. The sector catalogue is dynamic and can discover additional qualifying public companies.
+Prism is a native macOS console and a Python research runtime with two lanes: the existing paper-only daily-equity v1 research protocol and an event-driven Bybit v2 research and execution protocol. Bybit mainnet and live execution are disabled by default. Historical measurements remain development evidence; a leaderboard or backtest result does not establish profitability or grant order authority.
 
-The application has **33 agents** with fixed model routing:
+## Start here
 
-| Layer | Agents | Model | Reasoning |
-| --- | ---: | --- | --- |
-| Collect | 24 | GPT-6 Luna | Low |
-| Analyze | 6 | GPT-6.1 Sol | Medium |
-| Strategize | 2 | GPT-6 Astra | High |
-| Execute | 1 | GPT-6 Astra | Max |
+- [Documentation index](docs/README.md) separates operator guidance from architecture and research methods.
+- [Research workflow](docs/ResearchWorkflow.md) explains source review, hypothesis variation, screening, and how to read the development leaderboard.
+- [Architecture](docs/Architecture.md) describes the implemented data flow and layer boundaries.
+- [Research contract](docs/ResearchContract.md) defines experiment identity, statistical gates, and prospective evidence.
+- [Agent procedures](docs/Agents.md) links the executable model manuals and their actual request limits.
+- [Runtime guide](docs/Runtime.md) covers installation, controls, configuration, data, and storage.
+- [Continuous runtime](docs/ContinuousRuntime.md) describes independent workers, source-backed scheduling, durable research dossiers, Bybit identity and operator gates, and offline operating-cost estimates.
+- [Operational cost fixture report](docs/OperationalCosts.json) records request sizes, token assumptions, lane caps, and workload scenarios without live model calls.
 
-The table describes available roles. Defaults activate six collectors and two analysts, with deterministic candidate selection and execution authorization. Optional strategist/executor calls are advisory comparisons. Unchanged evidence and daily histories skip repeated model work. Default concurrency is 8, configurable up to 32. The runtime uses the existing OpenAI credential integration; Gemini is not a runtime provider.
+## Runtime
 
-Historical results are **development evidence**. Candidates are registered before evaluation and run in independent prospective shadow accounts. Promotion to the aggregate paper portfolio requires future observations, operating returns, stock/market/sector comparisons, and predeclared statistical reviews. A shared daily engine owns replay and forward orders, costs, exposure budgets, corporate actions and accounting. Current public data does not establish profitability or verified historical execution coverage.
-
-## Run
-
-The app requires macOS 26+ and Xcode 26+. The local backend uses Python 3.12+ and its standard library.
+The app requires macOS 26+ and Xcode 26+. The local backend uses Python 3.12+ and its standard library. New installs and process restarts start paused; closing the console does not stop the installed service. Use the [runtime guide](docs/Runtime.md) and [continuous-runtime guide](docs/ContinuousRuntime.md) for operator commands and controls.
 
 ```sh
 xcodebuild -project Prism.xcodeproj -scheme Prism -configuration Debug -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
 ```
 
-Install and control the local background service:
+## Offline dataset research
+
+The research CLI uses an explicit versioned JSON dataset and a temporary SQLite journal. It does not need the installed service, model credentials, or network access. `search` runs a bounded deterministic grid; see the [workflow guide](docs/ResearchWorkflow.md) for a complete example and interpretation limits.
 
 ```sh
-python3 scripts/prismctl.py install
-python3 scripts/prismctl.py status
-python3 scripts/prismctl.py start
-python3 scripts/prismctl.py stop
+python3 scripts/research.py search --journal /tmp/prism-search.sqlite3 \
+  --dataset /path/to/offline-dataset-v1.json --max-candidates 256 \
+  --families momentum mean_reversion breakout event_surprise \
+  --lookbacks 3 5 8 10 15 20 30 40 60 80 100 \
+  --output /tmp/prism-search-report.json
 ```
 
-The runtime starts paused in `.prism-runtime/cascade.sqlite3`. Its OpenAI credential comes from `PRISM_OPENAI_KEY_FILE`, `OPENAI_API_KEY`, or the existing private runtime credential/Keychain entry. Closing the console does not stop the installed service. Read [Runtime](docs/Runtime.md) for configuration and controls.
+Dataset requirements and provider-declared provenance are covered in [Runtime](docs/Runtime.md). A synthetic or vendor-declared input remains development evidence; it is not independently verified by import.
+
+## Continuous operations
+
+The event-driven runtime reacts to market boundaries, account events, sourced calendar records, review conditions, and freshness changes. It includes paper Bybit execution and a real-order adapter, but live execution and mainnet both remain disabled until an operator configures the exact instrument and version allowlists, the full risk envelope, a private mode-specific credential, and the mainnet opt-in. Cash Spot uses verified exchange conditional stops; linear perpetuals use verified exchange position stops. See [Continuous runtime](docs/ContinuousRuntime.md) before changing those controls. The safe disabled configuration is [examples/operator-config.json](examples/operator-config.json); [examples/calendar.json](examples/calendar.json) is an expired synthetic schema fixture.
+
+## Development checks
 
 ```sh
 PYTHONPATH=backend python3 -m unittest discover -s backend/tests -v
 scripts/check-ui-contract.sh
 ```
 
-## Documentation
+These checks use local fixtures. They do not start the installed service. See [Validation](docs/Validation.md) for known limits and [Profitability readiness](docs/ProfitabilityReadiness.md) for the recorded readiness assessment.
 
-- [Architecture](docs/Architecture.md): evidence flow and layer boundaries.
-- [Task procedures](docs/Agents.md): evidence checks, output contracts and abstention criteria for each stage.
-- [Runtime](docs/Runtime.md): catalogue, public sources and data limits.
-- [Validation](docs/Validation.md): verification results and data limitations.
-- [Research contract](docs/ResearchContract.md): frozen experiments, execution and promotion rules.
-- [Readiness assessment](docs/ProfitabilityReadiness.md): original findings and implementation follow-up.
+## Design notes
 
-Evaluate a versioned vendor dataset without credentials or a running service:
-
-```sh
-python3 scripts/research.py evaluate --journal /tmp/prism-research.sqlite3 \
-  --dataset /path/to/dataset.json --proposals /path/to/proposals.json --output /tmp/report.json
-```
-
-Dataset requirements and the distinction between provider declarations and independently verified data are described in [Runtime](docs/Runtime.md).
-
-The local glass prototype uses `PRISM_EXPERIMENTAL_GLASS` for private macOS rendering APIs. Remove that compilation condition to use the public `NSGlassEffectView` fallback. See [Design](docs/Design.md) and [third-party components](docs/ThirdParty.md).
+The glass prototype uses `PRISM_EXPERIMENTAL_GLASS` for private macOS rendering APIs. Remove that compilation condition to use the public `NSGlassEffectView` fallback. See [Design](docs/Design.md) and [third-party components](docs/ThirdParty.md).

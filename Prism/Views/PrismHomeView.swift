@@ -9,44 +9,23 @@ struct PrismHomeView: View {
         GeometryReader { geometry in
             ZStack {
                 GlassSurface(milkiness: preferences.milkiness)
-                HStack(spacing: 28) {
+                HStack(spacing: 24) {
                     navigationRail
-                    VStack(alignment: .leading, spacing: 20) {
-                        if runtime.selectedPage != .overview {
-                            HStack(spacing: 12) {
-                                if runtime.selectedPage == .settings {
-                                    Button { runtime.selectedPage = pageBeforeSettings } label: {
-                                        Image(systemName: "chevron.left").font(.system(size: 13)).frame(width: 28, height: 28)
-                                    }
-                                    .buttonStyle(.plain).glassEffect(.clear.interactive(), in: .circle)
-                                    .help("Back").accessibilityLabel("Back")
-                                }
-                                Text(runtime.selectedPage.title)
-                                    .font(.system(size: 24, weight: .medium, design: .rounded))
-                            }
-                            .padding(.top, 10).padding(.trailing, 36)
-                        }
+                    VStack(alignment: .leading, spacing: 18) {
+                        pageHeader
                         if !runtime.isConnected || runtime.errorMessage != nil { connectionNotice }
                         ScrollView {
-                            pageContent(availableHeight: geometry.size.height - 100)
-                                .frame(maxWidth: .infinity, alignment: .topLeading)
-                                .padding(.bottom, 10)
+                            pageContent(availableHeight: geometry.size.height - 126)
+                                .frame(maxWidth: 920, alignment: .topLeading)
+                                .frame(maxWidth: .infinity, alignment: .top)
+                                .padding(2).padding(.bottom, 12)
                         }
                         .scrollIndicators(.hidden)
                         .scrollContentBackground(.hidden)
                         .background(.clear)
                     }
                 }
-                .padding(28)
-            }
-            .overlay(alignment: .topTrailing) {
-                if runtime.selectedPage != .settings {
-                    Button { runtime.selectedPage = .settings } label: {
-                        Image(systemName: "gearshape").font(.system(size: 13)).frame(width: 32, height: 32)
-                    }
-                    .buttonStyle(.plain).glassEffect(.clear.interactive(), in: .circle)
-                    .help("Settings (⌘,)").accessibilityLabel("Settings").padding(18)
-                }
+                .padding(24)
             }
         }
         .ignoresSafeArea()
@@ -56,11 +35,38 @@ struct PrismHomeView: View {
         }
     }
 
+    private var pageHeader: some View {
+        HStack(spacing: 12) {
+            if runtime.selectedPage == .settings {
+                Button { runtime.selectedPage = pageBeforeSettings } label: {
+                    Image(systemName: "chevron.left").font(.system(size: 14, weight: .regular))
+                        .frame(width: 32, height: 32)
+                }
+                .buttonStyle(.plain).glassEffect(.clear.interactive(), in: .circle)
+                .help("Back").accessibilityLabel("Back")
+            }
+            Text(runtime.selectedPage.title)
+                .font(.system(size: 23, weight: .medium, design: .rounded))
+                .accessibilityAddTraits(.isHeader)
+            Spacer(minLength: 8)
+            if runtime.selectedPage != .settings {
+                Button { runtime.selectedPage = .settings } label: {
+                    Image(systemName: PrismPage.settings.symbol)
+                        .font(.system(size: 16, weight: .regular)).frame(width: 36, height: 36)
+                }
+                .buttonStyle(.plain).glassEffect(.clear.interactive(), in: .circle)
+                .help("Settings (⌘,)").accessibilityLabel("Settings")
+            }
+        }
+        .frame(minHeight: 36)
+        .padding(.horizontal, 4)
+    }
+
     private var navigationRail: some View {
         VStack(spacing: 8) {
             ForEach(PrismPage.mainSections) { page in navigationButton(page) }
         }
-        .padding(10).frame(width: 64)
+        .padding(8).frame(width: 60)
         .glassEffect(.clear, in: .rect(cornerRadius: 26))
         .frame(maxHeight: .infinity)
         .accessibilityElement(children: .contain).accessibilityLabel("Navigation")
@@ -70,29 +76,33 @@ struct PrismHomeView: View {
         let selected = runtime.selectedPage == page
         return Button { runtime.selectedPage = page } label: {
             Image(systemName: page.symbol)
-                .font(.system(size: 17, weight: selected ? .medium : .regular))
+                .font(.system(size: 18, weight: .regular))
+                .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(selected ? .primary : .secondary)
                 .frame(width: 44, height: 44).contentShape(Circle())
         }
         .buttonStyle(.plain)
         .background {
-            if selected { Circle().fill(.primary.opacity(0.065)) }
+            if selected { Circle().fill(.primary.opacity(0.085)) }
         }
         .help(page.title).accessibilityLabel(page.title).accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private var connectionNotice: some View {
         HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "circle.dotted").foregroundStyle(.secondary)
+            Image(systemName: "wifi.slash").font(.system(size: 12)).foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 4) {
-                Text(runtime.errorMessage ?? "Connecting…").font(.system(size: 11)).foregroundStyle(.secondary)
-                if runtime.state != nil && !runtime.isConnected {
-                    Text("Last received snapshot").font(.system(size: 10)).foregroundStyle(.tertiary)
+                Text(runtime.isConnected ? "Runtime notice" : (runtime.state == nil ? "Runtime offline" : "Offline · showing last snapshot"))
+                    .font(.system(size: 11, weight: .medium))
+                if let message = runtime.errorMessage {
+                    DisclosureGroup("Connection details") {
+                        Text(message).font(.system(size: 11)).textSelection(.enabled).padding(.top, 5)
+                    }.font(.system(size: 10)).foregroundStyle(.secondary)
                 }
             }
             Spacer(minLength: 0)
         }
-        .padding(.top, 8)
+        .padding(.horizontal, 4)
     }
 
     @ViewBuilder private func pageContent(availableHeight: CGFloat) -> some View {

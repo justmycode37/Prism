@@ -1,11 +1,12 @@
 import Foundation
 
-/// Verifies the cascade's real JSON state against the unchanged native UI model.
+/// Verifies runtime JSON and the leaderboard projection against native decoding contracts.
 @main
 struct RuntimeContractCheck {
     static func main() throws {
-        guard CommandLine.arguments.count == 2 else { throw Failure.invalid("Pass the state fixture path.") }
+        guard CommandLine.arguments.count == 3 else { throw Failure.invalid("Pass state and leaderboard fixture paths.") }
         let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+        let leaderboardData = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let state = try decoder.decode(RuntimeState.self, from: data)
@@ -14,6 +15,10 @@ struct RuntimeContractCheck {
         try require(state.research?.historicalResultsAreDevelopment == true && state.research?.experimentCount == 0,
                     "Development evidence and the prospective registry must reach the console.")
         try require(!state.runtime.openaiConfigured, "The contract fixture must use no provider credential.")
+        try require(state.operations?.mode == "paper" && state.operations?.enabled == false &&
+                    state.operations?.sections.first?.items.first?.id == "prepare" &&
+                    state.operations?.componentCosts.count == 4,
+                    "Operational plans, explicit mode and component budgets must decode.")
         try require(state.agents.count == 33 && Set(state.agents.map(\.id)).count == 33,
                     "Every cascade agent must have a stable, unique UI identity.")
         try require(state.agents.filter { $0.model == "gpt-6-luna" }.count == 24,
@@ -40,16 +45,24 @@ struct RuntimeContractCheck {
         var legacy = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         legacy.removeValue(forKey: "cascade")
         legacy.removeValue(forKey: "research")
+        legacy.removeValue(forKey: "operations")
         var legacyMarkets = legacy["markets"] as! [[String: Any]]
         legacyMarkets[0]["change_24h"] = NSNull()
         legacy["markets"] = legacyMarkets
         let legacyState = try decoder.decode(RuntimeState.self, from: JSONSerialization.data(withJSONObject: legacy))
-        try require(legacyState.cascade == nil && legacyState.markets[0].change24h == nil,
+        try require(legacyState.cascade == nil && legacyState.operations == nil && legacyState.markets[0].change24h == nil,
                     "Legacy metadata and unknown market changes must remain optional.")
+        var noLeaderboard = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        var research = noLeaderboard["research"] as! [String: Any]
+        research.removeValue(forKey: "leaderboard")
+        noLeaderboard["research"] = research
+        let oldResearchState = try decoder.decode(RuntimeState.self, from: JSONSerialization.data(withJSONObject: noLeaderboard))
+        try require(oldResearchState.research?.leaderboard == nil,
+                    "Older research snapshots without a leaderboard must still decode.")
         try require(state.portfolio.positions.first?.entryPrice == 100 && state.portfolio.trades.first?.id == "contract-fill",
                     "Nonempty paper positions and fills must decode.")
         try require(state.portfolio.totalPnl == 1 && state.portfolio.totalReturn == 0.0001,
-                    "The existing Overview must show equity less initial capital.")
+                    "Portfolio P&L must use equity less initial capital.")
         try require(state.portfolio.pnlSamples.map(\.pnl) == [0, 1], "Actual P&L observations must remain intact.")
         try require(state.strategies.count == 2, "Scored and unscored cascade outcomes must remain visible.")
         let scored = state.strategies.first { $0.id == "scored" }
@@ -58,11 +71,53 @@ struct RuntimeContractCheck {
                     "Negative measured outcomes and declarative parameters must decode.")
         try require(unscored?.sharpe == nil && unscored?.trades == nil,
                     "Unmeasured outcomes must preserve absent metrics.")
+        try checkLeaderboard(leaderboardData, stateData: data, decoder: decoder)
         try require(!state.events.isEmpty, "Cascade events must reach the existing activity view.")
         try checkRouting(data)
         try checkConfiguration(state.config, decoder: decoder)
         try checkPnl(data, decoder: decoder)
-        print("PASS: four cascade layers, 33 agents, model routing, unchanged Swift UI decoding, nullable strategy metrics, paper records, P&L, configuration encoding.")
+        print("PASS: four cascade layers, 33 agents, model routing, development leaderboard decoding and ranking, nullable strategy metrics, paper records, P&L, configuration encoding.")
+    }
+
+    private static func checkLeaderboard(_ leaderboardData: Data, stateData: Data, decoder: JSONDecoder) throws {
+        guard let leaderboardObject = try JSONSerialization.jsonObject(with: leaderboardData) as? [String: Any],
+              var stateObject = try JSONSerialization.jsonObject(with: stateData) as? [String: Any],
+              var researchObject = stateObject["research"] as? [String: Any] else {
+            throw Failure.invalid("The offline leaderboard fixture must attach to a research runtime snapshot.")
+        }
+        researchObject["leaderboard"] = leaderboardObject
+        stateObject["research"] = researchObject
+        let fixtureState = try decoder.decode(RuntimeState.self, from: JSONSerialization.data(withJSONObject: stateObject))
+        guard let leaderboard = fixtureState.research?.leaderboard else {
+            throw Failure.invalid("The optional development leaderboard must decode when present.")
+        }
+        try require(leaderboard.total == 5 && leaderboard.ranked == 4 &&
+                    leaderboard.rankingBasis == "development_net_return",
+                    "Leaderboard summary and ranking basis must decode.")
+        try require(leaderboard.testWindows == ["2025-01-01 → 2025-12-31"],
+                    "Dated and undated results must preserve the selectable test period.")
+        let rows = leaderboard.rankedRows
+        try require(rows.map(\.id) == ["leader", "tie-first", "tie-second", "negative", "unmeasured"],
+                    "Finite returns must rank descending, preserve stable ties, and put missing values last.")
+        try require(rows.first?.name == "Top fixture" && rows.first?.symbol == "MRVL" &&
+                    rows.first?.phase == "development" && rows.first?.netReturn == 0.12 &&
+                    rows.first?.maxDrawdown == 0.025 && rows.first?.trades == 9,
+                    "Leaderboard identity and measured strategy metrics must decode.")
+        try require(rows.first?.qualification?.qualified == false &&
+                    rows.first?.qualification?.status == "not_qualified" &&
+                    rows.first?.qualification?.rankingEffect == "none",
+                    "Development ranking must preserve its separate qualification status.")
+        let missing = rows.last
+        try require(missing?.finiteNetReturn == nil && missing?.finiteMaxDrawdown == nil && missing?.trades == nil,
+                    "Unmeasured leaderboard values must remain absent rather than becoming zero.")
+        let nonFinite = ResearchLeaderboardRow(
+            id: "nonfinite", experimentId: nil, name: nil, symbol: nil, family: nil,
+            phase: "development", netReturn: .infinity, maxDrawdown: .nan, trades: nil,
+            screenStatus: nil, prospectiveStatus: nil, qualification: nil,
+            forwardNetReturn: nil, forwardAsOf: nil, testStart: nil, testEnd: nil
+        )
+        try require(nonFinite.finiteNetReturn == nil && nonFinite.finiteMaxDrawdown == nil,
+                    "Non-finite metrics must be treated as unavailable.")
     }
 
     private static func checkRouting(_ data: Data) throws {

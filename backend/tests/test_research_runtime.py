@@ -18,6 +18,7 @@ class ResearchRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.tmp.name) / 'research.sqlite3')
+        self.store.update_config({'research': {'variants_per_hypothesis': 1}})
         self.collector, self.provider = Collector(), Provider()
         self.runtime = Runtime(self.store, collector=self.collector, provider=self.provider, key_loader=lambda: 'offline')
 
@@ -80,6 +81,7 @@ class ResearchRuntimeTests(unittest.TestCase):
         settings = default_config()['research']
         self.assertEqual((settings['active_collectors'], settings['active_analysts']), (6, 2))
         self.assertFalse(settings['use_model_executor'])
+        self.assertEqual(settings['variants_per_hypothesis'], 16)
         for change in ({'min_forward_sessions': 0}, {'min_forward_trades': 1},
                        {'data_cost_usd_per_day': float('nan')}, {'active_collectors': True},
                        {'mode': 'historical_profit_guarantee'}):

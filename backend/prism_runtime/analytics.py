@@ -108,8 +108,8 @@ def closed_candles(market, *, now_ms=None):
                     and market.get("interval_ms") == 86_400_000)
     if str(market.get('asset_class', '')).lower() == 'equity' and not equity_daily:
         raise ValueError('Equity research requires explicit daily candle intervals')
-    if equity_daily and market.get('history_adjustment') == 'unverified':
-        raise ValueError('Equity historical corporate-action adjustment is unverified')
+    if equity_daily and market.get('history_adjustment') not in {'adjusted_close', 'split_adjusted', 'total_return_adjusted'}:
+        raise ValueError('Equity history requires an explicit corporate-action adjustment declaration')
     if equity_daily:
         try:
             exchange_zone = ZoneInfo(market.get("exchange_timezone", "America/New_York"))
@@ -273,6 +273,22 @@ def _fingerprint(bars):
     return hashlib.sha256(json.dumps(bars, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def research_fingerprint(market, markets, start_ms, end_ms):
+    """Bind a measured equity result to every dated input used by its engines."""
+    from .temporal import market_as_of
+    records = []
+    selected = [market] + [row for row in markets if row is not market and row.get('benchmark_kind')]
+    for source in sorted(selected, key=lambda row: (row.get('symbol', ''), row.get('benchmark_kind', ''))):
+        visible = market_as_of(source, end_ms)
+        row = {key: visible.get(key) for key in ('symbol', 'security_id', 'asset_class', 'interval_ms',
+            'exchange_timezone', 'history_adjustment', 'raw_history_basis', 'benchmark_kind',
+            'corporate_actions', 'event_features')}
+        for key in ('candles', 'raw_candles'):
+            row[key] = [bar for bar in visible.get(key, []) if bar.get('start_ms', 0) >= start_ms]
+        records.append(row)
+    return _fingerprint(records)
+
+
 def _daily_report(spec, market, markets, start, end, config):
     from .simulation import replay
     bars = closed_candles(market)
@@ -293,6 +309,8 @@ def _daily_report(spec, market, markets, start, end, config):
         'sharpe': statistics.fmean(returns)/deviation*math.sqrt(252) if deviation else 0.,
         'max_drawdown': drawdown, 'trades': len(exits), 'entries': sum(row['side']=='buy' for row in book['trades']),
         'win_rate': sum(row['realized_pnl'] > 0 for row in exits)/len(exits) if exits else 0.,
+        'terminal_valuation': 'marked_open_positions_no_hypothetical_exit',
+        'open_positions': len(book.get('positions', [])),
         'costs': (book['fees_paid']+book.get('slippage_paid', 0))/book['initial_equity'], 'bars': len(curve)}
 
 
@@ -306,12 +324,37 @@ def _benchmarks(spec, market, markets, start, end, returns, config):
     result = {'stock_buy_hold_return': stock, 'exposure_matched_return': allocation*stock,
               'cash_return': 0., 'sector_return': None, 'market_return': None,
               'universe_scope': 'current_membership_only', 'missing_baselines': []}
+    daily = market.get('asset_class') == 'equity'
+    def matched_baseline(source):
+        from .simulation import replay
+        baseline_spec = {'symbol': source['symbol'], 'kind': 'momentum',
+                         'parameters': {'lookback': 3, 'threshold': 0.}}
+        if source.get('security_id'):
+            baseline_spec['security_id'] = source['security_id']
+        replayed = replay(baseline_spec, [source], config, start_ms=bars[start]['start_ms'],
+                          end_ms=bars[end-1]['end_ms'], benchmark_buy_hold=True)
+        portfolio = replayed['portfolio']
+        curve = replayed['curve']
+        eligible_closes = [row['close_ms'] for row in source.get('raw_candles', [])
+                           if row.get('open_ms', 0) >= bars[start]['start_ms'] and row.get('end_ms', 0) <= bars[end-1]['end_ms']]
+        if not curve or not eligible_closes or curve[-1]['session_ms'] != max(eligible_closes):
+            raise ValueError('Incomplete historical benchmark valuation')
+        return curve[-1]['equity'] / portfolio['initial_equity'] - 1
+    if daily:
+        result['stock_buy_hold_return'] = bars[end-1]['close']/bars[start]['open']-1
+        result['stock_reference_basis'] = 'gross_adjusted_price_reference_before_costs'
+        result['exposure_matched_return'] = matched_baseline(market)
+        result['execution_basis'] = 'shared_daily_policy_same_window_and_marked_open_terminal_positions'
     for kind in ('market', 'sector'):
         benchmark = next((m for m in markets if m.get('benchmark_kind') == kind), None)
         if benchmark:
             available = [b for b in closed_candles(benchmark) if bars[start]['start_ms'] <= b['start_ms'] and b['end_ms'] <= bars[end-1]['end_ms']]
             if len(available) >= end-start-2:
-                result[kind+'_return'] = allocation*(available[-1]['close']/available[0]['open']-1-cost)
+                try:
+                    result[kind+'_return'] = (matched_baseline(benchmark) if daily else
+                        allocation*(available[-1]['close']/available[0]['open']-1-cost))
+                except ValueError:
+                    result[kind+'_return'] = None
         if result[kind+'_return'] is None:
             result['missing_baselines'].append(kind)
     block_size = max(8, spec['parameters']['lookback'])
@@ -348,9 +391,13 @@ def validate_edges(proposals: list[dict], markets: list[dict], *, trial_count: i
                 'development_only': True, 'policy': policy, 'policy_hash': simulation.policy_hash(config)}
         try:
             spec = canonical_spec(proposal)
-            if not isinstance(edge["evidence_ids"], list) or not edge["evidence_ids"] or not all(isinstance(value, str) and value for value in edge["evidence_ids"]) or not edge["hypothesis"].strip():
+            edge["dataset_evidence_ids"] = deepcopy(proposal.get("dataset_evidence_ids", []))
+            lineage = edge["evidence_ids"] or edge["dataset_evidence_ids"]
+            if not isinstance(lineage, list) or not lineage or not all(isinstance(value, str) and value for value in lineage) or not edge["hypothesis"].strip():
                 raise ValueError("Hypothesis and source evidence lineage are required")
             market = _market(spec['symbol'], markets)
+            if market.get('asset_class') not in {'equity', 'fixture'}:
+                raise ValueError('Backtests require daily equity metadata; synthetic compatibility histories must be explicitly marked as fixture')
             bars = closed_candles(market)
             if len(bars) < MIN_CANDLES:
                 raise ValueError(f"Insufficient closed history: need at least {MIN_CANDLES} candles")
@@ -372,7 +419,11 @@ def validate_edges(proposals: list[dict], markets: list[dict], *, trial_count: i
                        "block_lag1_correlation": correlation, "train_net_return": train["net_return"], "train_trades": train["trades"]}
             validation = {"method": "development_chronological_block_screen", "benchmark": "stock_and_exposure_matched_buy_hold",
                           'development_only': True, 'policy_hash': simulation.policy_hash(config),
-                          "spec_hash": spec_hash(spec), "data_fingerprint": _fingerprint(bars),
+                          "spec_hash": spec_hash(spec),
+                          "data_fingerprint": research_fingerprint(market, markets, bars[0]['start_ms'], bars[-1]['end_ms']) if daily else _fingerprint(bars),
+                          "data_fingerprint_basis": 'equity_inputs_v1' if daily else 'legacy_fixture_candles',
+                          "history_start_ms": bars[0]['start_ms'],
+                          "execution_model": 'shared_daily_equity' if daily else 'synthetic_compatibility_only',
                           "train_start_ms": bars[warmup]["start_ms"], "train_end_ms": bars[split - 1]["end_ms"],
                           "holdout_start_ms": bars[split]["start_ms"], "holdout_end_ms": bars[-1]["end_ms"],
                           "sample_bars": len(bars), "alpha": ALPHA, "trial_count": trials,
@@ -469,13 +520,19 @@ def assess_strategy(proposal: dict, edges: list[dict], markets: list[dict], conf
         supplied = proposal.get("evidence_ids", evidence)
         if not isinstance(supplied, list) or any(value not in evidence for value in supplied):
             raise ValueError("Strategy cannot introduce unvalidated evidence lineage")
-        bars = closed_candles(_market(spec["symbol"], markets))
+        market = _market(spec["symbol"], markets)
+        bars = closed_candles(market)
         if not bars or bars[-1]["end_ms"] < first["validation"]["holdout_end_ms"]:
             raise ValueError("Market history no longer covers the validated holdout")
         for edge in selected:
             validation = edge["validation"]
             validated_bars = [bar for bar in bars if bar["end_ms"] <= validation["holdout_end_ms"]]
-            if len(validated_bars) < validation.get("sample_bars", 0) or _fingerprint(validated_bars[-validation["sample_bars"]:]) != validation["data_fingerprint"]:
+            measured = validated_bars[-validation["sample_bars"]:]
+            digest = (research_fingerprint(market, markets, validation['history_start_ms'], validation['holdout_end_ms'])
+                      if validation.get('data_fingerprint_basis') == 'equity_inputs_v1' else _fingerprint(measured))
+            if market.get('asset_class') == 'equity' and validation.get('data_fingerprint_basis') != 'equity_inputs_v1':
+                raise ValueError('Equity results require complete execution-input provenance')
+            if len(validated_bars) < validation.get("sample_bars", 0) or digest != validation["data_fingerprint"]:
                 raise ValueError("Historical data differs from the measured validation evidence")
         strategy.update(symbol=spec["symbol"], family=spec["kind"], spec=spec, status="paper", edge_ids=identifiers, evidence_ids=evidence,
                         reason="Validated frozen rule accepted for bounded paper execution", validation={"passed": True, "spec_hash": spec_hash(spec),
