@@ -4,11 +4,15 @@ from __future__ import annotations
 import math
 
 from .domain import identity, timestamp
+from .risk_controls import ACTIVE_ORDERS
 
 
 def _time(value):
-    if isinstance(value, (int, float)):
-        return timestamp(value / 1000 if value > 100_000_000_000 else value)
+    if type(value) in (int, float):
+        try:
+            return timestamp(value / 1000 if value > 100_000_000_000 else value) if math.isfinite(value) else None
+        except (ValueError, OverflowError, OSError):
+            return None
     return value if isinstance(value, str) else None
 
 
@@ -32,8 +36,11 @@ def _order_detail(row):
 
 
 def _finite(value):
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value))
+    try:
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value))
+    except OverflowError:
+        return False
 
 
 def _risk_view(execution):
@@ -117,13 +124,28 @@ def projection(*, mode, enabled, schedule, calendar, subscriptions, memory, exec
         for r in memory.get('recent_revisions', [])])
     section('decisions', 'Sol decisions', [_item(
         f"{r.get('strategy_id', r.get('strategy_version', 'Strategy'))} · {r.get('action', 'decision')}",
-        r.get('rationale', r.get('reason', r.get('summary', ''))), key=r.get('id'), status=r.get('status'), at=r.get('created_at', r.get('at')))
+        r.get('rationale', r.get('reason', r.get('summary', ''))), key=r.get('id'), status=r.get('status'), at=r.get('created_at_ms', r.get('created_at', r.get('at'))))
         for r in execution.get('decisions', [])])
+    orders = execution.get('orders', [])
+    def order_key(row):
+        stamp = row.get('updated_at_ms', row.get('created_at_ms'))
+        return (row.get('status', row.get('orderStatus')) in ACTIVE_ORDERS,
+                stamp if _finite(stamp) else 0)
+    orders = sorted(orders, key=order_key, reverse=True)
+    shown_orders = orders[:60]
+    def count(key, default):
+        value = execution.get(key, default)
+        return value if type(value) is int and value >= 0 else None
+    order_count = count('order_count', len(orders) if 'orders' in execution else None)
+    active_count = count('active_order_count', sum(
+        row.get('status', row.get('orderStatus')) in ACTIVE_ORDERS for row in orders)
+        if 'orders' in execution else None)
     section('orders', 'Actual order outcomes', [_item(
         f"{r.get('side', '')} {r.get('symbol', '')} · {r.get('order_link_id', r.get('orderLinkId', r.get('id', '')))}",
         _order_detail(r),
-        key=r.get('id', r.get('order_link_id')), status=r.get('status', r.get('orderStatus')), at=r.get('updated_at'))
-        for r in execution.get('orders', [])])
+        key=r.get('id', r.get('order_link_id')), status=r.get('status', r.get('orderStatus')),
+        at=r.get('updated_at_ms', r.get('created_at_ms', r.get('updated_at'))))
+        for r in shown_orders])
     section('positions', 'Bybit positions', [_item(
         f"{r.get('category', '')}:{r.get('symbol', '')} · {r.get('side', '')}",
         f"Quantity {r.get('quantity', r.get('size', '—'))} · Notional {r.get('notional', r.get('positionValue', '—'))} · P&L {r.get('unrealized_pnl', r.get('unrealisedPnl', '—'))}",
@@ -135,5 +157,8 @@ def projection(*, mode, enabled, schedule, calendar, subscriptions, memory, exec
     return {'mode': mode, 'enabled': enabled, 'next_wake_at': _time(decision.get('next_wake_at')),
             'rationale': decision.get('rationale'), 'risk_status': 'halted' if risk.get('halted') else 'reconciliation_required' if risk.get('reconciliation_required', True) else 'active',
             'gross_exposure': risk.get('gross_exposure'), 'realized_pnl': risk.get('realized_pnl'), 'unrealized_pnl': risk.get('unrealized_pnl'),
+            'order_count': order_count, 'active_order_count': active_count,
+            'orders_truncated': bool(execution.get('order_history_truncated')) or
+                len(orders) > len(shown_orders) or (order_count is not None and order_count > len(shown_orders)),
             'sections': sections, 'component_costs': [{'id': name, 'calls': row['calls'], 'spent_usd': row['spent'],
                 'reserved_usd': row['reserved'], 'limit_usd': row['daily_usd']} for name, row in resources.items()]}

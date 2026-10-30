@@ -144,6 +144,44 @@ class ContinuousSchedulingTests(unittest.TestCase):
         self.assertTrue(self.services.monitoring_enabled())
         self.assertFalse(self.services.enabled())
 
+    def test_old_unresolved_order_still_blocks_mode_changes_after_history_limit(self):
+        self.runtime.update_configuration({'bybit': {'allowed_instruments': [
+            {'category': 'spot', 'symbol': 'BTCUSDT'}]}})
+        self.services.adapter.submit_order({'category': 'spot', 'symbol': 'BTCUSDT',
+            'side': 'Buy', 'order_type': 'Limit', 'quantity': 1, 'price': 100,
+            'order_link_id': 'old-unresolved'})
+        with self.store.connection() as db:
+            original = dict(db.execute("SELECT * FROM bybit_orders WHERE order_link_id='old-unresolved'").fetchone())
+            columns = list(original)
+            rows = []
+            for index in range(5001):
+                row = {**original, 'order_link_id': f'later-closed-{index}',
+                    'order_id': f'later-closed-{index}', 'status': 'cancelled',
+                    'created_at_ms': original['created_at_ms'] + index + 1}
+                rows.append(tuple(row[key] for key in columns))
+            db.executemany('INSERT INTO bybit_orders (' + ','.join(columns) + ') VALUES (' +
+                ','.join('?' for _ in columns) + ')', rows)
+        self.runtime.control('pause')
+        self.assertFalse(any(row['status'] in {'acknowledged', 'open', 'unknown'}
+            for row in self.services.adapter.orders(limit=5000)))
+        self.assertTrue(self.services.has_exposure())
+        with self.assertRaises(ValueError):
+            self.runtime.update_configuration({'trading_mode': {'selected': 'sol_perpetual'}})
+
+    def test_private_fill_resolves_owner_from_exact_local_journal_without_history_scan(self):
+        self.runtime.update_configuration({'bybit': {'allowed_instruments': [
+            {'category': 'spot', 'symbol': 'BTCUSDT'}]}})
+        self.services.adapter.submit_order({'category': 'spot', 'symbol': 'BTCUSDT',
+            'side': 'Buy', 'order_type': 'Limit', 'quantity': 1, 'price': 100,
+            'order_link_id': 'owned-fill', 'strategy_id': 'owner'})
+        self.services.live.strategies = lambda: [
+            {'id': 'owner', 'symbol': 'BTCUSDT'}, {'id': 'unrelated', 'symbol': 'BTCUSDT'}]
+        self.services.adapter.orders = lambda **_: self.fail('Exact private-event lookup must not scan bounded history')
+        self.services.on_private({'topic': 'execution', 'data': [
+            {'orderLinkId': 'owned-fill', 'symbol': 'BTCUSDT', 'execId': 'fixture-fill'}]})
+        events = self.services.events.state()['events']
+        self.assertEqual([row['target'] for row in events if row['kind'] == 'fill'], ['owner'])
+
     def test_configuration_guard_does_not_change_account_under_exposure(self):
         self.runtime.control('pause')
         self.execution.positions = [{'quantity': .1}]

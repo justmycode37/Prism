@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import heapq
 import json
 import math
 import statistics
@@ -25,6 +26,7 @@ from .store import encoded
 MAX_SUBSCRIPTIONS = 256
 MAX_SNAPSHOTS_PER_STRATEGY = 128
 FUTURE_TOLERANCE_MS = 1000
+SOL_FORMING_MAX_AGE_MS = 15_000
 PING_SECONDS = 20
 HEARTBEAT_SECONDS = 45
 OHLC = ('open', 'high', 'low', 'close')
@@ -100,21 +102,39 @@ def _bar_values(row):
     return [row.get(name) for name in ('start_ms', 'end_ms', *OHLC, 'volume', 'turnover', 'closed')]
 
 
-def _sol_chart_candle(row):
+def _sol_chart_candle(row, now_ms):
     """Return the small, validated candle shape used by the SOL UI."""
     if not isinstance(row, dict) or type(row.get('closed')) is not bool:
         return None
     try:
         start = _milliseconds(row.get('start_ms'))
+        end = _milliseconds(row.get('end_ms'))
         values = {name: _number(row.get(name), positive=True) for name in OHLC}
         if (_floor(start, '1') != start or
-                _milliseconds(row.get('end_ms')) != start + INTERVAL_MS['1']):
+                end != start + INTERVAL_MS['1'] or start > now_ms + FUTURE_TOLERANCE_MS or
+                row['closed'] and end > now_ms + FUTURE_TOLERANCE_MS):
             return None
         if values['high'] < max(values['open'], values['close']) or values['low'] > min(values['open'], values['close']):
             return None
     except (TypeError, ValueError, OverflowError):
         return None
     return {'start_ms': start, **values, 'closed': row['closed']}
+
+
+def _is_current_sol_forming(row, now_ms):
+    """Accept only a recent live one-minute bar for the current chart interval."""
+    if not isinstance(row, dict) or row.get('closed') is not False or row.get('source') != 'websocket':
+        return False
+    try:
+        start = _milliseconds(row.get('start_ms'))
+        end = _milliseconds(row.get('end_ms'))
+        updated = _milliseconds(row.get('updated_at_ms'))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    age = now_ms - updated
+    return (_floor(start, '1') == start and end == start + INTERVAL_MS['1']
+            and start <= now_ms < end
+            and -FUTURE_TOLERANCE_MS <= age <= SOL_FORMING_MAX_AGE_MS)
 
 
 def sol_chart_projection(store, market=None):
@@ -125,17 +145,24 @@ def sol_chart_projection(store, market=None):
     series and closed bars; it never creates a service or contacts Bybit.
     """
     environment = 'testnet' if store.config().get('bybit', {}).get('mode') == 'testnet' else 'mainnet'
+    now_ms = store._now_ms()
     key = ('linear', 'SOLUSDT', '1')
     rows = None
     if market is not None and getattr(market, 'environment', None) == environment:
         try:
             with market._lock:
+                # Candles and the service clock share the same injected time
+                # source. Fall back to the store clock only for offline reads.
+                now_ms = market._now()
                 series = market._series.get(key)
                 if (series and series.get('environment') == environment and
                         series.get('key') == list(key)):
                     rows = list(series.get('bars', {}).values())
                     forming = series.get('forming')
-                    if forming is not None:
+                    # A stopped service can retain a persisted forming bar from
+                    # before a restart. It is historical context, not a live
+                    # chart observation, and must never look current.
+                    if market._running and _is_current_sol_forming(forming, now_ms):
                         rows.append(forming)
         except Exception:
             rows = None
@@ -158,11 +185,17 @@ def sol_chart_projection(store, market=None):
                     (':'.join((environment, *key)), history_limit))]
         except Exception:
             return None
-    candles = [candle for row in rows if (candle := _sol_chart_candle(row)) is not None]
-    candles.sort(key=lambda candle: candle['start_ms'])
-    # A malformed duplicate cannot cause the chart to emit two values for one minute.
-    unique = {candle['start_ms']: candle for candle in candles}
-    candles = [unique[start] for start in sorted(unique)[-120:]]
+    unique = {}
+    for row in rows:
+        candle = _sol_chart_candle(row, now_ms)
+        if candle is not None:
+            # A malformed duplicate cannot cause the chart to emit two values
+            # for one minute. The durable series key normally makes this moot.
+            unique[candle['start_ms']] = candle
+    # Select a bounded recent tail without sorting all up to 5,000 history
+    # rows on each UI state poll, then sort only the chart-sized result.
+    candles = sorted(heapq.nlargest(120, unique.values(), key=lambda item: item['start_ms']),
+                     key=lambda item: item['start_ms'])
     if not candles:
         return None
     return {'symbol': 'SOLUSDT', 'category': 'linear', 'timeframe': '1',
@@ -253,6 +286,11 @@ class MarketDataService:
                 value['quote_synchronized'] = False
                 value['ticker_synchronized'] = False
                 value['book_synchronized'] = False
+                # Sequence IDs belong to a synchronized stream epoch. A
+                # process restart starts a new epoch just like a socket
+                # reconnect; retaining a pre-restart high-water mark can make
+                # fresh post-restart ticker updates look out of order.
+                value['quote_sequence'] = None
                 self._instruments[tuple(value['key'])] = value
             for row in db.execute('SELECT * FROM md_connections'):
                 value = json.loads(row['value'])
@@ -418,7 +456,43 @@ class MarketDataService:
             series['forming'] = bar
             return 'intrabar' if not historical else None
         if existing:
-            if _bar_values(existing) == _bar_values(bar) or bar['updated_at_ms'] <= existing['updated_at_ms']:
+            if _bar_values(existing) == _bar_values(bar):
+                # A REST recovery can race the live close. If REST writes the
+                # exact final OHLCV first, the later websocket confirmation is
+                # still the only evidence that this close was observed live.
+                # Promote only the current contiguous tail and only when the
+                # exchange message itself falls at/after close inside a
+                # registered strategy's original decision window. Historical
+                # replays remain history.
+                now = self._now()
+                if (bar['source'] == 'websocket' and existing.get('source') in {'rest', 'recovery'}
+                        and latest == start and bar['end_ms'] <= now):
+                    previous = max((stamp for stamp in bars if stamp < start), default=None)
+                    contiguous = previous is None or bars[previous]['end_ms'] == start
+                    timely = any(
+                        self._uses(strategy, key)
+                        and strategy['registered_at_ms'] <= bar['start_ms']
+                        and bar['observed_at_ms'] >= strategy['registered_at_ms']
+                        and 0 <= bar['updated_at_ms'] - bar['end_ms']
+                        <= strategy['market_policy']['max_decision_latency_seconds'] * 1000
+                        and 0 < now - bar['end_ms']
+                        <= strategy['market_policy']['max_decision_latency_seconds'] * 1000
+                        for strategy in self._strategies.values())
+                    if contiguous and timely:
+                        bar['revision'] = existing.get('revision', 0)
+                        bar['contiguous_on_arrival'] = True
+                        # No values were corrected. Earlier forward proofs
+                        # remain valid, and historical snapshots retain their
+                        # immutable non-forward provenance. Source/ready fields
+                        # give the next snapshot a new fingerprint and ID.
+                        for sid, strategy in self._strategies.items():
+                            if self._uses(strategy, key):
+                                self._cache.pop(sid, None)
+                        self._write_bar(series, bar, persist=persist)
+                        return 'candle_closed' if persist else None
+                series['ignored'] += 1
+                return None
+            if bar['updated_at_ms'] <= existing['updated_at_ms']:
                 series['ignored'] += 1
                 return None
             bar['revision'] = existing.get('revision', 0) + 1
@@ -526,7 +600,13 @@ class MarketDataService:
                 if wire in data:
                     quote[local] = _number(data[wire])
             quote.update(timestamp_ms=stamp, received_at_ms=self._now(), source='websocket')
-            instrument.update(ticker_quote=quote, quote_sequence=sequence, ticker_synchronized=True)
+            # Keep the sequence high-water mark across a message that omits
+            # ``cs``. Otherwise the next sequenced update could roll back to
+            # an older exchange state simply because one intermediate snapshot
+            # lacked sequence metadata.
+            instrument.update(ticker_quote=quote,
+                              quote_sequence=sequence if sequence is not None else previous,
+                              ticker_synchronized=True)
             self._compose_quote(instrument)
             self._save_instrument(instrument)
             return True

@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "offline_synthetic_fixture": true,
+  "command": "PYTHONDONTWRITEBYTECODE=1 python3 scripts/measure_paper_exchange.py --orders 0 1000 10000 50000 --quotes 3",
+  "scope": "PaperExchange flat account, zero active orders, synthetic closed-order histories; tracemalloc enabled; setup excluded",
+  "before_phase": "full canonical JSON quote reads and writes",
+  "after_phase": "revision-matched compact quote head, with immediate transactions",
+  "before": [
+    {
+      "closed_orders": 0,
+      "quotes": 3,
+      "advance_seconds": 0.003221,
+      "ticker_seconds": 0.001355,
+      "peak_traced_bytes": 5097
+    },
+    {
+      "closed_orders": 1000,
+      "quotes": 3,
+      "advance_seconds": 0.056883,
+      "ticker_seconds": 0.016739,
+      "peak_traced_bytes": 1363844
+    },
+    {
+      "closed_orders": 10000,
+      "quotes": 3,
+      "advance_seconds": 0.571025,
+      "ticker_seconds": 0.172307,
+      "peak_traced_bytes": 14043620
+    },
+    {
+      "closed_orders": 50000,
+      "quotes": 3,
+      "advance_seconds": 2.876376,
+      "ticker_seconds": 0.898272,
+      "peak_traced_bytes": 70184883
+    }
+  ],
+  "after": [
+    {
+      "closed_orders": 0,
+      "quotes": 3,
+      "advance_seconds": 0.001947,
+      "ticker_seconds": 0.001268,
+      "peak_traced_bytes": 5705
+    },
+    {
+      "closed_orders": 1000,
+      "quotes": 3,
+      "advance_seconds": 0.001796,
+      "ticker_seconds": 0.001247,
+      "peak_traced_bytes": 4961
+    },
+    {
+      "closed_orders": 10000,
+      "quotes": 3,
+      "advance_seconds": 0.001957,
+      "ticker_seconds": 0.001317,
+      "peak_traced_bytes": 4961
+    },
+    {
+      "closed_orders": 50000,
+      "quotes": 3,
+      "advance_seconds": 0.002224,
+      "ticker_seconds": 0.001378,
+      "peak_traced_bytes": 4961
+    }
+  ]
+}

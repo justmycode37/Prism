@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from datetime import datetime
 import threading
 import time
@@ -149,28 +150,56 @@ class ContinuousServices:
         if not event:
             return None
         try:
-            if (not self.support or not is_sol_mode(self.store.config()) or
+            swarm = self.support
+            if (not swarm or not is_sol_mode(self.store.config()) or
                     event['target'] != self.store.get_document('sol_mode_strategy_id')):
                 self.events.finish(event['id'], {'reason': 'Trading mode changed'}, status='superseded')
                 return None
-            current = self.market.sample(event['target'])
             frozen = self.store.snapshot(event['payload'].get('snapshot_id'))
             source = frozen['value'] if frozen else {}
-            if (not current.get('ready') or not source.get('candles') or not current.get('candles') or
-                    source['candles'][-1]['end_ms'] != current['candles'][-1]['end_ms']):
-                self.events.finish(event['id'], {'reason': 'Minute observation superseded or unavailable'}, status='superseded')
+            reason = self._sol_minute_obsolete(event['target'], frozen)
+            if reason:
+                self.events.finish(event['id'], {'reason': reason}, status='superseded')
                 return None
             snapshot = {**source, 'snapshot_id': frozen['id']}
-            report = self.support.refresh(event['target'], snapshot)
-            if self.enabled() and is_sol_mode(self.store.config()):
+            preflight = getattr(self.execution, 'support_preflight', None)
+            admission = preflight(event['target']) if callable(preflight) else {'needed': True}
+            if admission.get('needed') is False:
+                report = {'status': 'skipped', 'reason': admission.get('reason'), 'reports': []}
+            else:
+                report = swarm.refresh(event['target'], snapshot,
+                    max_age_seconds=mode_settings(self.store.config())['support_max_age_seconds'])
+            # Support may outlive its minute, Pause, or a mode reconfiguration.
+            # A late result is journalled, but must not create new attention.
+            reason = self._sol_minute_obsolete(event['target'], frozen)
+            if (self.enabled() and swarm is self.support and is_sol_mode(self.store.config()) and
+                    event['target'] == self.store.get_document('sol_mode_strategy_id') and not reason):
                 self.events.publish('candle_closed', event['target'], event['payload'],
                     key='supported-' + event['id'], priority=60)
-            self.events.finish(event['id'], {'report_count': len(report.get('reports', []))})
+            self.events.finish(event['id'], {'report_count': len(report.get('reports', [])),
+                'reason': reason or report.get('reason')}, status='superseded' if reason else 'completed')
             return report
         except Exception as error:
             self.events.finish(event['id'], {'reason': type(error).__name__}, status='blocked')
             self._error('support', error)
             return {'status': 'blocked'}
+
+    def _sol_minute_obsolete(self, strategy_id, frozen):
+        """Check source identity and the current minute before buying model work."""
+        source = frozen['value'] if frozen else {}
+        deadline = source.get('attention_deadline_ms')
+        if (type(deadline) not in (int, float) or not math.isfinite(deadline) or
+                self.clock() * 1000 >= deadline):
+            return 'Minute observation attention deadline expired or unavailable'
+        verifier = getattr(self.market, 'snapshot_status', None)
+        if callable(verifier) and verifier(frozen['id']).get('valid') is not True:
+            return 'Minute observation was invalidated or expired'
+        current = self.market.sample(strategy_id)
+        if (not current.get('ready') or not source.get('candles') or not current.get('candles') or
+                source['candles'][-1]['end_ms'] != current['candles'][-1]['end_ms'] or
+                source.get('signal_input_id') != current.get('signal_input_id')):
+            return 'Minute observation superseded or unavailable'
+        return None
 
     def enabled(self):
         return not self.runtime.paused and not self.stop.is_set()
@@ -182,7 +211,9 @@ class ContinuousServices:
             return True
         # The UI projection may lag a crash after submission. The durable
         # adapter journal, including ambiguous outcomes, remains authoritative.
-        if any(x.get('status') in ACTIVE_ORDERS for x in self.adapter.orders(limit=5000)):
+        reader = getattr(self.adapter, 'active_orders', None)
+        unresolved = reader() if callable(reader) else self.adapter.orders(limit=5000)
+        if any(x.get('status') in ACTIVE_ORDERS for x in unresolved):
             return True
         with self.store.connection() as db:
             row = db.execute('SELECT value FROM bybit_account_snapshots WHERE mode=? ORDER BY id DESC LIMIT 1',
@@ -241,7 +272,16 @@ class ContinuousServices:
                 self.live.observe(sid, snapshot)
             key = payload.get('id') or payload.get('key') or event['id']
             kind = 'support' if is_sol_mode(self.store.config()) and payload['kind'] == 'candle_closed' else payload['kind']
-            self.events.publish(kind, sid, {**payload, 'snapshot_id': snapshot.get('snapshot_id')},
+            attention = {**payload, 'snapshot_id': snapshot.get('snapshot_id')}
+            if kind == 'support':
+                # Observation evidence has already been written to the tape
+                # and research store. Only stale SOL model attention can be
+                # coalesced when later source minutes are queued.
+                attention.update(sol_attention=True,
+                    attention_deadline_ms=snapshot.get('attention_deadline_ms'),
+                    captured_at_ms=snapshot.get('captured_at_ms'),
+                    signal_input_id=snapshot.get('signal_input_id'))
+            self.events.publish(kind, sid, attention,
                 key='execute-' + key, priority=payload.get('priority', 50),
                 delay=min(self.store.config()['operations']['event_coalesce_seconds'],
                           max(0., (snapshot.get('attention_deadline_ms', 0) / 1000 - self.clock()) / 4)))
@@ -286,12 +326,15 @@ class ContinuousServices:
         self.scheduler.interrupt({'id': identity(['private', message]), 'kind': kind,
                                   'target': 'portfolio', 'event_at': self.clock()})
         rows = message.get('data', [])
-        known = self.adapter.orders(limit=5000)
+        lookup = getattr(self.adapter, 'local_order', None)
+        known = [] if callable(lookup) else self.adapter.orders(limit=5000)
         for row in rows:
             symbols = [x for x in self.live.strategies() if not row.get('symbol') or x['symbol'] == row.get('symbol')]
             link = row.get('orderLinkId')
             if link:
-                owner = next((x.get('strategy_id') for x in known if x['order_link_id'] == link), None)
+                local = lookup(link) if callable(lookup) else next(
+                    (x for x in known if x['order_link_id'] == link), None)
+                owner = local.get('strategy_id') if local else None
                 if owner:
                     symbols = [x for x in symbols if x['id'] == owner]
             for strategy in symbols:
@@ -306,14 +349,17 @@ class ContinuousServices:
         if not event:
             return None
         try:
+            if event['payload'].get('sol_attention') is True and (
+                    not is_sol_mode(self.store.config()) or
+                    event['target'] != self.store.get_document('sol_mode_strategy_id')):
+                self.events.finish(event['id'], {'reason': 'SOL trading mode or strategy changed'},
+                                   status='superseded')
+                return {'status': 'superseded'}
             if is_sol_mode(self.store.config()) and event['kind'] in {'candle_closed', 'signal', 'intrabar'}:
                 frozen = self.store.snapshot(event['payload'].get('snapshot_id'))
-                source = frozen['value'] if frozen else {}
-                current = self.market.sample(event['target'])
-                if (not source.get('candles') or not current.get('candles') or
-                        source['candles'][-1]['end_ms'] != current['candles'][-1]['end_ms'] or
-                        self.clock() * 1000 > source.get('attention_deadline_ms', 0)):
-                    self.events.finish(event['id'], {'reason': 'Minute decision expired or superseded'}, status='superseded')
+                reason = self._sol_minute_obsolete(event['target'], frozen)
+                if reason:
+                    self.events.finish(event['id'], {'reason': reason}, status='superseded')
                     return {'status': 'superseded'}
             result = self.execution.handle_event({**event['payload'], 'id': event['id'],
                 'kind': event['kind'], 'strategy_id': event['target']})
@@ -706,30 +752,49 @@ class ContinuousServices:
         return result
 
     def state(self):
-        schedule = self.scheduler.state()
-        agent_plan = self.store.get_document('scheduler_agent_decision', {})
-        schedule['rationale'] = agent_plan.get('rationale', 'Source-derived fallback is watching events and required observations.')
-        pending_wakes = [x['trigger_at'] for x in schedule['tasks'] if x['status'] == 'pending']
-        if agent_plan.get('status') == 'accepted' and agent_plan.get('next_wake_at', 0) > self.clock():
-            pending_wakes.append(agent_plan['next_wake_at'])
-        elif agent_plan.get('retry_at', 0) > self.clock():
-            pending_wakes.append(agent_plan['retry_at'])
-        schedule['next_wake_at'] = min(pending_wakes, default=None)
+        sol = is_sol_mode(self.store.config())
+        if sol:
+            # The Research planner and sourced calendar are suspended in SOL
+            # mode. Their old wake times and coverage failures do not describe
+            # this event-driven one-minute trader.
+            schedule = {'tasks': [], 'events': [], 'coverage': {'missing': []},
+                'next_wake_at': (int(self.clock()) // 60 + 1) * 60,
+                'rationale': 'Watching the next live closed one-minute SOLUSDT observation; host eligibility and order controls apply.'}
+        else:
+            schedule = self.scheduler.state()
+            agent_plan = self.store.get_document('scheduler_agent_decision', {})
+            schedule['rationale'] = agent_plan.get('rationale', 'Source-derived fallback is watching events and required observations.')
+            pending_wakes = [x['trigger_at'] for x in schedule['tasks'] if x['status'] == 'pending']
+            if agent_plan.get('status') == 'accepted' and agent_plan.get('next_wake_at', 0) > self.clock():
+                pending_wakes.append(agent_plan['next_wake_at'])
+            elif agent_plan.get('retry_at', 0) > self.clock():
+                pending_wakes.append(agent_plan['retry_at'])
+            schedule['next_wake_at'] = min(pending_wakes, default=None)
         memory = self.memory.state()
+        sid = self.store.get_document('sol_mode_strategy_id') if sol else None
+        if sol:
+            memory = {**memory, **{key: [row for row in memory.get(key, []) if any(
+                row.get(field) == sid for field in ('strategy_id', 'experiment_id', 'target_id',
+                    'parent_experiment_id', 'child_experiment_id'))]
+                for key in ('queued', 'recent_reviews', 'recent_revisions')}}
         market = self.market.state()
         execution = self.execution.state()
         with self._error_lock:
-            blocked = list(self._errors.values())
+            blocked = [value for key, value in self._errors.items()
+                       if not sol or key not in {'planner', 'discovery', 'calendar'}]
         blocked += [{'id': x['id'], 'kind': x['kind'], 'status': x['status'],
                      'reason': (x.get('result') or {}).get('reason', 'Deferred by bounded work capacity')}
-                    for x in self.events.state()['events'] if x['status'] in {'blocked', 'failed', 'deferred'}]
+                    for x in self.events.state()['events'] if x['status'] in {'blocked', 'failed', 'deferred'}
+                    and (not sol or x.get('target') == sid)]
         blocked += [{'id': 'coverage-' + row['category'], 'kind': 'Calendar coverage', 'reason': str(row)}
                     for row in schedule.get('coverage', {}).get('missing', [])]
         blocked += [{'id': row['id'], 'kind': 'Strategy review', 'status': row['status'],
                      'reason': row['deferred_reason']} for row in memory.get('queued', []) if row.get('deferred_reason')]
-        with self.store.connection() as db:
-            attempts = db.execute("SELECT key,value FROM cascade_meta WHERE key LIKE 'development_attempt_%' "
-                                  "OR key LIKE 'revision_transition_%' ORDER BY key LIMIT 128").fetchall()
+        attempts = []
+        if not sol:
+            with self.store.connection() as db:
+                attempts = db.execute("SELECT key,value FROM cascade_meta WHERE key LIKE 'development_attempt_%' "
+                                      "OR key LIKE 'revision_transition_%' ORDER BY key LIMIT 128").fetchall()
         for row in attempts:
             value = json.loads(row['value'])
             if value.get('status') in {'blocked', 'deferred'}:

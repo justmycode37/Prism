@@ -400,10 +400,16 @@ class BybitAdapterTests(unittest.TestCase):
 
     def test_amend_is_durable_and_pending_until_query_confirms(self):
         order = self.create_spot(link="amend-link-1")
+        original_key = (order["created_at_ms"], order["order_link_id"])
+        original_revision = self.adapter.accounting_revision()
         amended = self.adapter.amend_order(order["order_link_id"], price="100.15", quantity="0.55")
         self.assertEqual(amended["status"], "acknowledged")
         self.assertEqual(amended["intent"]["price"], "100.1")
         self.assertEqual(amended["intent"]["qty"], "0.55")
+        self.assertEqual((amended["created_at_ms"], amended["order_link_id"]), original_key,
+                         "Supported amend updates keep the immutable creation-order pagination key.")
+        self.assertGreater(self.adapter.accounting_revision()["orders"], original_revision["orders"],
+                           "An amended owner intent invalidates cached accounting reconstruction.")
         call = next(call for call in self.transport.calls if urlsplit(call["url"]).path == "/v5/order/amend")
         self.assertEqual(json.loads(call["body"])["orderLinkId"], "amend-link-1")
 

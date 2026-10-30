@@ -1,6 +1,14 @@
 import AppKit
 import SwiftUI
 
+fileprivate enum SingleTraderAccountFixture: String, CaseIterable {
+    case normal = "normal"
+    case zeroEquityLoss = "zero-equity-loss"
+    case unavailableEquity = "unavailable-equity"
+    case offlineRetainedPnl = "offline-retained-pnl"
+    case priorUTCDay = "prior-utc-day"
+}
+
 enum PrismAppearance: String, CaseIterable, Identifiable {
     case system, light, dark
     var id: String { rawValue }
@@ -33,9 +41,11 @@ final class RuntimeClient: ObservableObject {
     @Published var selectedPage: PrismPage = .overview
     @Published var pnlSamples: [PaperPnlSample] = []
 
-    init(includeSnapshot: Bool, singleTraderFixture: Bool = false, solSampleCount: Int = 0) {
+    fileprivate init(includeSnapshot: Bool, singleTraderFixture: Bool = false, solSampleCount: Int = 0,
+                     accountFixture: SingleTraderAccountFixture = .normal) {
         if includeSnapshot {
-            let json = singleTraderFixture ? Self.singleTraderFixture(solSampleCount: solSampleCount) : Self.fixture
+            let json = singleTraderFixture ? Self.singleTraderFixture(solSampleCount: solSampleCount,
+                accountFixture: accountFixture) : Self.fixture
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             do {
@@ -57,13 +67,83 @@ final class RuntimeClient: ObservableObject {
             if singleTraderFixture {
                 guard snapshot.tradingMode?.isSolPerpetual == true,
                       snapshot.markets.contains(where: { $0.symbol == "SOLUSDT" }),
-                      snapshot.portfolio.positions.contains(where: { $0.symbol == "SOLUSDT" }),
-                      snapshot.portfolio.trades.contains(where: { $0.symbol == "SOLUSDT" }),
+                      snapshot.tradingMode?.actualSolExecution?.fills?.contains(where: { $0.id == "sol-exec-1" }) == true,
+                      !snapshot.portfolio.positions.contains(where: { $0.symbol == "SOLUSDT" }),
+                      !snapshot.portfolio.trades.contains(where: { $0.symbol == "SOLUSDT" }),
                       snapshot.agents.contains(where: { $0.roleId == "sol_trader" }) else {
-                    fatalError("SOL trader fixture is missing its quote, paper activity, mode, or agent projection")
+                    fatalError("SOL trader fixture must use the actual execution projection, not research simulation")
+                }
+                switch accountFixture {
+                case .normal:
+                    guard snapshot.tradingMode?.actualSolExecution?.positions?.contains(where: { $0.symbol == "SOLUSDT" }) == true else {
+                        fatalError("Normal SOL rendering fixture must include actual account exposure")
+                    }
+                case .offlineRetainedPnl:
+                    guard snapshot.tradingMode?.accountEquity != nil,
+                          snapshot.tradingMode?.tradingPnl != nil,
+                          snapshot.tradingMode?.accountDay == "2026-10-30" else {
+                        fatalError("Offline SOL fixture must retain its recorded account metrics")
+                    }
+                case .priorUTCDay:
+                    guard snapshot.tradingMode?.accountEquity != nil,
+                          snapshot.tradingMode?.tradingPnl != nil,
+                          snapshot.tradingMode?.accountDay == "2026-10-29" else {
+                        fatalError("Rollover fixture must retain the prior UTC-day account metrics")
+                    }
+                case .zeroEquityLoss:
+                    guard snapshot.tradingMode?.accountEquity == 0,
+                          snapshot.tradingMode?.accountEquity.map({ PrismFormat.money($0) }) == PrismFormat.money(0),
+                          snapshot.tradingMode?.tradingPnl == -1_038.6,
+                          snapshot.tradingMode?.actualSolExecution?.confirmedFlat == false else {
+                        fatalError("Zero-equity account loss must remain distinct from missing equity and confirmed flatness")
+                    }
+                case .unavailableEquity:
+                    guard snapshot.tradingMode?.accountEquity == nil,
+                          snapshot.tradingMode?.tradingPnl == nil,
+                          snapshot.tradingMode?.accountStatus == "stale",
+                          snapshot.tradingMode?.accountAsOf != nil,
+                          snapshot.tradingMode?.actualSolExecution?.confirmedFlat == false else {
+                        fatalError("Unavailable current equity must not be replaced by a saved baseline or confirmed flatness")
+                    }
+                }
+                if [.zeroEquityLoss, .unavailableEquity].contains(accountFixture) {
+                    guard snapshot.tradingMode?.actualSolExecution?.positionsStatus == "unavailable",
+                          snapshot.tradingMode?.actualSolExecution?.positions?.isEmpty == true,
+                          snapshot.tradingMode?.enabled == false,
+                          snapshot.tradingMode?.pending == true,
+                          snapshot.operations?.riskStatus == "reconciliation_required" else {
+                        fatalError("Account-loss fixtures must remain unreconciled and unconfirmed flat")
+                    }
+                }
+                let fixtureNow = accountFixture == .priorUTCDay
+                    ? PrismFormat.date("2026-10-30T00:00:05Z")!
+                    : PrismFormat.date("2026-10-30T10:01:00Z")!
+                let connected = accountFixture != .offlineRetainedPnl
+                let isCurrent = TradingAccountPresentation.isCurrent(
+                    snapshot.tradingMode!, connected: connected, now: fixtureNow)
+                if let asOf = snapshot.tradingMode?.accountAsOf, let recordedAt = PrismFormat.date(asOf) {
+                    guard !TradingAccountPresentation.isCurrent(snapshot.tradingMode!, connected: true,
+                        now: recordedAt.addingTimeInterval(-1)) else {
+                        fatalError("A future account timestamp cannot be presented as current")
+                    }
+                }
+                if accountFixture == .zeroEquityLoss {
+                    guard isCurrent,
+                          TradingAccountPresentation.pnlTitle(snapshot.tradingMode!, current: isCurrent) == "Trading P&L · today",
+                          TradingAccountPresentation.equityTitle(current: isCurrent) == "Account equity" else {
+                        fatalError("A connected, current-day zero balance must retain its recorded-current labels")
+                    }
+                }
+                if accountFixture == .offlineRetainedPnl || accountFixture == .priorUTCDay {
+                    guard !isCurrent,
+                          TradingAccountPresentation.pnlTitle(snapshot.tradingMode!, current: isCurrent) == "Trading P&L · recorded",
+                          TradingAccountPresentation.equityTitle(current: isCurrent) == "Account equity · snapshot" else {
+                        fatalError("Disconnected or prior-day values must be labeled as recorded snapshots")
+                    }
                 }
             }
             isConnected = true
+            if accountFixture == .offlineRetainedPnl { isConnected = false }
             errorMessage = nil
             pnlSamples = state?.portfolio.pnlSamples ?? []
         }
@@ -74,12 +154,10 @@ final class RuntimeClient: ObservableObject {
     func updateDailySpendCeiling(_ amount: Double?) async -> Bool { false }
     func selectTradingMode(_ mode: String) async -> Bool { false }
 
-    fileprivate static func singleTraderFixture(solSampleCount: Int) -> String {
+    fileprivate static func singleTraderFixture(solSampleCount: Int,
+                                                accountFixture: SingleTraderAccountFixture = .normal) -> String {
         let data = Data(fixture.utf8)
         guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              var portfolio = root["portfolio"] as? [String: Any],
-              var positions = portfolio["positions"] as? [[String: Any]],
-              var trades = portfolio["trades"] as? [[String: Any]],
               var agents = root["agents"] as? [[String: Any]],
               var markets = root["markets"] as? [[String: Any]] else {
             fatalError("Could not prepare local SOL trader rendering fixture")
@@ -93,16 +171,24 @@ final class RuntimeClient: ObservableObject {
             "lifetime_model_budget_usd": 12.0, "trading_pnl": 38.6, "trading_return": 0.0386,
             "account_equity": 1_038.6, "gross_exposure": 720.0, "leverage": 0.72,
             "leverage_policy": "capped", "venue_max_leverage": 20.0,
+            "account_as_of": "2026-10-30T10:00:00Z", "account_day": "2026-10-30",
+            "account_status": "current",
             "max_position_risk_fraction": 0.02, "enabled": true,
-            "api_spent_usd": 1.18, "api_reserved_usd": 0.22, "pending": false
+            "api_spent_usd": 1.18, "api_reserved_usd": 0.22, "pending": false,
+            "actual_sol_execution": [
+                "environment": "paper", "account_scope": "opaque-fixture-scope",
+                "positions_status": "confirmed", "positions_as_of": "2026-10-30T10:00:00Z",
+                "confirmed_flat": false,
+                "positions": [["id": "sol-position-fixture", "category": "linear",
+                    "symbol": "SOLUSDT", "side": "long", "quantity": 4.0,
+                    "entry_price": 174.25, "mark_price": 179.8, "leverage": 2.0,
+                    "stop_loss": 168.0, "ownership": "managed"]],
+                "fills_available": true, "fills_truncated": false,
+                "fills": [["id": "sol-exec-1", "side": "buy", "quantity": 4.0,
+                    "price": 174.25, "timestamp": "2026-10-30T09:15:00Z",
+                    "fee": 0.4182, "fee_currency": "USDT", "realized_pnl": 0.0]]
+            ] as [String: Any]
         ]
-        positions.append(["symbol": "SOLUSDT", "side": "long", "quantity": 4.0,
-                          "entry_price": 174.25, "mark_price": 179.8, "unrealized_pnl": 22.2])
-        trades.append(["id": "sol-trade-1", "symbol": "SOLUSDT", "side": "buy", "quantity": 4.0,
-                       "price": 174.25, "timestamp": "2026-10-30T09:15:00Z", "realized_pnl": 16.4])
-        portfolio["positions"] = positions
-        portfolio["trades"] = trades
-        root["portfolio"] = portfolio
         markets.append(["symbol": "SOLUSDT", "price": 179.8, "change_24h": 0.027,
                         "funding_rate": 0.0001, "updated_at": "2026-10-30T10:00:00Z"])
         root["markets"] = markets
@@ -114,6 +200,55 @@ final class RuntimeClient: ObservableObject {
             ]
         } else {
             root.removeValue(forKey: "sol_chart")
+        }
+        if [.zeroEquityLoss, .unavailableEquity].contains(accountFixture) {
+            if var mode = root["trading_mode"] as? [String: Any] {
+                mode["enabled"] = false
+                mode["pending"] = true
+                mode["unsupported_reason"] = "Synthetic fixture: account reconciliation is required."
+                if var actual = mode["actual_sol_execution"] as? [String: Any] {
+                    actual["positions_status"] = "unavailable"
+                    actual["positions_as_of"] = NSNull()
+                    actual["confirmed_flat"] = false
+                    actual["positions"] = []
+                    mode["actual_sol_execution"] = actual
+                }
+                switch accountFixture {
+                case .normal:
+                    break
+                case .zeroEquityLoss:
+                    mode["account_equity"] = 0.0
+                    mode["trading_pnl"] = -1_038.6
+                    mode["trading_return"] = -1.0
+                    mode["account_status"] = "current"
+                    mode["account_as_of"] = "2026-10-30T10:00:00Z"
+                    mode["account_day"] = "2026-10-30"
+                case .unavailableEquity:
+                    mode["account_equity"] = NSNull()
+                    mode["trading_pnl"] = NSNull()
+                    mode["trading_return"] = NSNull()
+                    mode["account_as_of"] = "2026-10-29T10:00:00Z"
+                    mode["account_day"] = "2026-10-29"
+                    mode["account_status"] = "stale"
+                    // Retained host accounting state must not be mistaken for
+                    // current equity when the live value is unavailable.
+                    mode["daily_baseline_equity"] = 1_038.6
+                case .offlineRetainedPnl, .priorUTCDay:
+                    break
+                }
+                root["trading_mode"] = mode
+            }
+            if var operations = root["operations"] as? [String: Any] {
+                operations["risk_status"] = "reconciliation_required"
+                root["operations"] = operations
+            }
+        } else if accountFixture == .priorUTCDay, var mode = root["trading_mode"] as? [String: Any] {
+            // The source was fresh 35 seconds ago; the UTC day rolled while
+            // the service snapshot remained connected and otherwise current.
+            mode["account_as_of"] = "2026-10-29T23:59:30Z"
+            mode["account_day"] = "2026-10-29"
+            mode["account_status"] = "current"
+            root["trading_mode"] = mode
         }
         agents.append(["id": "agent-sol-trader", "name": "SOL Perpetual Trader", "team": "Trading",
                        "status": "working", "task": "Manage paper SOLUSDT position", "last_run_at": "2026-10-30T09:58:00Z",
@@ -285,6 +420,17 @@ enum UIRenderingCheck {
                 rendered += 1
             } catch { failures.append("\(name): \(error)") }
         }
+        for scenario in [SingleTraderAccountFixture.zeroEquityLoss, .unavailableEquity,
+                         .offlineRetainedPnl, .priorUTCDay] {
+            let name = "single-trader-account-\(scenario.rawValue)"
+            do {
+                try render(appearance: .aqua, colorScheme: .light, size: NSSize(width: 840, height: 1100),
+                           includeSnapshot: true, singleTraderFixture: true, solSampleCount: 120,
+                           initialWorkspace: .singleTrader, accountFixture: scenario,
+                           destination: output.appendingPathComponent("\(name).png"))
+                rendered += 1
+            } catch { failures.append("\(name): \(error)") }
+        }
         for (name, workspace, snapshot, traderFixture, pending, paused, page) in [
             ("single-trader-offline-minimum", PrismWorkspace.singleTrader, false, false, false, false, PrismPage.overview),
             ("single-trader-chart-absent", .singleTrader, true, true, false, false, .overview),
@@ -322,10 +468,12 @@ enum UIRenderingCheck {
                                size: NSSize, includeSnapshot: Bool, singleTraderFixture: Bool = false,
                                solSampleCount: Int = 0, initialWorkspace: PrismWorkspace?,
                                eligibilityPending: Bool = false, paused: Bool = false,
-                               tradeReviewStatus: String? = nil, destination: URL) throws {
+                               tradeReviewStatus: String? = nil,
+                               accountFixture: SingleTraderAccountFixture = .normal,
+                               destination: URL) throws {
         NSApp.appearance = NSAppearance(named: appearance)
         let runtime = RuntimeClient(includeSnapshot: includeSnapshot, singleTraderFixture: singleTraderFixture,
-                                    solSampleCount: solSampleCount)
+                                    solSampleCount: solSampleCount, accountFixture: accountFixture)
         if includeSnapshot && (eligibilityPending || paused || tradeReviewStatus != nil) {
             let json = singleTraderFixture ? RuntimeClient.singleTraderFixture(solSampleCount: solSampleCount) : RuntimeClient.fixture
             var object = try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]

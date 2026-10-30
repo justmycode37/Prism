@@ -162,6 +162,14 @@ class MarketDataTests(unittest.TestCase):
         self.assertTrue(all(row['ok'] for row in self.service.initialize()))
         self.service.ingest_message(ticker(self.clock.ms), (value or strategy())['market_policy']['category'])
 
+    def setup_sol_strategy(self):
+        value = strategy('sol', category='linear')
+        value['market_policy']['symbol'] = 'SOLUSDT'
+        value['spec']['symbol'] = 'SOLUSDT'
+        self.service.register_strategy(value)
+        self.assertTrue(all(row['ok'] for row in self.service.initialize()))
+        self.service.ingest_message(ticker(self.clock.ms, category='linear', symbol='SOLUSDT'), 'linear')
+
     def live_close(self, *, interval='1', category='spot', start=None, close=None):
         width = INTERVAL_MS[interval]
         start = self.clock.ms // width * width if start is None else start
@@ -319,6 +327,96 @@ class MarketDataTests(unittest.TestCase):
         self.assertTrue(next_snap['ready'], next_snap['reason'])
         self.assertEqual(len(self.events), before + 2)
 
+    def test_live_close_confirms_identical_rest_tail_without_losing_forward_evidence(self):
+        self.setup_sol_strategy()
+        second_version = strategy('sol-v2', category='linear')
+        second_version['market_policy']['symbol'] = 'SOLUSDT'
+        second_version['spec']['symbol'] = 'SOLUSDT'
+        self.service.register_strategy(second_version)
+        # Recovery can include the just-closed minute when it runs after the
+        # boundary. An identical websocket confirmation must promote its
+        # provenance instead of being discarded as a duplicate.
+        self.clock.advance(60.1)
+        result = self.service.backfill('linear', 'SOLUSDT', '1')
+        self.assertTrue(result[0]['ok'])
+        series = self.service._series[('linear', 'SOLUSDT', '1')]
+        self.assertEqual(series['bars'][self.base]['source'], 'rest')
+        historical = self.service.snapshot('sol')
+        self.assertFalse(historical['ready'])
+
+        self.service.ingest_message(ticker(self.clock.ms, category='linear',
+                                           sequence=self.clock.ms, symbol='SOLUSDT'), 'linear')
+        # Bybit's documented envelope timestamp may equal our normalized
+        # exclusive end boundary; it is still after close because host receipt
+        # occurs after that boundary.
+        self.service.ingest_message(kline(self.base, ts=self.base + 60000, symbol='SOLUSDT'), 'linear')
+        snapshot = self.service.snapshot('sol')
+        second_snapshot = self.service.snapshot('sol-v2')
+
+        self.assertTrue(snapshot['ready'], snapshot['reason'])
+        self.assertTrue(snapshot['live_observation'])
+        self.assertTrue(second_snapshot['ready'], second_snapshot['reason'])
+        self.assertTrue(second_snapshot['live_observation'])
+        self.assertNotEqual(historical['snapshot_id'], snapshot['snapshot_id'])
+        self.assertTrue(self.service.snapshot_status(historical['snapshot_id'])['valid'])
+        frozen_historical = self.store.snapshot(historical['snapshot_id'])['value']
+        self.assertFalse(frozen_historical['ready'])
+        self.assertFalse(frozen_historical['live_observation'])
+        self.assertEqual(frozen_historical['candles'][-1]['source'], 'rest')
+        self.assertEqual(series['bars'][self.base]['source'], 'websocket')
+        self.assertEqual([event['kind'] for event in self.events[-4:]],
+                         ['candle_closed', 'signal', 'candle_closed', 'signal'])
+
+    def test_stale_websocket_replay_cannot_promote_historical_rest_tail(self):
+        self.setup_sol_strategy()
+        self.clock.advance(60.1)
+        self.service.backfill('linear', 'SOLUSDT', '1')
+        self.clock.advance(40)
+        self.service.ingest_message(kline(self.base, ts=self.base + 60001, symbol='SOLUSDT'), 'linear')
+        series = self.service._series[('linear', 'SOLUSDT', '1')]
+        self.assertEqual(series['bars'][self.base]['source'], 'rest')
+        self.assertFalse(self.service.snapshot('sol')['live_observation'])
+
+    def test_identical_live_confirmation_preserves_earlier_prospective_snapshots(self):
+        self.setup_strategy()
+        prior = self.live_close()
+        self.assertTrue(prior['live_observation'])
+        with self.store.connection() as db:
+            db.execute('INSERT INTO md_snapshot_pins VALUES (?)', (prior['snapshot_id'],))
+        self.clock.advance(60)
+        self.service.backfill('spot', 'BTCUSDT', '1')
+        historical = self.service.snapshot('s')
+        self.assertFalse(historical['live_observation'])
+        self.service.ingest_message(ticker(self.clock.ms, sequence=self.clock.ms), 'spot')
+        self.service.ingest_message(kline(self.base + 60000, ts=self.clock.ms), 'spot')
+        latest = self.service.snapshot('s')
+        self.assertTrue(latest['live_observation'])
+        self.assertTrue(self.service.snapshot_status(prior['snapshot_id'])['valid'],
+                        'An unchanged later candle cannot invalidate earlier forward evidence')
+
+    def test_live_confirmation_cannot_promote_bar_that_predates_strategy_registration(self):
+        self.setup_sol_strategy()
+        self.clock.advance(60.1)
+        self.service.backfill('linear', 'SOLUSDT', '1')
+        with self.service._lock:
+            # Model a version registered after this candle started while
+            # retaining its already shared durable history.
+            self.service._strategies['sol']['registered_at_ms'] = self.base + 1
+            self.service._persist_strategy(self.service._strategies['sol'])
+        self.service.ingest_message(kline(self.base, ts=self.clock.ms, symbol='SOLUSDT'), 'linear')
+        series = self.service._series[('linear', 'SOLUSDT', '1')]
+        self.assertEqual(series['bars'][self.base]['source'], 'rest')
+        self.assertFalse(self.service.snapshot('sol')['live_observation'])
+
+    def test_live_confirmation_before_close_timestamp_cannot_promote_rest_tail(self):
+        self.setup_sol_strategy()
+        self.clock.advance(60.1)
+        self.service.backfill('linear', 'SOLUSDT', '1')
+        self.service.ingest_message(kline(self.base, ts=self.base + 59999, symbol='SOLUSDT'), 'linear')
+        series = self.service._series[('linear', 'SOLUSDT', '1')]
+        self.assertEqual(series['bars'][self.base]['source'], 'rest')
+        self.assertFalse(self.service.snapshot('sol')['live_observation'])
+
     def test_recovery_can_prepend_history_after_websocket_wins_startup_race(self):
         self.service.register_strategy(strategy())
         self.service.ingest_message(kline(self.base - 60000), 'spot')
@@ -366,6 +464,46 @@ class MarketDataTests(unittest.TestCase):
         self.assertFalse(snap['ready'])
         self.assertEqual(snap['quote'], quote)
         self.assertIn('quote', snap['reason'])
+
+    def test_sequence_high_watermark_survives_a_message_without_sequence(self):
+        self.setup_strategy(strategy(category='linear'))
+        self.live_close(category='linear')
+        instrument = self.service._instruments[('linear', 'BTCUSDT')]
+        accepted_sequence = instrument['quote_sequence']
+        self.assertIsNotNone(accepted_sequence)
+
+        self.clock.advance(1)
+        self.assertTrue(self.service.ingest_message(ticker(
+            self.clock.ms, sequence=None, data={'bid1Price': '100.1', 'ask1Price': '100.11'}), 'linear'))
+        quote_after_unsequenced = self.service.snapshot('s')['quote']
+        self.assertEqual(instrument['quote_sequence'], accepted_sequence)
+
+        # The newer exchange timestamp cannot authorize a lower sequence.
+        self.clock.advance(1)
+        self.assertFalse(self.service.ingest_message(ticker(
+            self.clock.ms, sequence=accepted_sequence - 1,
+            data={'bid1Price': '99', 'ask1Price': '99.01'}), 'linear'))
+        self.assertEqual(self.service.snapshot('s')['quote'], quote_after_unsequenced)
+
+    def test_process_restart_resets_ticker_sequence_epoch(self):
+        self.setup_strategy(strategy(category='linear'))
+        self.live_close(category='linear')
+        old_sequence = self.service._instruments[('linear', 'BTCUSDT')]['quote_sequence']
+        self.assertIsNotNone(old_sequence)
+
+        self.service.stop()
+        self.service = MarketDataService(self.store, self.rest, clock=self.clock)
+        instrument = self.service._instruments[('linear', 'BTCUSDT')]
+        self.assertIsNone(instrument['quote_sequence'])
+        self.clock.advance(1)
+        self.assertTrue(self.service.ingest_message(ticker(
+            self.clock.ms, sequence=None, data={'bid1Price': '100', 'ask1Price': '100.01'}), 'linear'))
+        self.clock.advance(1)
+        # New epoch sequence numbers can restart below the old process's
+        # persisted high-water mark after the first unsequenced snapshot.
+        self.assertTrue(self.service.ingest_message(ticker(
+            self.clock.ms, sequence=1, data={'bid1Price': '100.1', 'ask1Price': '100.11'}), 'linear'))
+        self.assertEqual(instrument['quote_sequence'], 1)
 
     def test_spot_wire_uses_level_one_book_and_ticker_turnover_with_independent_freshness(self):
         self.service.register_strategy(strategy())

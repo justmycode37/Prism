@@ -136,6 +136,20 @@ class SolModeIntegrationTests(unittest.TestCase):
         self.runtime.update_configuration({'trading_mode': {'selected': 'research'}})
         self.assertEqual(agent._base('execution', {}, 'execution')['reasoning']['effort'], 'high')
 
+    def test_support_specialists_use_bounded_sol_support_routing_and_shared_mode_budget(self):
+        offline = OfflineTransport()
+        agent = ResponsesAgent(self.store, ModelProvider(lambda: 'fixture-key', offline))
+        self.select_sol()
+        schema = {'type': 'object', 'properties': {'ok': {'type': 'boolean'}},
+                  'required': ['ok'], 'additionalProperties': False}
+        agent.structured('support', {'instrument': {'symbol': 'SOLUSDT'}}, schema,
+                         task_id='sol-support-routing', role='support')
+        request = offline.requests[0]
+        self.assertEqual((request['model'], request['reasoning']['effort']), ('gpt-6-luna', 'max'))
+        self.assertNotIn('tools', request)
+        self.assertGreater(agent.budget.mode_budget()['spent_usd'], 0)
+        self.assertEqual(agent.budget.limits('support')['concurrency'], 4)
+
     def test_research_worker_cannot_spend_on_inactive_sol_review(self):
         from prism_runtime.research_service import ResearchWorker
         self.select_sol()

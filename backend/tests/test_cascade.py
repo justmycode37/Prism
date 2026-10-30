@@ -245,6 +245,34 @@ class StoreTests(unittest.TestCase):
         restarted.settle(call, {'input_tokens': 1, 'output_tokens': 1})
         self.assertEqual(restarted.budget()['spent_today_usd'], amount)
 
+    def test_settlement_uses_rates_frozen_when_call_was_admitted(self):
+        call = self.store.reserve('gpt-6-luna', 1000, 1000)
+        saved = self.store.config()
+        saved['model_prices']['gpt-6-luna'] = {'input': 100., 'output': 500.}
+        self.store.set_document('config', saved)
+        self.store.settle(call, {'input_tokens': 200, 'output_tokens': 20})
+        self.assertAlmostEqual(self.store.budget()['spent_today_usd'], .0003)
+        later = self.store.reserve('gpt-6-luna', 1000, 1000)
+        self.store.settle(later, {'input_tokens': 200, 'output_tokens': 20})
+        self.assertAlmostEqual(self.store.budget()['spent_today_usd'], .0303)
+
+    def test_settlement_without_a_rate_receipt_keeps_unknown_charge(self):
+        call = self.store.reserve('gpt-6-luna', 1000, 1000)
+        reserved = self.store.budget()['reserved_usd']
+        with self.store.connection() as db:
+            db.execute('DELETE FROM cascade_call_rates WHERE call_id=?', (call,))
+        self.store.settle(call, {'input_tokens': 200, 'output_tokens': 20})
+        self.assertEqual(self.store.budget()['spent_today_usd'], reserved)
+        with self.store.connection() as db:
+            self.assertEqual(db.execute('SELECT status FROM cascade_calls WHERE id=?', (call,)).fetchone()[0], 'unknown')
+
+    def test_unrepresentable_provider_usage_keeps_unknown_charge(self):
+        call = self.store.reserve('gpt-6-luna', 1000, 1000)
+        reserved = self.store.budget()['reserved_usd']
+        self.store.settle(call, {'input_tokens': 10 ** 400, 'output_tokens': 1})
+        self.assertEqual(self.store.budget()['spent_today_usd'], reserved)
+        self.assertEqual(self.store.budget()['reserved_usd'], 0)
+
     def test_config_rejects_unsafe_or_non_narrowing_topologies(self):
         invalid = [dict(max_concurrency=True), dict(daily_limit_usd=float('nan')), dict(model='invented'),
                    dict(sources=[{'url': 'http://localhost', 'kind': 'article'}]),

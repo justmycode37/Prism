@@ -116,16 +116,64 @@ class Runtime:
             strategy_id = self.store.get_document('sol_mode_strategy_id')
             value['strategy_id'] = strategy_id
             value['latest_trade_review'] = self._latest_trade_review(strategy_id)
-            account = (self.store.get_document('live_execution_state', {}) or {}).get('account', {})
-            # Daily venue account equity changes include fees/funding, never provider charges.
-            pnl = account.get('daily_pnl') if account.get('daily_pnl_verified') else None
-            initial = account.get('daily_baseline_equity')
+            execution_state = self.store.get_document('live_execution_state', {}) or {}
+            expected_scope = self._expected_execution_account_scope(config)
+            matching_execution_state = (isinstance(execution_state, dict) and
+                execution_state.get('environment') == config['bybit']['mode'] and
+                execution_state.get('account_scope') == expected_scope)
+            account = execution_state.get('account', {}) if (
+                matching_execution_state and
+                isinstance(execution_state.get('account'), dict) and
+                execution_state['account'].get('mode') == config['bybit']['mode']) else {}
+            now_ms = self.store._now_ms()
+            today_utc = datetime.fromtimestamp(now_ms / 1000, timezone.utc).strftime('%Y-%m-%d')
+            account_day = account.get('day') if isinstance(account.get('day'), str) else None
+            account_as_of_ms = account.get('updated_at_ms')
+            account_as_of_ms = (account_as_of_ms if type(account_as_of_ms) is int and account_as_of_ms >= 0
+                                else None)
+            account_as_of = timestamp(account_as_of_ms / 1000) if account_as_of_ms is not None else None
+            max_account_age = config['live_execution'].get('max_account_age_seconds', 60.)
+            if (type(max_account_age) not in (int, float) or not math.isfinite(max_account_age) or
+                    max_account_age <= 0):
+                max_account_age = 60.
+            account_fresh = (account_as_of_ms is not None and
+                0 <= now_ms - account_as_of_ms <= max_account_age * 1000)
+            account_binding_verified = account.get('account_binding_verified') is True
+            account_status = ('unavailable' if account_as_of_ms is None else
+                'unverified' if not account_binding_verified else
+                'current' if account_fresh else 'stale')
+            # P&L is an account-wide UTC-day delta, not model spend or an old day's value.
+            pnl_value = account.get('daily_pnl')
+            pnl_baseline = account.get('daily_baseline_equity')
+            pnl_verified = (account_status == 'current' and account_day == today_utc and
+                account.get('daily_pnl_verified') is True and
+                type(pnl_value) in (int, float) and math.isfinite(pnl_value) and
+                type(pnl_baseline) in (int, float) and math.isfinite(pnl_baseline) and pnl_baseline > 0)
+            pnl = pnl_value if pnl_verified else None
+            initial = pnl_baseline if pnl_verified else None
+            equity = account.get('equity')
+            if (account_as_of_ms is None or type(equity) not in (int, float) or
+                    not math.isfinite(equity)):
+                equity = None
+            exposure = account.get('portfolio_notional')
+            if (account_as_of_ms is None or type(exposure) not in (int, float) or
+                    not math.isfinite(exposure) or exposure < 0):
+                exposure = None
+            leverage_map = account.get('leverage_by_instrument')
+            sol_leverage = leverage_map.get('linear:SOLUSDT') if isinstance(leverage_map, dict) else None
+            if (account_status != 'current' or type(sol_leverage) not in (int, float) or
+                    not math.isfinite(sol_leverage) or sol_leverage < 1):
+                sol_leverage = None
             value.update(trading_pnl=pnl, trading_return=(pnl / initial if pnl is not None and initial else None),
-                account_equity=account.get('equity'), gross_exposure=account.get('portfolio_notional'),
-                leverage=account.get('leverage'),
+                account_equity=equity, account_as_of=account_as_of, account_day=account_day,
+                account_status=account_status, gross_exposure=exposure,
+                leverage=sol_leverage,
                 pending=not (config['bybit']['enabled'] and config['live_execution']['enabled'] and
                     strategy_id in config['live_execution']['eligible_strategy_versions']),
                 unsupported_reason='Exchange execution requires the exact qualified version, account, instrument and risk approvals.')
+            value['actual_sol_execution'] = self._actual_sol_execution_projection(
+                environment=config['bybit']['mode'], strategy_id=strategy_id,
+                expected_scope=expected_scope)
             with self.store.connection() as db:
                 exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bybit_instruments'").fetchone()
                 row = db.execute('SELECT value,updated_at_ms FROM bybit_instruments WHERE mode=? AND category=? AND symbol=?',
@@ -137,6 +185,132 @@ class Runtime:
                 except (ValueError, TypeError):
                     value['venue_max_leverage'] = None
         return value
+
+    @staticmethod
+    def _expected_execution_account_scope(config):
+        """Match ExecutionController._scope without reading credentials."""
+        environment = config['bybit']['mode']
+        account_id = config['bybit'].get('account_id', '')
+        account_id = account_id.strip() if isinstance(account_id, str) else ''
+        subject = account_id or 'unbound'
+        payload = json.dumps([environment, subject], allow_nan=False, separators=(',', ':'))
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+    def _actual_sol_execution_projection(self, *, environment, strategy_id, expected_scope):
+        """Project bounded actual Bybit SOL fills and the matching controller snapshot.
+
+        Reads only durable local state. It never constructs an adapter, loads
+        credentials, or contacts the venue. Missing or mismatched controller
+        state cannot be presented as a confirmed flat account.
+        """
+        stored = self.store.get_document('live_execution_state', {}) or {}
+        now_ms = self.store._now_ms()
+        positions, as_of, positions_truncated = [], None, False
+        positions_status = 'unavailable'
+        confirmed_flat = False
+        account_value = stored.get('account') if isinstance(stored, dict) else None
+        matching_scope = (isinstance(stored, dict) and stored.get('environment') == environment and
+                          stored.get('account_scope') == expected_scope and
+                          isinstance(account_value, dict) and account_value.get('mode') == environment)
+        account = account_value if matching_scope else {}
+        raw_positions = stored.get('positions') if matching_scope else None
+        state_as_of = stored.get('updated_at_ms') if matching_scope else None
+        as_of_ms = state_as_of if type(state_as_of) is int and state_as_of >= 0 else None
+        if (matching_scope and isinstance(raw_positions, list) and as_of_ms is not None):
+            as_of = timestamp(as_of_ms / 1000)
+            incomplete = False
+            for row in raw_positions:
+                if not isinstance(row, dict):
+                    incomplete = True
+                    continue
+                if row.get('category') != 'linear' or row.get('symbol') != 'SOLUSDT':
+                    continue
+                quantity = row.get('quantity')
+                entry = row.get('entry_price')
+                mark = row.get('mark_price')
+                if (type(quantity) not in (int, float) or not math.isfinite(quantity) or quantity == 0 or
+                        type(entry) not in (int, float) or not math.isfinite(entry) or entry <= 0 or
+                        type(mark) not in (int, float) or not math.isfinite(mark) or mark <= 0):
+                    incomplete = True
+                    continue
+                owner_id = row.get('strategy_id') if isinstance(row.get('strategy_id'), str) else None
+                ownership = ('managed' if owner_id and owner_id == strategy_id else
+                             'other_strategy' if owner_id else 'unattributed')
+                leverage = row.get('leverage')
+                if type(leverage) not in (int, float) or not math.isfinite(leverage) or leverage < 1:
+                    leverage = None
+                stop_loss = row.get('stop_loss')
+                if type(stop_loss) not in (int, float) or not math.isfinite(stop_loss) or stop_loss <= 0:
+                    stop_loss = None
+                side = 'short' if quantity < 0 else 'long'
+                position_id = 'sol-linear-' + identity([environment, owner_id or ownership, side])[:20]
+                positions.append({'id': position_id, 'category': 'linear',
+                    'symbol': 'SOLUSDT', 'side': side,
+                    'quantity': abs(quantity), 'entry_price': entry, 'mark_price': mark,
+                    'leverage': leverage, 'stop_loss': stop_loss, 'ownership': ownership})
+            positions.sort(key=lambda row: (row['ownership'] != 'managed', row['id']))
+            positions_truncated = len(positions) > 12
+            positions = positions[:12]
+            reconciliation = stored.get('reconciliation_required')
+            account_reconciliation = account.get('reconciliation_required')
+            binding_verified = account.get('account_binding_verified') is True
+            fresh = 0 <= now_ms - as_of_ms <= 60_000
+            if (not incomplete and reconciliation is False and account_reconciliation is False and
+                    binding_verified and fresh):
+                positions_status = 'confirmed'
+                confirmed_flat = len(positions) == 0
+            else:
+                positions_status = 'stale'
+
+        fills, fills_available, fills_truncated, rows = [], False, False, []
+        if matching_scope and isinstance(strategy_id, str) and strategy_id:
+            with self.store.connection() as db:
+                tables = {row['name'] for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('bybit_orders','bybit_executions')")}
+                fills_available = tables == {'bybit_orders', 'bybit_executions'}
+                if fills_available:
+                    rows = db.execute('''SELECT e.exec_id,e.exec_time_ms,e.qty,e.price,e.fee,
+                                e.fee_currency,e.realized_pnl,e.value,o.intent
+                        FROM bybit_executions e JOIN bybit_orders o
+                          ON o.mode=e.mode AND o.order_link_id=e.order_link_id
+                        WHERE e.mode=? AND e.category='linear' AND e.symbol='SOLUSDT'
+                          AND json_extract(o.intent,'$.category')='linear'
+                          AND json_extract(o.intent,'$.symbol')='SOLUSDT'
+                          AND json_extract(o.intent,'$.strategy_id')=?
+                          AND COALESCE(json_extract(e.value,'$.execType'),'Trade')='Trade'
+                        ORDER BY e.exec_time_ms DESC,e.exec_id DESC LIMIT 6''',
+                        (environment, strategy_id)).fetchall()
+            fills_truncated = len(rows) > 5
+            for row in rows[:5]:
+                try:
+                    item = json.loads(row['value'])
+                    quantity, price = float(row['qty']), float(row['price'])
+                    fee = float(row['fee'])
+                    realized = float(row['realized_pnl'])
+                    at_ms = int(row['exec_time_ms'])
+                except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+                    fills_available = False
+                    fills = []
+                    break
+                try:
+                    intent = json.loads(row['intent'])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    intent = {}
+                side = item.get('side') or intent.get('side')
+                if (side not in {'Buy', 'Sell'} or not all(math.isfinite(x) for x in
+                        (quantity, price, fee, realized)) or quantity <= 0 or price <= 0 or at_ms < 0):
+                    fills_available = False
+                    fills = []
+                    break
+                fills.append({'id': row['exec_id'], 'side': side.lower(), 'quantity': quantity,
+                    'price': price, 'timestamp': timestamp(at_ms / 1000), 'fee': fee,
+                    'fee_currency': row['fee_currency'], 'realized_pnl': realized})
+        return {'environment': environment,
+            'positions_status': positions_status, 'positions_as_of': as_of,
+            'confirmed_flat': confirmed_flat, 'positions': positions,
+            'positions_truncated': positions_truncated,
+            'fills_available': fills_available, 'fills_truncated': fills_truncated,
+            'fills': fills}
 
     def _latest_trade_review(self, strategy_id):
         """Project only the active SOL version's safe reviewer decision fields."""
@@ -339,10 +513,12 @@ class Runtime:
             return self.continuous.state()
         from .operations_console import projection
         config = self.store.config()
+        sol = is_sol_mode(config)
         return projection(mode=config['bybit']['mode'], enabled=False,
-            schedule={'rationale': 'Runtime is paused; Start enables the independent services and validated event schedule.'},
+            schedule={'rationale': 'Runtime is paused; Start enables independent services to watch live SOLUSDT minute observations.'
+                      if sol else 'Runtime is paused; Start enables the independent services and validated event schedule.'},
             calendar=[], subscriptions=[], memory=self.memory.state(), execution={},
-            resources=self.component_budget.state(), blocked=[{'kind': 'Calendar coverage',
+            resources=self.component_budget.state(), blocked=[] if sol else [{'kind': 'Calendar coverage',
                 'reason': 'Calendar coverage has not yet been loaded and verified.'}])
 
     def _active(self, generation):
@@ -602,7 +778,8 @@ class Runtime:
         try:
             result = self.provider.run(model_agent, payload)
         except Exception as error:
-            self.store.settle(reservation, getattr(error, 'usage', None))
+            self.store.settle(reservation, getattr(error, 'usage', None),
+                              request_started=getattr(error, 'request_started', None))
             raise
         self.store.settle(reservation, result.get('usage'))
         output = result.get('output')

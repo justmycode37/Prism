@@ -4,6 +4,10 @@ Only public market requests may leave this transport, through an explicitly
 supplied public transport. Account/order routes are always local. A create
 acknowledgement never fills an order: a later measured quote must match it.
 This conservative top-of-book simulator does not model queue priority.
+The v1 document remains the canonical accounting checkpoint. A separate
+revisioned compact head carries the newest quote state between accounting
+writes; runtime reads must use this adapter's _load/request paths so that
+quotes are overlaid only while the head matches the canonical revision.
 """
 from __future__ import annotations
 
@@ -27,18 +31,185 @@ class PaperExchange:
         self._lock = threading.RLock()
         # A distinct document never reads, changes or impersonates a real account.
         self._key = 'bybit_paper_exchange_v1'
-        if store.get_document(self._key) is None:
-            store.set_document(self._key, {'cash': initial_equity, 'initial_equity': initial_equity,
+        self._head_key = 'bybit_paper_exchange_head_v1'
+        self._revision_key = 'bybit_paper_exchange_revision_v1'
+        self._ensure_head_storage()
+
+    def _ensure_head_storage(self):
+        """Install canonical-document invalidation and initialize its compact head."""
+        with self.store.connection() as db:
+            db.execute('INSERT OR IGNORE INTO cascade_meta(key,value) VALUES (?,?)',
+                       (self._revision_key, '0'))
+            # All normal Store writes and direct fixture SQL writes to the
+            # canonical document pass through this revision trigger. The head
+            # is only trusted while it names the same canonical revision.
+            db.executescript(f'''
+                CREATE TRIGGER IF NOT EXISTS bybit_paper_revision_insert
+                AFTER INSERT ON cascade_meta WHEN NEW.key='{self._key}' BEGIN
+                    UPDATE cascade_meta SET value=CAST(value AS INTEGER)+1 WHERE key='{self._revision_key}';
+                END;
+                CREATE TRIGGER IF NOT EXISTS bybit_paper_revision_update
+                AFTER UPDATE OF value ON cascade_meta
+                WHEN OLD.key='{self._key}' AND NEW.key='{self._key}' AND OLD.value IS NOT NEW.value BEGIN
+                    UPDATE cascade_meta SET value=CAST(value AS INTEGER)+1 WHERE key='{self._revision_key}';
+                END;
+                CREATE TRIGGER IF NOT EXISTS bybit_paper_revision_delete
+                AFTER DELETE ON cascade_meta WHEN OLD.key='{self._key}' BEGIN
+                    UPDATE cascade_meta SET value=CAST(value AS INTEGER)+1 WHERE key='{self._revision_key}';
+                END;
+            ''')
+            row = db.execute('SELECT 1 FROM cascade_meta WHERE key=?', (self._key,)).fetchone()
+        if row is None:
+            self._save({'cash': self.initial_equity, 'initial_equity': self.initial_equity,
                 'orders': {}, 'executions': [], 'transactions': [], 'positions': {},
                 'quotes': {}, 'quote_ids': {}, 'leverages': {}, 'counter': 0})
 
+    @staticmethod
+    def _head_for_state(state, revision):
+        positions = state.get('positions')
+        orders = state.get('orders')
+        flat = isinstance(positions, dict) and isinstance(orders, dict)
+        if flat:
+            for position in positions.values():
+                quantity = position.get('quantity') if isinstance(position, dict) else None
+                if (type(quantity) not in (int, float) or not math.isfinite(quantity) or
+                        quantity != 0):
+                    flat = False
+                    break
+        active_count = None
+        if isinstance(orders, dict):
+            terminal = {'Filled', 'Cancelled', 'Rejected', 'Deactivated', 'PartiallyFilledCanceled'}
+            active_count = sum(1 for order in orders.values()
+                               if not isinstance(order, dict) or order.get('orderStatus') not in terminal)
+        else:
+            flat = False
+        return {'revision': revision, 'flat': flat, 'active_order_count': active_count,
+                'quotes': copy.deepcopy(state.get('quotes', {})),
+                'quote_ids': copy.deepcopy(state.get('quote_ids', {}))}
+
+    @staticmethod
+    def _encode(value):
+        return json.dumps(value, allow_nan=False, separators=(',', ':'))
+
+    def _write_head(self, db, state, revision):
+        head = self._head_for_state(state, revision)
+        db.execute('INSERT INTO cascade_meta(key,value) VALUES (?,?) ON CONFLICT(key) '
+                   'DO UPDATE SET value=excluded.value', (self._head_key, self._encode(head)))
+        return head
+
+    def _read_valid_head(self, db):
+        rows = db.execute('SELECT key,value FROM cascade_meta WHERE key IN (?,?)',
+                          (self._head_key, self._revision_key)).fetchall()
+        values = {row['key']: row['value'] for row in rows}
+        try:
+            revision = int(values[self._revision_key])
+            head = json.loads(values[self._head_key])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(head, dict):
+            return None
+        if head.get('revision') != revision:
+            return None
+        return head
+
     def _load(self):
-        state = self.store.get_document(self._key)
+        with self.store.connection() as db:
+            # A missing head is rebuilt in this transaction. Freeze canonical
+            # state and its revision together even with another Store writer.
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT value FROM cascade_meta WHERE key=?', (self._key,)).fetchone()
+            revision_row = db.execute('SELECT value FROM cascade_meta WHERE key=?',
+                                      (self._revision_key,)).fetchone()
+            if row is None:
+                raise ValueError('Paper exchange canonical state is missing')
+            state = json.loads(row['value'])
+            revision = int(revision_row['value']) if revision_row else 0
+            head = self._read_valid_head(db)
+            if head is None:
+                # Direct canonical edits invalidate the compact quote and
+                # flatness cache. Rebuild it from the just-read state.
+                head = self._write_head(db, state, revision)
+        # Latest measured quotes live in the compact head between canonical
+        # accounting writes. _load is the compatibility view that overlays
+        # them; direct raw v1 document reads remain a checkpoint representation.
+        state['quotes'] = copy.deepcopy(head.get('quotes', {}))
+        state['quote_ids'] = copy.deepcopy(head.get('quote_ids', {}))
         state.setdefault('leverages', {})
         return state
 
     def _save(self, state):
-        self.store.set_document(self._key, state)
+        with self.store.connection() as db:
+            db.execute('INSERT INTO cascade_meta(key,value) VALUES (?,?) ON CONFLICT(key) '
+                       'DO UPDATE SET value=excluded.value', (self._key, self._encode(state)))
+            row = db.execute('SELECT value FROM cascade_meta WHERE key=?',
+                             (self._revision_key,)).fetchone()
+            revision = int(row['value']) if row else 0
+            self._write_head(db, state, revision)
+
+    def _fast_head(self, *, require_flat=False):
+        with self.store.connection() as db:
+            head = self._read_valid_head(db)
+        if (head is None or type(head.get('active_order_count')) is not int or
+                head.get('active_order_count') != 0 or (require_flat and head.get('flat') is not True)):
+            return None
+        quotes, quote_ids = head.get('quotes'), head.get('quote_ids')
+        if not isinstance(quotes, dict) or not isinstance(quote_ids, dict):
+            return None
+        return head
+
+    @staticmethod
+    def _accepted_quote(snapshot, now, state):
+        category, symbol = snapshot['category'], snapshot['symbol']
+        key, quote = category + ':' + symbol, snapshot.get('quote', {})
+        if (not all(type(quote.get(k)) in (int, float) and math.isfinite(quote[k]) and quote[k] > 0
+                    for k in ('bid', 'ask', 'timestamp_ms')) or quote['bid'] > quote['ask']
+                or not 0 <= now - quote['timestamp_ms'] <= 10000):
+            return None
+        if (any(quote.get(field) is not None and
+                (type(quote[field]) not in (int, float) or not math.isfinite(quote[field]) or quote[field] < 0)
+                for field in ('bid_size', 'ask_size')) or
+                any(quote.get(field) is not None and
+                    (type(quote[field]) not in (int, float) or not math.isfinite(quote[field]) or
+                     not 0 < quote[field] <= now)
+                for field in ('book_timestamp_ms', 'ticker_timestamp_ms'))):
+            return None
+        digest = identity([quote['timestamp_ms'], quote])
+        previous = state.get('quotes', {}).get(key, {})
+        if (state.get('quote_ids', {}).get(key) == digest or
+                quote['timestamp_ms'] <= previous.get('timestamp_ms', 0) or
+                quote.get('book_timestamp_ms') is not None and
+                quote['book_timestamp_ms'] <= (previous.get('book_timestamp_ms') or 0)):
+            return None
+        return key, digest, copy.deepcopy(quote)
+
+    def _advance_flat(self, snapshots):
+        """Persist quote-only head updates without parsing closed order history."""
+        with self.store.connection() as db:
+            # Do not label an old flat head with a newer canonical revision if
+            # another connection inserts inventory or an order during a quote.
+            db.execute('BEGIN IMMEDIATE')
+            head = self._read_valid_head(db)
+            if (head is None or head.get('flat') is not True or
+                    type(head.get('active_order_count')) is not int or head.get('active_order_count') != 0 or
+                    not isinstance(head.get('quotes'), dict) or not isinstance(head.get('quote_ids'), dict)):
+                return None
+            now = round(self.clock() * 1000)
+            changed = False
+            state = {'quotes': head['quotes'], 'quote_ids': head['quote_ids']}
+            for snapshot in snapshots:
+                accepted = self._accepted_quote(snapshot, now, state)
+                if accepted is None:
+                    continue
+                key, digest, quote = accepted
+                state['quote_ids'][key], state['quotes'][key] = digest, quote
+                changed = True
+            if changed:
+                revision_row = db.execute('SELECT value FROM cascade_meta WHERE key=?',
+                                          (self._revision_key,)).fetchone()
+                head.update(revision=int(revision_row['value']), quotes=state['quotes'], quote_ids=state['quote_ids'])
+                db.execute('INSERT INTO cascade_meta(key,value) VALUES (?,?) ON CONFLICT(key) '
+                           'DO UPDATE SET value=excluded.value', (self._head_key, self._encode(head)))
+            return []
 
     @staticmethod
     def _ok(result=None, code=0, message='OK'):
@@ -50,8 +221,13 @@ class PaperExchange:
         args = json.loads(body) if body else params
         if path.startswith('/v5/market/'):
             if path == '/v5/market/tickers' and method == 'GET':
-                state = self._load()
-                quote = state['quotes'].get(args.get('category', '') + ':' + args.get('symbol', ''))
+                head = self._fast_head()
+                if head is None:
+                    state = self._load()
+                    quotes = state['quotes']
+                else:
+                    quotes = head['quotes']
+                quote = quotes.get(args.get('category', '') + ':' + args.get('symbol', ''))
                 if quote:
                     return self._ok({'list': [{'symbol': args['symbol'], 'bid1Price': str(quote['bid']),
                         'ask1Price': str(quote['ask']), 'lastPrice': str((quote['bid'] + quote['ask']) / 2),
@@ -79,7 +255,8 @@ class PaperExchange:
                     'orderStatus': 'Untriggered' if conditional else 'New',
                     'cumExecQty': '0', 'cumExecValue': '0', 'avgPrice': '0',
                     'leavesQty': str(qty), 'createdTime': str(round(self.clock() * 1000)),
-                    'updatedTime': str(round(self.clock() * 1000))}
+                    'updatedTime': str(round(self.clock() * 1000)),
+                    'paperEligibleAfterTime': str(round(self.clock() * 1000))}
                 state['orders'][link] = order
                 self._save(state)
                 return self._ok({'orderId': order['orderId'], 'orderLinkId': link})
@@ -97,6 +274,9 @@ class PaperExchange:
                     if args.get('price') is not None:
                         order['price'] = args['price']
                     order['leavesQty'] = str(qty - float(order['cumExecQty']))
+                    # A changed price or size must not use a market observation
+                    # that predates the amendment, including after restart.
+                    order['paperEligibleAfterTime'] = str(round(self.clock() * 1000))
                 order['updatedTime'] = str(round(self.clock() * 1000))
                 self._save(state)
                 return self._ok({'orderId': order['orderId'], 'orderLinkId': order['orderLinkId']})
@@ -205,11 +385,14 @@ class PaperExchange:
                 linear_margin += position['quantity'] * position['entry_price'] / leverage
                 upl += position['quantity'] * (mark - position['entry_price'])
         equity = state['cash'] + spot_value + upl
+        # Losses reduce collateral immediately. This conservative simulator
+        # does not reuse unrealized gains as cash or model portfolio margin.
+        available = max(0., state['cash'] + min(0., upl) - linear_margin)
         return {'accountType': 'UNIFIED', 'totalEquity': str(equity),
             'totalWalletBalance': str(state['cash'] + spot_value),
-            'totalAvailableBalance': str(max(0., state['cash'] - linear_margin)), 'totalPerpUPL': str(upl),
+            'totalAvailableBalance': str(available), 'totalPerpUPL': str(upl),
             'coin': [{'coin': 'USDT', 'walletBalance': str(state['cash']), 'equity': str(state['cash'] + upl),
-                      'availableToWithdraw': str(max(0., state['cash'] - linear_margin)), 'spotBorrow': '0'}, *coins]}
+                      'availableToWithdraw': str(available), 'spotBorrow': '0'}, *coins]}
 
     def advance(self, snapshots):
         """Match against a later fresh quote once; return actual simulated events.
@@ -217,21 +400,25 @@ class PaperExchange:
         Total matched volume for all orders shares the observed top-of-book size.
         Market orders use IOC semantics. No fill is manufactured on missing data.
         """
+        snapshots = tuple(snapshots)
         messages = []
         with self._lock:
+            fast_result = self._advance_flat(snapshots)
+            if fast_result is not None:
+                return fast_result
             state = self._load()
+            changed = False
             now = round(self.clock() * 1000)
             for snapshot in snapshots:
                 category, symbol = snapshot['category'], snapshot['symbol']
-                key, quote = category + ':' + symbol, snapshot.get('quote', {})
-                if (not all(type(quote.get(k)) in (int, float) and math.isfinite(quote[k]) and quote[k] > 0
-                            for k in ('bid', 'ask', 'timestamp_ms')) or quote['bid'] > quote['ask']
-                        or not 0 <= now - quote['timestamp_ms'] <= 10000):
+                # The same validation and high-water semantics are used by the
+                # flat fast path and the full matching path.
+                accepted = self._accepted_quote(snapshot, now, state)
+                if accepted is None:
                     continue
-                digest = identity([quote['timestamp_ms'], quote])
-                if state['quote_ids'].get(key) == digest:
-                    continue
+                key, digest, quote = accepted
                 state['quote_ids'][key], state['quotes'][key] = digest, copy.deepcopy(quote)
+                changed = True
                 depth = {side: max(0., float(quote.get(side + '_size') or 0)) for side in ('bid', 'ask')}
                 position = state['positions'].get(key)
                 if category == 'linear' and position and position['quantity'] > 0 and position.get('stop_loss', 0) >= quote['bid']:
@@ -243,7 +430,7 @@ class PaperExchange:
                 for order in list(state['orders'].values()):
                     if (order['category'] != category or order['symbol'] != symbol or
                             order['orderStatus'] not in {'New', 'PartiallyFilled', 'Untriggered'} or
-                            quote['timestamp_ms'] <= int(order['createdTime'])):
+                            quote['timestamp_ms'] <= int(order.get('paperEligibleAfterTime', order['createdTime']))):
                         continue
                     if order.get('orderFilter') in {'StopOrder', 'tpslOrder'} and order['orderStatus'] == 'Untriggered':
                         stop = float(order.get('triggerPrice') or 0)
@@ -273,6 +460,11 @@ class PaperExchange:
                         available = float(self._wallet(state)['totalAvailableBalance'])
                         leverage = float(state.get('leverages', {}).get(key, '1')) if category == 'linear' else 1.
                         quantity = min(quantity, available / (price / leverage + price * self.fee))
+                    if (order.get('timeInForce') == 'FOK' and
+                            quantity < float(order['qty']) - float(order['cumExecQty'])):
+                        order.update(orderStatus='Cancelled', updatedTime=str(now))
+                        messages.append({'topic': 'order', 'data': [copy.deepcopy(order)]})
+                        continue
                     if quantity > 1e-12:
                         execution = self._fill(state, order, quantity, price, now)
                         messages.append({'topic': 'execution', 'data': [execution]})
@@ -281,7 +473,8 @@ class PaperExchange:
                         order['orderStatus'] = 'PartiallyFilledCanceled' if float(order['cumExecQty']) else 'Cancelled'
                     order['updatedTime'] = str(now)
                     messages.append({'topic': 'order', 'data': [copy.deepcopy(order)]})
-            self._save(state)
+            if changed:
+                self._save(state)
         return messages
 
     def _fill(self, state, order, quantity, price, now):
@@ -290,6 +483,8 @@ class PaperExchange:
             'quantity': 0., 'entry_price': 0., 'stop_loss': 0.})
         fee, realized = quantity * price * self.fee, 0.
         if order['side'] == 'Buy':
+            if position['quantity'] <= 1e-12:
+                position['stop_loss'] = 0.
             position['entry_price'] = (position['quantity'] * position['entry_price'] + quantity * price) / (position['quantity'] + quantity)
             position['quantity'] += quantity
             if order.get('stopLoss'):
@@ -309,7 +504,7 @@ class PaperExchange:
             'category': order['category'], 'symbol': order['symbol'], 'orderId': order['orderId'],
             'orderLinkId': order['orderLinkId'], 'side': order['side'], 'execQty': str(quantity),
             'execPrice': str(price), 'execFee': str(fee), 'feeCurrency': 'USDT',
-            'execPnl': str(realized), 'execTime': str(now)}
+            'execPnl': str(realized), 'execTime': str(now), 'seq': state['counter']}
         state['executions'].append(execution)
         return copy.deepcopy(execution)
 

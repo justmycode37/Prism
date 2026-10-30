@@ -7,15 +7,21 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, HTTPRedirectHandler, build_opener
 
+from .deadline_http import AbsoluteDeadlineHTTPS, DeadlineHTTPError
+
 
 class ProviderError(RuntimeError):
-    def __init__(self, message: str, usage: dict | None = None):
+    def __init__(self, message: str, usage: dict | None = None, *, request_started: bool | None = None):
         super().__init__(message)
         self.usage = usage
+        # False is host knowledge that transport was never entered. None must
+        # remain conservative: a timeout cannot prove a request was not billed.
+        self.request_started = request_started
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -96,6 +102,126 @@ _INSTRUCTIONS = {
 }
 
 
+class DeadlineTransport:
+    """Explicit transport protocol for calls that accept a remaining timeout."""
+
+    def send(self, body: dict, api_key: str, *, timeout_seconds: float) -> dict:
+        raise NotImplementedError
+
+
+class ResponsesHTTPSTransport(DeadlineTransport):
+    """The built-in HTTPS transport with a shared deadline for all I/O.
+
+    ``opener_factory`` and ``monotonic`` are injectable for offline tests.
+    The deadline is a remaining duration supplied by the caller, so fixture
+    epoch clocks never get compared with the machine wall clock.
+    """
+
+    def __init__(self, *, opener_factory=build_opener, monotonic=time.monotonic,
+                 resolver=None, socket_factory=None, ssl_context=None, select_fn=None):
+        self.opener_factory, self.monotonic = opener_factory, monotonic
+        # Custom openers remain available for existing offline fixtures. The
+        # built-in path avoids urllib's per-operation timeout behavior and uses
+        # one absolute deadline through connect, TLS, headers and response body.
+        self._fixture_opener = opener_factory is not build_opener
+        options = {'monotonic': monotonic}
+        for name, value in (('resolver', resolver), ('socket_factory', socket_factory),
+                            ('ssl_context', ssl_context), ('select_fn', select_fn)):
+            if value is not None:
+                options[name] = value
+        self._absolute_https = AbsoluteDeadlineHTTPS(**options)
+
+    def __call__(self, body: dict, api_key: str) -> dict:
+        return self.send(body, api_key, timeout_seconds=180.)
+
+    def send(self, body: dict, api_key: str, *, timeout_seconds: float) -> dict:
+        if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or
+                not 0 < timeout_seconds <= 180 or not math.isfinite(timeout_seconds)):
+            raise ProviderError('Provider request deadline elapsed', request_started=False)
+        if not self._fixture_opener:
+            return self._send_absolute(body, api_key, timeout_seconds=float(timeout_seconds))
+        return self._send_with_opener(body, api_key, timeout_seconds=float(timeout_seconds))
+
+    def _send_absolute(self, body: dict, api_key: str, *, timeout_seconds: float) -> dict:
+        started = self.monotonic()
+        try:
+            encoded_body = json.dumps(body, allow_nan=False).encode('utf-8')
+            if not isinstance(api_key, str) or not api_key or not api_key.isascii() or any(
+                    ord(character) < 33 or ord(character) > 126 for character in api_key):
+                raise ProviderError('OpenAI API key is malformed', request_started=False)
+        except ProviderError:
+            raise
+        except (ValueError, TypeError, UnicodeError) as exc:
+            raise ProviderError('OpenAI API request is invalid', request_started=False) from exc
+        request = (b'POST /v1/responses HTTP/1.1\r\n'
+            b'Host: api.openai.com\r\n'
+            b'Authorization: Bearer ' + api_key.encode('ascii') + b'\r\n'
+            b'Accept: application/json\r\n'
+            b'Accept-Encoding: identity\r\n'
+            b'Content-Type: application/json\r\n'
+            b'Content-Length: ' + str(len(encoded_body)).encode('ascii') + b'\r\n'
+            b'Connection: close\r\n\r\n' + encoded_body)
+        try:
+            remaining = timeout_seconds - (self.monotonic() - started)
+            if remaining <= 0:
+                raise ProviderError('Provider request deadline elapsed', request_started=False)
+            # A provider can serve concurrent support and execution calls. The
+            # template holds immutable transport configuration; each handoff
+            # owns its deadline, socket and request-started accounting.
+            raw = self._absolute_https.new_session().request(
+                request, timeout_seconds=remaining)
+        except DeadlineHTTPError as exc:
+            raise ProviderError(str(exc), request_started=exc.request_started) from exc
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError, UnicodeError) as exc:
+            raise ProviderError('OpenAI API returned invalid JSON', request_started=True) from exc
+
+    def _send_with_opener(self, body: dict, api_key: str, *, timeout_seconds: float) -> dict:
+        """Legacy injected-opener path retained for existing offline fixtures.
+
+        A caller-supplied opener controls its own I/O and therefore does not
+        claim the built-in transport's absolute-deadline guarantee.
+        """
+        deadline = self.monotonic() + float(timeout_seconds)
+        request = Request("https://api.openai.com/v1/responses",
+                          data=json.dumps(body, allow_nan=False).encode(),
+                          headers={"Authorization": "Bearer " + api_key,
+                                   "Content-Type": "application/json"}, method="POST")
+        try:
+            opener = self.opener_factory(_NoRedirect())
+            open_timeout = deadline - self.monotonic()
+            if open_timeout <= 0:
+                raise ProviderError('Provider request deadline elapsed', request_started=False)
+            with opener.open(request, timeout=open_timeout) as response:
+                socket = getattr(getattr(getattr(response, 'fp', None), 'raw', None), '_sock', None)
+                raw = bytearray()
+                while True:
+                    remaining = deadline - self.monotonic()
+                    if remaining <= 0:
+                        raise ProviderError('Provider request deadline elapsed')
+                    if socket is not None:
+                        socket.settimeout(remaining)
+                    # HTTPResponse.read(n) can refill repeatedly while a peer
+                    # trickles data. read1 performs one underlying read, letting
+                    # us shrink the remaining socket timeout between chunks.
+                    chunk = response.read1(min(65_536, 2_000_001 - len(raw)))
+                    if self.monotonic() >= deadline:
+                        raise ProviderError('Provider request deadline elapsed')
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                    if len(raw) > 2_000_000:
+                        raise ProviderError("Provider response exceeds the size limit")
+                return json.loads(raw)
+        except HTTPError as exc:
+            raise ProviderError(f"OpenAI API returned HTTP {exc.code}") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise ProviderError("OpenAI API connection failed") from exc
+        except (ValueError, TypeError) as exc:
+            raise ProviderError("OpenAI API returned invalid JSON") from exc
+
+
 def output_schema(layer: str) -> dict:
     """Return a copy so callers cannot mutate the shared request contract."""
     if layer == "executor":
@@ -168,11 +294,39 @@ class ModelProvider:
     returns a key string; keys are never persisted or sent to an agent.
     """
 
-    def __init__(self, key_loader: Callable[[], str], transport: Callable | None = None):
+    def __init__(self, key_loader: Callable[[], str], transport: Callable | DeadlineTransport | None = None):
         self.key_loader = key_loader
-        self.transport = transport or self._transport
+        self.transport = ResponsesHTTPSTransport() if transport is None else transport
 
-    def run(self, agent: dict, payload: dict) -> dict:
+    def request(self, body: dict, *, timeout_seconds: float | None = None) -> dict:
+        """Load a key and send one request, preserving legacy two-arg transports.
+
+        The explicit deadline transport receives the remaining timeout. A
+        legacy injected callable keeps its historical ``(body, key)`` API and
+        remains host-managed until it returns.
+        """
+        if timeout_seconds is not None and (
+                isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or
+                not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+            raise ProviderError('Provider request deadline elapsed', request_started=False)
+        started = time.monotonic()
+        try:
+            key = self.key_loader()
+        except Exception as error:
+            raise ProviderError('OpenAI API key is unavailable', request_started=False) from error
+        if not isinstance(key, str) or not key.strip():
+            raise ProviderError("OpenAI API key is not configured", request_started=False)
+        remaining = None if timeout_seconds is None else timeout_seconds - (time.monotonic() - started)
+        if remaining is not None and remaining <= 0:
+            raise ProviderError('Provider request deadline elapsed', request_started=False)
+        if isinstance(self.transport, DeadlineTransport):
+            bounded = 180. if remaining is None else min(180., float(remaining))
+            return self.transport.send(body, key.strip(), timeout_seconds=bounded)
+        if remaining is not None and remaining <= 0:
+            raise ProviderError('Provider request deadline elapsed', request_started=False)
+        return self.transport(body, key.strip())
+
+    def run(self, agent: dict, payload: dict, *, timeout_seconds: float | None = None) -> dict:
         layer = str(agent.get("layer", agent.get("role", "collector")))
         if layer == "executor":
             layer = "execution"
@@ -190,9 +344,6 @@ class ModelProvider:
         max_input_bytes = min(2_000_000, max(4000, int(agent.get("max_input_bytes", 48_000))))
         if len(encoded.encode("utf-8")) > max_input_bytes:
             raise ProviderError(f"Agent input exceeds the {max_input_bytes} byte handoff limit")
-        key = self.key_loader()
-        if not isinstance(key, str) or not key.strip():
-            raise ProviderError("OpenAI API key is not configured")
         body = {
             "model": model, "reasoning": {"effort": effort}, "store": False,
             "max_output_tokens": min(32_768, max(1024, int(agent.get("max_output_tokens", 8192)))),
@@ -210,7 +361,7 @@ class ModelProvider:
             "text": {"format": {"type": "json_schema", "name": "prism_" + layer,
                                 "strict": True, "schema": schema}},
         }
-        response = self.transport(body, key.strip())
+        response = self.request(body, timeout_seconds=timeout_seconds)
         if not isinstance(response, dict):
             raise ProviderError("Provider returned a non-object response")
         raw_usage = response.get("usage")
@@ -244,19 +395,4 @@ class ModelProvider:
 
     @staticmethod
     def _transport(body: dict, api_key: str) -> dict:
-        request = Request("https://api.openai.com/v1/responses",
-                          data=json.dumps(body, allow_nan=False).encode(),
-                          headers={"Authorization": "Bearer " + api_key,
-                                   "Content-Type": "application/json"}, method="POST")
-        try:
-            with build_opener(_NoRedirect()).open(request, timeout=180) as response:
-                raw = response.read(2_000_001)
-                if len(raw) > 2_000_000:
-                    raise ProviderError("Provider response exceeds the size limit")
-                return json.loads(raw)
-        except HTTPError as exc:
-            raise ProviderError(f"OpenAI API returned HTTP {exc.code}") from exc
-        except (URLError, TimeoutError, OSError) as exc:
-            raise ProviderError("OpenAI API connection failed") from exc
-        except (ValueError, TypeError) as exc:
-            raise ProviderError("OpenAI API returned invalid JSON") from exc
+        return ResponsesHTTPSTransport().send(body, api_key, timeout_seconds=180.)

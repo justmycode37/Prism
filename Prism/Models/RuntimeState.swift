@@ -40,7 +40,11 @@ struct TradingModeStatus: Decodable, Sendable {
     let lifetimeModelBudgetUsd: Double?
     let tradingPnl: Double?
     let tradingReturn: Double?
+    /// Zero is a valid observed balance; nil means no usable equity value was projected.
     let accountEquity: Double?
+    let accountAsOf: String?
+    let accountDay: String?
+    let accountStatus: String?
     let grossExposure: Double?
     let leverage: Double?
     let leveragePolicy: String?
@@ -51,8 +55,47 @@ struct TradingModeStatus: Decodable, Sendable {
     let apiReservedUsd: Double?
     let pending: Bool?
     let unsupportedReason: String?
+    /// Actual Bybit SOL linear position/fill state from a matching local controller snapshot.
+    /// Missing in older runtimes and fixtures.
+    let actualSolExecution: SOLExecutionProjection?
 
     var isSolPerpetual: Bool { selected == "sol_perpetual" }
+}
+
+struct SOLExecutionProjection: Decodable, Sendable {
+    let environment: String?
+    let positionsStatus: String?
+    let positionsAsOf: String?
+    let confirmedFlat: Bool?
+    let positions: [SOLExecutionPosition]?
+    let positionsTruncated: Bool?
+    let fillsAvailable: Bool?
+    let fillsTruncated: Bool?
+    let fills: [SOLExecutionFill]?
+}
+
+struct SOLExecutionPosition: Decodable, Identifiable, Sendable {
+    let id: String
+    let category: String?
+    let symbol: String?
+    let side: String
+    let quantity: Double
+    let entryPrice: Double
+    let markPrice: Double
+    let leverage: Double?
+    let stopLoss: Double?
+    let ownership: String?
+}
+
+struct SOLExecutionFill: Decodable, Identifiable, Sendable {
+    let id: String
+    let side: String
+    let quantity: Double
+    let price: Double
+    let timestamp: String
+    let fee: Double?
+    let feeCurrency: String?
+    let realizedPnl: Double?
 }
 
 struct TradeReviewStatus: Decodable, Sendable {
@@ -74,8 +117,15 @@ struct OperationalStatus: Decodable, Sendable {
     let grossExposure: Double?
     let realizedPnl: Double?
     let unrealizedPnl: Double?
+    let orderCount: Int?
+    let activeOrderCount: Int?
+    let ordersTruncated: Bool?
     let sections: [OperationalSection]
     let componentCosts: [OperationalCost]
+
+    func section(id: String) -> OperationalSection? {
+        sections.first { $0.id == id }
+    }
 }
 
 struct OperationalSection: Decodable, Identifiable, Sendable {
@@ -479,11 +529,27 @@ struct MarketQuote: Decodable, Identifiable, Sendable {
     let fundingRate: Double?
     let updatedAt: String
 
+    func freshness(at now: Date, staleAfter: TimeInterval = 15,
+                   futureTolerance: TimeInterval = 5) -> MarketQuoteFreshness {
+        guard let date = PrismFormat.date(updatedAt) else { return .unavailable }
+        let age = now.timeIntervalSince(date)
+        guard age.isFinite else { return .unavailable }
+        if age < -futureTolerance { return .clockSkew }
+        return age > staleAfter ? .stale(age: age) : .current(age: max(0, age))
+    }
+
     // Foundation capitalizes the letter after the numeric component in change_24h.
     private enum CodingKeys: String, CodingKey {
         case symbol, price, fundingRate, updatedAt
         case change24h = "change24H"
     }
+}
+
+enum MarketQuoteFreshness: Equatable, Sendable {
+    case current(age: TimeInterval)
+    case stale(age: TimeInterval)
+    case clockSkew
+    case unavailable
 }
 
 struct RuntimeEvent: Decodable, Identifiable, Sendable {

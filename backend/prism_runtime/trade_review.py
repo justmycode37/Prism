@@ -42,12 +42,16 @@ class TradeReviewer:
                 proposal_hash TEXT NOT NULL, binding_hash TEXT NOT NULL, status TEXT NOT NULL,
                 decision TEXT, rationale TEXT NOT NULL, value TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL)""")
+            db.execute('CREATE INDEX IF NOT EXISTS idx_trade_review_tool_recent '
+                       'ON trade_reviews(tool_id,created_at_ms DESC)')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_trade_review_global_recent '
+                       'ON trade_reviews(created_at_ms DESC)')
 
     @staticmethod
     def proposal_hash(tool_id, tool_name, arguments):
         return _hash({"tool_id": tool_id, "tool_name": tool_name, "arguments": arguments})
 
-    def review(self, payload, *, task_id):
+    def review(self, payload, *, task_id, deadline_ms=None):
         """Return a host approval record; any uncertainty is a durable block."""
         tool_id = payload.get("tool_id") if isinstance(payload, dict) else None
         tool_name = payload.get("tool_name") if isinstance(payload, dict) else None
@@ -57,14 +61,32 @@ class TradeReviewer:
         proposal_hash = self.proposal_hash(tool_id, tool_name, arguments)
         binding_hash = _hash(payload)
         review_id = str(task_id)
+        reviewing = {"status": "blocked", "review_id": review_id,
+                     "strategy_id": payload.get("strategy_id"),
+                     "proposal_hash": proposal_hash, "binding_hash": binding_hash,
+                     "reason": "Trade review is already in progress; duplicate request was suppressed"}
         with self.store.connection() as db:
-            old = db.execute("SELECT * FROM trade_reviews WHERE review_id=?", (review_id,)).fetchone()
-        if old:
-            row = dict(old)
-            if (row["proposal_hash"] != proposal_hash or row["binding_hash"] != binding_hash or
-                    row["tool_id"] != tool_id or row["tool_name"] != tool_name):
-                return {"status": "blocked", "review_id": review_id,
-                        "reason": "Cached review binding changed"}
+            # Claim the durable identity before making a paid request. The
+            # unique review_id serializes duplicate delivery across both
+            # threads and backend processes. A crash leaves a blocked claim;
+            # it can never silently trigger a second review or authorize a
+            # mutation on replay.
+            cursor = db.execute("INSERT OR IGNORE INTO trade_reviews VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (review_id, tool_id, tool_name, proposal_hash, binding_hash, "reviewing",
+                 None, reviewing["reason"], encoded(reviewing), max(0, round(float(self.clock()) * 1000))))
+            claimed = cursor.rowcount == 1
+            row = db.execute("SELECT * FROM trade_reviews WHERE review_id=?", (review_id,)).fetchone()
+        if not row:
+            return {"status": "blocked", "review_id": review_id,
+                    "reason": "Trade review claim could not be persisted"}
+        row = dict(row)
+        if (row["proposal_hash"] != proposal_hash or row["binding_hash"] != binding_hash or
+                row["tool_id"] != tool_id or row["tool_name"] != tool_name):
+            return {"status": "blocked", "review_id": review_id,
+                    "reason": "Cached review binding changed"}
+        if not claimed:
+            if row["status"] == "reviewing":
+                return json.loads(row["value"])
             return json.loads(row["value"])
 
         outcome = {"status": "blocked", "review_id": review_id,
@@ -77,7 +99,7 @@ class TradeReviewer:
             if self.agents is None or not callable(getattr(self.agents, "structured", None)):
                 raise RuntimeError("reviewer unavailable")
             result = self.agents.structured("trade_review", copy.deepcopy(payload), TRADE_REVIEW_SCHEMA,
-                task_id=review_id, role="trade_reviewer")
+                task_id=review_id, role="trade_reviewer", deadline_ms=deadline_ms)
             if (not isinstance(result, dict) or set(result) != {"decision", "rationale"} or
                     result.get("decision") not in {"approve", "reject"} or
                     not isinstance(result.get("rationale"), str) or not result["rationale"].strip() or
@@ -101,9 +123,18 @@ class TradeReviewer:
             outcome["reason"] = rationale
         now_ms = max(0, round(float(self.clock()) * 1000))
         with self.store.connection() as db:
-            db.execute("INSERT OR IGNORE INTO trade_reviews VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (review_id, tool_id, tool_name, proposal_hash, binding_hash, outcome["status"],
-                 decision, rationale, encoded(outcome), now_ms))
+            db.execute("UPDATE trade_reviews SET status=?,decision=?,rationale=?,value=?,created_at_ms=? "
+                "WHERE review_id=? AND proposal_hash=? AND binding_hash=? AND status='reviewing'",
+                (outcome["status"], decision, rationale, encoded(outcome), now_ms,
+                 review_id, proposal_hash, binding_hash))
+            row = db.execute("SELECT status,value FROM trade_reviews WHERE review_id=?", (review_id,)).fetchone()
+        # The host requires a durable matching receipt. Do not return a
+        # transient model approval if finalization failed or another process
+        # changed the claim while the model was responding.
+        if not row or row["status"] != outcome["status"]:
+            return {"status": "blocked", "review_id": review_id,
+                    "proposal_hash": proposal_hash, "binding_hash": binding_hash,
+                    "reason": "Trade review result could not be durably recorded"}
         return outcome
 
     def record_block(self, payload, *, task_id, reason):

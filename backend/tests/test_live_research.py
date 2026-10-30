@@ -1,8 +1,11 @@
 import copy
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
 from prism_runtime import analytics
 from prism_runtime.domain import identity, timestamp
@@ -110,6 +113,107 @@ class LiveResearchTests(unittest.TestCase):
         self.assertLess(child['alpha_budget'], parent['alpha_budget'])
         self.assertEqual(self.research.report(child['id'])['verified_observations'], 0)
         self.assertFalse(self.research.eligibility(child['id'])['eligible'])
+
+    def test_shadow_capacity_uses_full_frozen_policy_and_exact_repeat_is_idempotent(self):
+        self.store.update_config({'research': {'max_shadow_candidates': 1}})
+        first = self.research.register(self.spec, policy(), hypothesis='Capacity fixture',
+            evidence_ids=['source'], initial_equity=100., performance_basis='trading',
+            execution_identity={'mode': 'sol_perpetual', 'risk_profile': 1})
+        repeated = self.research.register(self.spec, policy(), hypothesis='Exact repeat',
+            evidence_ids=['source'], initial_equity=100., performance_basis='trading',
+            execution_identity={'mode': 'sol_perpetual', 'risk_profile': 1})
+        self.assertEqual(repeated['id'], first['id'])
+        for changes in (
+            {'initial_equity': 101.},
+            {'performance_basis': 'operating'},
+            {'execution_identity': {'mode': 'sol_perpetual', 'risk_profile': 2}},
+        ):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'capacity exhausted'):
+                self.research.register(self.spec, policy(), hypothesis='Policy variant',
+                    evidence_ids=['source'], initial_equity=changes.get('initial_equity', 100.),
+                    performance_basis=changes.get('performance_basis', 'trading'),
+                    execution_identity=changes.get('execution_identity',
+                        {'mode': 'sol_perpetual', 'risk_profile': 1}))
+
+    def test_shadow_capacity_admission_is_atomic_across_store_instances(self):
+        self.store.update_config({'research': {'max_shadow_candidates': 1}})
+        second_store = Store(Path(self.temp.name) / 'live.sqlite3', clock=lambda: self.now[0])
+        second_research = LiveResearch(second_store, clock=lambda: self.now[0])
+        barrier = threading.Barrier(3)
+        outcomes = []
+        outcome_lock = threading.Lock()
+
+        def register(research, profile):
+            barrier.wait()
+            try:
+                value = research.register(self.spec, policy(), hypothesis='Concurrent candidate',
+                    evidence_ids=['source'], initial_equity=100., performance_basis='trading',
+                    execution_identity={'mode': 'sol_perpetual', 'profile': profile})
+                outcome = ('ok', value['id'])
+            except Exception as error:
+                outcome = ('error', str(error))
+            with outcome_lock:
+                outcomes.append(outcome)
+
+        threads = [threading.Thread(target=register, args=(research, profile))
+                   for research, profile in ((self.research, 'a'), (second_research, 'b'))]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(sum(kind == 'ok' for kind, _ in outcomes), 1, outcomes)
+        self.assertEqual(sum(kind == 'error' and 'capacity exhausted' in value
+                             for kind, value in outcomes), 1, outcomes)
+        with self.store.connection() as db:
+            count = db.execute("SELECT COUNT(*) FROM cascade_strategies "
+                "WHERE json_extract(value,'$.status') IN ('shadow','paper','queued')").fetchone()[0]
+        self.assertEqual(count, 1)
+        second_store.close()
+
+    def test_registration_rechecks_resource_limits_after_concurrent_config_change(self):
+        self.register()
+        second_store = Store(self.store.path, clock=lambda: self.now[0])
+        self.addCleanup(second_store.close)
+        original_config = self.store.config
+        changed = []
+        def interleaved_config():
+            result = original_config()
+            if not changed:
+                changed.append(True)
+                second_store.update_config({'research': {'max_shadow_candidates': 1}})
+            return result
+        with patch.object(self.store, 'config', side_effect=interleaved_config):
+            with self.assertRaisesRegex(ValueError, 'capacity exhausted'):
+                self.register(spec={**self.spec, 'parameters': {'lookback': 4, 'threshold': .001}})
+        self.assertEqual(len(self.research.strategies()), 1)
+
+    def test_shadow_registration_rolls_back_if_strategy_insert_fails(self):
+        for failing_method in ('save_strategy', 'update_experiment_status'):
+            before = {}
+            with self.store.connection() as db:
+                for table in ('experiments', 'experiment_attempts', 'experiment_status', 'cascade_strategies'):
+                    before[table] = db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0]
+
+            original = getattr(self.store, failing_method)
+
+            def fail(*_args, **_kwargs):
+                raise RuntimeError('synthetic ' + failing_method + ' failure')
+
+            setattr(self.store, failing_method, fail)
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'synthetic .* failure'):
+                    self.research.register(self.spec, policy(), hypothesis='Rollback candidate',
+                        evidence_ids=['source'], initial_equity=100., performance_basis='trading',
+                        execution_identity={'mode': 'sol_perpetual',
+                            'rollback_probe': failing_method})
+            finally:
+                setattr(self.store, failing_method, original)
+            with self.store.connection() as db:
+                after = {table: db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0]
+                         for table in before}
+            self.assertEqual(after, before, failing_method)
 
     def test_minute_closures_do_not_become_daily_sessions(self):
         exp = self.register()
@@ -238,14 +342,90 @@ class LiveResearchTests(unittest.TestCase):
     def test_event_detail_retention_never_stops_daily_evidence_accounting(self):
         from unittest.mock import patch
         exp = self.register()
+        snapshots = []
         with patch('prism_runtime.live_research.MAX_EVENT_CAPTURES', 2):
             for _ in range(6):
                 self.now[0] += 60
-                self.assertIsNotNone(self.research.observe(exp['id'], self.snapshot(exp['id'])))
+                snapshot = self.snapshot(exp['id'])
+                snapshots.append(snapshot)
+                self.assertIsNotNone(self.research.observe(exp['id'], snapshot))
         report = self.research.report(exp['id'])
         self.assertEqual(report['verified_observations'], 1)
         self.assertGreater(report['history_omissions']['omitted_event_captures'], 0)
-        self.assertEqual(self._account(exp['id'])['last_capture_ms'], round(self.now[0] * 1000))
+        final_book = self._account(exp['id'])
+        self.assertEqual(final_book['last_capture_ms'], round(self.now[0] * 1000))
+        with self.store.connection() as db:
+            retained = {row['snapshot_id'] for row in db.execute(
+                'SELECT snapshot_id FROM live_research_v2_captures WHERE experiment_id=?', (exp['id'],))}
+        self.assertIn(snapshots[-1]['snapshot_id'], retained)
+        self.assertNotIn(snapshots[1]['snapshot_id'], retained)
+
+        # Retention may omit optional old event detail, but account high-water
+        # state and every daily proof survive reconstruction and duplicate replay.
+        restarted = LiveResearch(self.store, clock=lambda: self.now[0])
+        self.assertEqual(restarted.observations(exp['id']), self.research.observations(exp['id']))
+        self.assertEqual(self._account(exp['id']), final_book)
+        replay = restarted.observe(exp['id'], snapshots[-1])
+        self.assertIsNotNone(replay)
+        self.assertEqual(self._account(exp['id']), final_book)
+        late_replay = restarted.observe(exp['id'], snapshots[1])
+        self.assertIsNone(late_replay)
+        self.assertEqual(self._account(exp['id']), final_book)
+        self.assertEqual(restarted.report(exp['id'])['verified_observations'], 1)
+
+    def test_quote_only_marks_skip_event_history_count_but_event_capture_still_counts(self):
+        exp = self.register()
+        self.now[0] += 60
+        first = self.snapshot(exp['id'])
+        self.research.observe(exp['id'], first)
+        book = self._account(exp['id'])
+        book.update(last_signal_key='profile-live-signal', pending_target=None,
+                    pending_signal_at_ms=0, pending_signal_key=None, pending_snapshot_id=None)
+        with self.store.connection() as db:
+            db.execute('UPDATE live_research_v2_accounts SET value=? WHERE experiment_id=?',
+                       (json.dumps(book, separators=(',', ':')), exp['id']))
+
+        def observe_with_query_trace(when):
+            self.now[0] = when
+            snapshot = self.snapshot(exp['id'])
+            statements = []
+            original_connect = sqlite3.connect
+
+            def traced_connect(*args, **kwargs):
+                db = original_connect(*args, **kwargs)
+                db.set_trace_callback(statements.append)
+                return db
+
+            sqlite3.connect = traced_connect
+            try:
+                result = self.research.observe_quote(exp['id'], snapshot)
+            finally:
+                sqlite3.connect = original_connect
+            count_queries = sum('COUNT(*)' in sql and 'live_research_v2_captures' in sql
+                                for sql in statements)
+            return result, count_queries
+
+        before = self._account(exp['id'])
+        with self.store.connection() as db:
+            capture_count = db.execute('SELECT COUNT(*) FROM live_research_v2_captures WHERE experiment_id=?',
+                                       (exp['id'],)).fetchone()[0]
+            day_count = db.execute('SELECT COUNT(*) FROM live_research_v2_days WHERE experiment_id=?',
+                                   (exp['id'],)).fetchone()[0]
+        same_day, count_queries = observe_with_query_trace(self.now[0] + 1)
+        self.assertEqual(same_day['events'], [])
+        self.assertEqual(count_queries, 0)
+        after = self._account(exp['id'])
+        for key in ('cash', 'quantity', 'equity', 'completed_trades', 'risk_halted'):
+            self.assertEqual(after[key], before[key], key)
+        with self.store.connection() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM live_research_v2_captures WHERE experiment_id=?',
+                (exp['id'],)).fetchone()[0], capture_count)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM live_research_v2_days WHERE experiment_id=?',
+                (exp['id'],)).fetchone()[0], day_count)
+
+        next_day, count_queries = observe_with_query_trace(self.now[0] + 86_400)
+        self.assertIn('utc_day_mark', next_day['events'])
+        self.assertEqual(count_queries, 1)
 
     def test_intrabar_requires_trigger_fresh_forming_candle_and_deduplicates(self):
         exp = self.register(mode='intrabar')
