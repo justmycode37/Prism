@@ -24,7 +24,8 @@ class EquityMarketData:
         if symbol is None:
             raise ValueError('Invalid equity ticker symbol')
 
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{url_quote(symbol, safe='')}?range=5y&interval=1d"
+        chart_range = '1d' if self.settings.get('quote_only') else '5y'
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{url_quote(symbol, safe='')}?range={chart_range}&interval=1d&events=div%2Csplits"
         data = self.fetch_json(url, budget)
         try:
             result = data['chart']['result'][0]
@@ -41,7 +42,7 @@ class EquityMarketData:
         quote_type = meta.get('instrumentType', meta.get('quoteType'))
         if isinstance(quote_type, bool) or not isinstance(quote_type, str):
             raise ValueError('Yahoo instrument metadata is malformed')
-        if quote_type.upper() != 'EQUITY':
+        if quote_type.upper() != 'EQUITY' and not (quote_type.upper() == 'ETF' and symbol in self.settings.get('benchmark_symbols', ['SPY', 'SMH'])):
             raise ValueError('Yahoo instrument is not an equity')
 
         currency = meta.get('currency')
@@ -87,6 +88,7 @@ class EquityMarketData:
 
         # --- Build adjusted candles ---
         candles = []
+        raw_candles = []
         # Use candle_limit from settings (config ingestion key), not max_candles
         candle_limit = self.settings.get('candle_limit', self.settings.get('max_candles', 1260))
         try:
@@ -135,9 +137,11 @@ class EquityMarketData:
                                 'end_ms': end_ms, 'closed': True, 'open': o, 'high': h,
                                 'low': l, 'close': c, 'volume': volume,
                                 'asset_class': 'equity'})
+                raw_candles.append({**candles[-1], **vals, 'provider_timestamp_ms': stamp*1000})
             except (TypeError, ValueError, OverflowError, OSError):
                 continue
         candles = candles[-candle_limit:]
+        raw_candles = raw_candles[-candle_limit:]
 
         # --- Compute daily change from correct previous session ---
         # previousClose is the *previous trading session* close, suitable for daily change.
@@ -163,15 +167,64 @@ class EquityMarketData:
                   'exchange_timezone': timezone_name, 'price': price, 'as_of_ms': actual_ms,
                   'timestamp': quote_asof, 'updated_at': quote_asof, 'change_24h': change,
                   'change_24h_caveat': change_caveat,
-                  'funding_rate': None, 'interval_ms': 86_400_000, 'candles': candles}
+                  'funding_rate': None, 'interval_ms': 86_400_000, 'candles': candles,
+                  'raw_candles': raw_candles, 'raw_history_basis': 'vendor_split_adjusted_not_execution_verified',
+                  'security_id': str(meta.get('exchangeName', 'unknown')) + ':' + symbol,
+                  'instrument_type': quote_type.upper(), 'corporate_actions': []}
         market['history_adjustment'] = 'adjusted_close' if adj else 'unverified'
+        observed_ms = data.get('_fetched_at_ms', now_ms)
+        if not self._number(observed_ms) or not actual_ms <= observed_ms <= now_ms:
+            observed_ms = now_ms
+        for kind, values in result.get('events', {}).items():
+            if kind not in {'splits', 'dividends'} or not isinstance(values, dict):
+                continue
+            for event in values.values():
+                if not isinstance(event, dict):
+                    continue
+                stamp = self._number(event.get('date'))
+                if stamp is None or stamp <= 0 or stamp*1000 > now_ms:
+                    continue
+                action = {'type': 'split' if kind == 'splits' else 'dividend', 'effective_at_ms': round(stamp*1000),
+                          'available_at_ms': round(observed_ms)}
+                if kind == 'splits':
+                    numerator, denominator = self._positive(event.get('numerator')), self._positive(event.get('denominator'))
+                    if numerator is None or denominator is None:
+                        continue
+                    action['ratio'] = numerator/denominator
+                else:
+                    amount = self._number(event.get('amount'))
+                    if amount is None or amount < 0:
+                        continue
+                    action['amount'] = amount
+                action['id'] = hashlib.sha256(json.dumps([symbol, action['type'], action['effective_at_ms']]).encode()).hexdigest()[:24]
+                market['corporate_actions'].append(action)
+        market['corporate_actions'].sort(key=lambda row: (row['effective_at_ms'], row['type'] != 'split'))
+        regular = meta.get('currentTradingPeriod', {}).get('regular', {})
+        opening, closing = self._number(regular.get('start')), self._number(regular.get('end'))
+        if opening and closing and 0 < opening < closing:
+            open_price = None
+            for i, raw_ts in enumerate(timestamps):
+                try:
+                    same_date = datetime.fromtimestamp(int(raw_ts), timezone.utc).astimezone(zone).date() == datetime.fromtimestamp(opening, timezone.utc).astimezone(zone).date()
+                    if same_date and i < len(indicator.get('open', [])):
+                        open_price = self._positive(indicator['open'][i])
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            if actual_ms < opening*1000:
+                open_price = None
+            market['session'] = {'open_ms': round(opening*1000), 'close_ms': round(closing*1000), 'open_price': open_price}
+            market['session_known_at'] = datetime.fromtimestamp(observed_ms/1000, timezone.utc).isoformat()
+        market['coverage'] = {'session_observed': 'session' in market, 'historical_sessions_verified': False,
+                              'corporate_actions_requested': True, 'survivorship_safe': False,
+                              'raw_execution_history_verified': False}
+        market['history_revision'] = hashlib.sha256(json.dumps([candles, raw_candles], sort_keys=True).encode()).hexdigest()
 
         caveat = ('Unofficial Yahoo Finance chart data. Daily OHLC values are adjusted by adjusted-close/close, '
                   'so historical prices can reflect dividends and splits; volume and live quote remain raw. '
                   'Only prior daily sessions are included; the current local day is excluded conservatively. Coverage, corporate actions and timestamps may be revised.')
 
         # --- Evidence IDs: quote ID includes content-sensitive hash ---
-        quote_content_dict = {k: v for k, v in market.items() if k != 'candles'}
+        quote_content_dict = {k: v for k, v in market.items() if k not in {'candles', 'raw_candles', 'session_known_at', 'corporate_actions'}}
         quote_content = json.dumps(quote_content_dict, sort_keys=True)
         quote_ev = self.evidence_factory(url, 'market', f'{symbol} public equity quote',
                                          quote_content, agent, published=quote_asof)
@@ -208,6 +261,11 @@ class EquityMarketData:
         if any(left['start_ms'] >= right['start_ms'] for left, right in zip(candles, candles[1:])):
             raise ValueError('Equity history has duplicate or unordered sessions')
 
+        if self.settings.get('quote_only'):
+            for key in ('candles','raw_candles','history_adjustment','raw_history_basis','history_revision'):
+                market.pop(key, None)
+            market['quote_only'] = True
+            return {'markets':[market], 'evidence':[]}
         return {'markets': [market], 'evidence': [quote_ev, chart_ev]}
 
     @staticmethod

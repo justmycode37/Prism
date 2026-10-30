@@ -13,6 +13,7 @@ from email.utils import parsedate_to_datetime
 from hashlib import sha256
 from html.parser import HTMLParser
 import http.client
+import copy
 import io
 import ipaddress
 import json
@@ -25,6 +26,7 @@ import time
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
 
 
 DEFAULT_SOURCES = []
@@ -243,7 +245,7 @@ class SourceCollector:
                          min(512, max(1, int(self.settings.get("max_requests", 512)))), 0)
         result = []
         with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="prism-quotes") as pool:
-            futures = [pool.submit(self._market, str(symbol).upper(), budget, {"symbol": str(symbol).upper()})
+            futures = [pool.submit(self._quote_market, str(symbol).upper(), budget, {"symbol": str(symbol).upper()})
                        for symbol in list(dict.fromkeys(symbols))[:256]]
             for future in as_completed(futures):
                 try:
@@ -425,16 +427,49 @@ class SourceCollector:
                 "content": content[:self.max_content], "observed_at": _iso(),
                 "symbols": list(dict.fromkeys(symbols))[:16]}
         publication = _published(published)
-        if publication:
-            item["published_at"] = publication
-        snapshot = {key: value for key, value in item.items() if key != "observed_at"}
+        item['published_at'] = publication or None
+        item['event_time'] = publication or None
+        item['first_observed_at'] = item['observed_at']
+        item['available_at'] = item['observed_at']
+        item['content_hash'] = sha256(re.sub(r'\s+', ' ', item['content']).strip().encode()).hexdigest()
+        item['event_identity'] = item['content_hash']
+        item['source_family'] = urlsplit(url).hostname or ''
+        item['primary_source'] = item['source_family'] == 'sec.gov' or item['source_family'].endswith('.sec.gov') or 'investor' in item['source_family']
+        snapshot = {key: value for key, value in item.items() if key not in {'observed_at', 'first_observed_at', 'available_at'}}
         item["id"] = "ev_" + sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:24]
         return item
 
     def _market(self, symbol: str, budget: _Budget, agent: dict) -> dict:
         from .equities import EquityMarketData
-        return EquityMarketData(self._json, self._evidence, self.settings).collect(
+        with self._lock:
+            cache = getattr(self, '_daily_markets', {}).get(symbol)
+        if cache:
+            zone = ZoneInfo(cache['markets'][0].get('exchange_timezone', 'America/New_York'))
+            if cache['_history_day'] == datetime.now(zone).date().isoformat():
+                return copy.deepcopy({key:value for key,value in cache.items() if key != '_history_day'})
+        settings = {**self.settings, 'benchmark_symbols': self.config.get('research', {}).get('benchmark_symbols', ['SPY', 'SMH'])}
+        result = EquityMarketData(self._json, self._evidence, settings).collect(
             symbol, budget, {**agent, 'symbol': symbol})
+        zone = ZoneInfo(result['markets'][0].get('exchange_timezone', 'America/New_York'))
+        with self._lock:
+            if not hasattr(self, '_daily_markets'):
+                self._daily_markets = {}
+            self._daily_markets[symbol] = {**copy.deepcopy(result), '_history_day':datetime.now(zone).date().isoformat()}
+        return result
+
+    def _quote_market(self, symbol, budget, agent):
+        from .equities import EquityMarketData
+        with self._lock:
+            cache = getattr(self, '_daily_markets', {}).get(symbol)
+        zone = ZoneInfo(cache['markets'][0].get('exchange_timezone', 'America/New_York')) if cache else ZoneInfo('America/New_York')
+        if cache is None or cache['_history_day'] != datetime.now(zone).date().isoformat():
+            try:
+                return self._market(symbol, budget, agent)
+            except Exception:
+                pass  # A chart outage does not prevent an independently observed fresh quote.
+        settings = {**self.settings, 'quote_only':True,
+            'benchmark_symbols':self.config.get('research',{}).get('benchmark_symbols',['SPY','SMH'])}
+        return EquityMarketData(self._json,self._evidence,settings).collect(symbol,budget,agent)
 
     def _json(self, url: str, budget: _Budget) -> dict:
         response = self._fetch(url, budget, ttl=60)

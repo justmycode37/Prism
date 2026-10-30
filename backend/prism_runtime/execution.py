@@ -141,6 +141,9 @@ def execute(portfolio: dict, strategies: list[dict], decisions: list[dict], mark
     a fresh activate decision for a validated strategy and a fresh closed signal.
     """
     now_ms = round(time.time() * 1000) if now is None else timestamp_ms(now)
+    if portfolio.get('policy_version') == 1 or any(row.get('asset_class') == 'equity' for row in markets if isinstance(row, dict)):
+        from .simulation import advance
+        return advance(portfolio, strategies, decisions, markets, config, now_ms)
     limits = _limits(config)
     if not isinstance(portfolio, dict) or not isinstance(strategies, list) or not isinstance(decisions, list) or not isinstance(markets, list):
         raise ValueError("Invalid paper execution inputs")
@@ -218,6 +221,7 @@ def execute(portfolio: dict, strategies: list[dict], decisions: list[dict], mark
             continue
         strategy = strategy_by_id[identity]
         spec = canonical_spec(strategy["spec"])
+        signal_identity = spec_hash(spec)
         symbol = spec["symbol"]
         quote = quotes.get(symbol)
         if not quote:
@@ -246,9 +250,9 @@ def execute(portfolio: dict, strategies: list[dict], decisions: list[dict], mark
                 stale_signal = days < 0 or days > 14 or sessions > 2
             if signal_ms > quote["timestamp_ms"] or stale_signal:
                 raise ValueError("Signal is future dated or stale")
-            if signal_ms <= result.setdefault("seen_signals", {}).get(identity, 0):
+            if signal_ms <= result.setdefault("seen_signals", {}).get(signal_identity, 0):
                 continue
-            result["seen_signals"][identity] = signal_ms
+            result["seen_signals"][signal_identity] = signal_ms
             if not signal_target(spec, bars):
                 continue
             _revalue(result)

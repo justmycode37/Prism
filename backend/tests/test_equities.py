@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from prism_runtime.equities import EquityMarketData
 
@@ -35,6 +36,43 @@ class EquityTests(unittest.TestCase):
         self.assertTrue(all(c['closed'] for c in market['candles']))
         self.assertEqual(len(result['evidence']), 2)
         self.assertIn('unofficial', result['evidence'][1]['content'].lower())
+
+    def test_raw_basis_actions_and_actual_current_session_are_explicit(self):
+        now=datetime(2026,10,29,15,tzinfo=timezone.utc)
+        opening=int(datetime(2026,10,29,13,30,tzinfo=timezone.utc).timestamp())
+        closing=int(datetime(2026,10,29,20,tzinfo=timezone.utc).timestamp())
+        result=self.payload['chart']['result'][0]
+        result['meta'].update(regularMarketTime=opening+60,
+            currentTradingPeriod={'regular':{'start':opening,'end':closing}})
+        result['timestamp']=[opening-2*86400,opening-86400,opening]
+        result['indicators']['quote'][0]['open'][2]=90
+        result['indicators']['quote'][0]['high'][2]=92
+        result['indicators']['quote'][0]['low'][2]=89
+        result['indicators']['quote'][0]['close'][2]=91
+        result['events']={'splits':{'s':{'date':opening-86400,'numerator':2,'denominator':1}},
+                          'dividends':{'d':{'date':opening-2*86400,'amount':1}}}
+        with patch('prism_runtime.equities.datetime', wraps=datetime) as clock:
+            clock.now.return_value=now
+            market=self.collector.collect('MRVL',None,{})['markets'][0]
+        self.assertEqual(market['session'],{'open_ms':opening*1000,'close_ms':closing*1000,'open_price':90})
+        self.assertEqual([bar['open'] for bar in market['raw_candles']],[10,20])
+        self.assertEqual(market['raw_history_basis'],'vendor_split_adjusted_not_execution_verified')
+        self.assertEqual({a['type'] for a in market['corporate_actions']},{'split','dividend'})
+        self.assertTrue(all(a['available_at_ms']>a['effective_at_ms'] for a in market['corporate_actions']))
+        self.assertFalse(market['coverage']['historical_sessions_verified'])
+
+    def test_missing_regular_metadata_never_invents_a_session(self):
+        del self.payload['chart']['result'][0]['meta']['currentTradingPeriod']
+        market=self.collector.collect('MRVL',None,{})['markets'][0]
+        self.assertNotIn('session',market)
+
+    def test_only_configured_benchmark_etfs_are_supported(self):
+        meta=self.payload['chart']['result'][0]['meta']
+        meta.update(symbol='SPY',instrumentType='ETF')
+        self.assertEqual(self.collector.collect('SPY',None,{})['markets'][0]['instrument_type'],'ETF')
+        meta['symbol']='VOO'
+        with self.assertRaises(ValueError):
+            self.collector.collect('VOO',None,{})
 
     def test_current_day_excluded_when_open_or_session_missing(self):
         self.payload['chart']['result'][0]['meta']['currentTradingPeriod']['regular']['end'] = self.now + 3600

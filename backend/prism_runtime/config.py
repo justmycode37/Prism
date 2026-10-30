@@ -13,7 +13,7 @@ LAYER_ORDER = ('collector', 'analyst', 'strategist', 'executor')
 DEFAULT_CONFIG = {
     'model': 'gpt-6-luna',  # Existing UI configuration field: collector model.
     'max_concurrency': 8,
-    'cycle_interval_seconds': 900,
+    'cycle_interval_seconds': 3600,
     'market_refresh_seconds': 60,
     'daily_limit_usd': None,
     'max_calls_per_day': None,
@@ -21,6 +21,21 @@ DEFAULT_CONFIG = {
     'max_input_bytes': 1000000,
     'max_evidence_per_cycle': 4000,
     'max_handoffs_per_agent': 64,
+    'research': {
+        'version': 1, 'mode': 'prospective_shadow',
+        'active_collectors': 6, 'active_analysts': 2,
+        'discovery_interval_seconds': 86400,
+        'max_shadow_candidates': 64,
+        'max_holding_sessions': 20,
+        'min_forward_sessions': 60, 'min_forward_trades': 8,
+        'forward_block_sessions': 5, 'min_forward_blocks': 12,
+        'review_interval_sessions': 20,
+        'max_forward_drawdown': .10,
+        'min_excess_return': 0.0,
+        'data_cost_usd_per_day': 0.0, 'infrastructure_cost_usd_per_day': 0.0,
+        'use_model_selector': False, 'use_model_executor': False,
+        'benchmark_symbols': ['SPY', 'SMH'],
+    },
     'layers': {
         'collector': {'count': 24, 'model': 'gpt-6-luna', 'reasoning_effort': 'low'},
         'analyst': {'count': 6, 'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium'},
@@ -48,6 +63,8 @@ DEFAULT_CONFIG = {
     'risk': {
         'max_gross_fraction': 0.30, 'max_symbol_fraction': 0.10,
         'allocation_fraction': 0.10, 'fee_bps': 6, 'slippage_bps': 3,
+        'spread_bps': 10, 'impact_bps': 10, 'max_participation_fraction': .01,
+        'max_correlated_fraction': .10, 'correlation_ceiling': .80,
         'max_quote_age_seconds': 120, 'stop_loss_fraction': 0.05,
         'max_drawdown_fraction': 0.10, 'position_ttl_seconds': 86400,
         'kill_switch': False,
@@ -109,6 +126,33 @@ def validate_config_update(changes: dict) -> dict:
             if not isinstance(value, list) or not 1 <= len(value) <= 256 or any(not isinstance(x, str) or not x or len(x) > 20 for x in value) or len(set(value)) != len(value):
                 raise ValueError('Symbols must be a deduplicated list of tickers.')
             result[key] = list(value)
+        elif key == 'research':
+            if not isinstance(value, dict) or not value or set(value) - set(DEFAULT_CONFIG['research']):
+                raise ValueError('Invalid research protocol settings.')
+            integers = {'active_collectors': (1, 24), 'active_analysts': (1, 6),
+                        'discovery_interval_seconds': (3600, 604800), 'max_shadow_candidates': (1, 256),
+                        'max_holding_sessions': (1, 100), 'min_forward_sessions': (60, 2520),
+                        'min_forward_trades': (8, 1000), 'forward_block_sessions': (5, 100),
+                        'min_forward_blocks': (12, 100), 'review_interval_sessions': (20, 252)}
+            for name, number in value.items():
+                if name in {'use_model_selector', 'use_model_executor'}:
+                    if not isinstance(number, bool):
+                        raise ValueError('Research model switches must be boolean.')
+                elif name == 'benchmark_symbols':
+                    if not isinstance(number, list) or len(number) != 2 or any(not isinstance(symbol, str) or not symbol.isalnum() or len(symbol) > 10 for symbol in number) or len(set(number)) != 2:
+                        raise ValueError('Supply distinct market and sector benchmark symbols.')
+                elif name in integers:
+                    if isinstance(number, bool) or not isinstance(number, int) or not integers[name][0] <= number <= integers[name][1]:
+                        raise ValueError('Invalid research protocol limit.')
+                elif name in {'data_cost_usd_per_day', 'infrastructure_cost_usd_per_day', 'min_excess_return'}:
+                    if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number) or number < 0:
+                        raise ValueError('Research costs and effect thresholds must be finite and nonnegative.')
+                elif name == 'max_forward_drawdown':
+                    if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number) or not 0 < number <= .10:
+                        raise ValueError('Forward drawdown cannot exceed 10%.')
+                elif number != DEFAULT_CONFIG['research'][name]:
+                    raise ValueError('Unsupported research protocol version or mode.')
+            result[key] = copy.deepcopy(value)
         elif key == 'sector':
             if not isinstance(value, dict) or not value or not set(value) <= {'id', 'max_symbols', 'discovery_enabled', 'seed_symbols', 'keywords'}:
                 raise ValueError('Invalid sector settings.')

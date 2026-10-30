@@ -1,62 +1,87 @@
 # Runtime
 
-Prism runs a standard-library Python service behind the existing SwiftUI console. The research scope is public AI infrastructure equities. Model work is routed through the existing OpenAI credential integration; no Gemini runtime is present. The harness is paper-only.
+Prism is a standard-library Python service behind a SwiftUI macOS console. It researches AI infrastructure equities and simulates trades only. Starting a process begins paused; closing the console does not stop an installed background service.
 
-## Roster and lifecycle
+## Operation and research efficiency
 
-The fixed 33-agent roster is 24 GPT-6 Luna low-reasoning collectors, 6 GPT-6.1 Sol medium-reasoning analysts, 2 GPT-6 Astra high-reasoning strategists and 1 GPT-6 Astra max-reasoning executor. Default concurrency is 8, configurable up to 32. Each cycle reserves budget before provider calls. Reservations are reconciled against reported usage; uncertain remote outcomes retain their reservation. Pause and stop checkpoints must be honored between bounded units of work, including before downstream handoffs and paper actions. Starts begin paused.
+Install with `python3 scripts/prismctl.py install`. Use `status`, `start`, `pause`, `resume`, `stop` and `run` for service control. The Mac must remain awake and connected for opening observations and risk checks. Implementation verification does not start this service or use its credentials.
 
-## Sector catalogue
+The available roster is 24 GPT-6 Luna low collectors, six GPT-6.1 Sol medium analysts, two GPT-6 Astra high strategists and one GPT-6 Astra max executor. Defaults activate six collectors and two analysts. Default concurrency is eight, configurable up to 32. Deterministic selection and authorization avoid strategist/executor calls; optional model reviews are recorded advisory comparisons. They do not drive fills.
 
-The configured sector record uses this shape:
+Research checks for changed information hourly by default, and discovery is cached for one day. Acquisition completes before model fan-out. Content identities, closed daily bars, features, policy and role instructions form a material-input fingerprint. Unchanged cycles reuse prior research without new model calls. Quote refresh and risk processing run independently every 60 seconds while active. The working set and advisory switches are configurable; available roster size is not evidence of investment value.
 
-```json
-{
-  "id": "ai_infrastructure",
-  "max_symbols": 80,
-  "discovery_enabled": true,
-  "seed_symbols": ["MRVL", "NBIS", "APLD", "CRWV", "IREN", "MU"],
-  "keywords": ["AI infrastructure", "data center", "accelerator", "memory", "power", "networking"]
-}
-```
+Model-call reservations are reconciled against usage. Unknown remote outcomes retain conservative charges. Existing optional spending/call ceilings remain available, and null explicitly disables a ceiling. Model prices are operator-supplied local estimates, not invoices. Costs are attributed to cycles, roles and candidate experiments; candidate outcomes and source attribution are observational, not established causal ablation results.
 
-Seeds are examples and fallback candidates, not a symbol whitelist. Discovery can add qualifying public equities up to 80 symbols. Record discovery results, source provenance, exclusions and any seed fallback so operators can tell whether discovery succeeded or fell back.
-
-## Public collection
-
-Ingestion bounds are 48 pages, 160 requests, 90 seconds per bounded collection operation, crawl depth 2, 1 MB per response, 24,000 extracted content characters, 256 shared evidence items and 1,260 daily candles. The cycle-wide evidence handoff budget is 4,000. A collector may produce a large packet; shard article bodies, feed items and chart series into provenance-preserving records and enforce aggregate limits explicitly.
-
-Fetch only public data with Python standard-library networking. Do not use model calls, shell commands, browsers or credentials for acquisition. Enforce HTTPS where applicable, public-address DNS checks, address pinning, redirect revalidation, robots.txt, bounded host pacing, shared caches and per-source failure reporting. Cache freshness and failures should be observable. A failure, robots block, timeout, or truncated response must never be reported as successful coverage. Extracted article bodies are retained up to the configured content cap. Full acquired chart series stay in the research journal; collector packets include the latest 256 bars for assigned companies.
-
-## Market observations
-
-Use Yahoo Finance's public, unofficial chart data for adjusted daily OHLCV. This source can be delayed and its interface can change. Store the source timestamp as the quote time and calculate freshness from that actual time; do not reset freshness to fetch time. Quotes older than 120 seconds cannot support a new fill. In particular, stale after-hours observations must not be presented as current executable prices.
-
-Use up to 1,260 daily candles. Preserve trading-session gaps; do not synthesize weekend or holiday bars. A symbol with fewer than 300 usable observations is insufficient for statistical admission. The current exchange-local date is excluded conservatively. Missing historical adjustment metadata blocks statistical admission. Invalid and incomplete values are rejected or excluded. Weekends do not age a daily equity signal by trading sessions; holidays count conservatively as weekdays.
-
-## Evidence and validation
-
-Keep source URLs, observed and publication times, content hashes and source IDs through every handoff. Distinguish verified facts from interpretation and speculation. Deduplicate syndicated reporting by canonical identity and shared underlying event; repeated copies are not independent cross-checks. Freeze candidate rules before chronological holdout validation. Host code computes all statistics and stores rejections and insufficient-history outcomes.
-
-Paper execution uses deterministic checks and simulated fills only. The executor has no broker credentials or order-submission capability. Pausing must prevent additional provider work and execution after the current bounded operation reaches its checkpoint.
-
-## Startup, configuration and controls
-
-Install the per-user macOS service with `python3 scripts/prismctl.py install`. The control token remains private and is linked to the console's Keychain entry. `PRISM_STATE_DIR` and `PRISM_CONTROL_TOKEN_FILE` select alternate state/token locations. The listener binds `127.0.0.1:8787`; `/v1/state`, `/v1/control` and `/v1/config` require the local bearer token and reject browser origins.
-
-The existing OpenAI key is loaded from `PRISM_OPENAI_KEY_FILE`, `OPENAI_API_KEY`, the private `.prism-runtime/secrets/openai.key` file or the `studio.prism.openai` Keychain entry. Source URLs must never contain credentials. Model-call and spending ceilings are optional; null disables a ceiling while usage accounting remains active. Spend is a conservative local token estimate, not a provider invoice.
-
-Use `python3 scripts/prismctl.py start`, `pause`, `resume`, `stop` or `run`. Run requests an immediate cycle and enables continued scheduling. Quotes refresh independently every 60 seconds while active; research repeats 15 minutes after a cycle completes. The Mac must remain awake and connected.
-
-Save a partial configuration such as the following, then run `python3 scripts/prismctl.py configure --config-file /path/to/settings.json`:
+Example partial configuration:
 
 ```json
 {
-  "sector": {"max_symbols": 100, "discovery_enabled": true},
-  "ingestion": {"shared_evidence_limit": 300, "max_content_chars": 32000}
+  "research": {
+    "active_collectors": 6,
+    "active_analysts": 2,
+    "max_holding_sessions": 20,
+    "min_forward_sessions": 60,
+    "min_forward_trades": 8,
+    "forward_block_sessions": 5,
+    "min_forward_blocks": 12,
+    "review_interval_sessions": 20,
+    "benchmark_symbols": ["SPY", "SMH"],
+    "data_cost_usd_per_day": 0,
+    "infrastructure_cost_usd_per_day": 0
+  }
 }
 ```
 
-Discovery tries the SEC company directory and falls back to Nasdaq's public listed-company directories when unavailable. ETF and test listings are excluded from exchange discovery. Source failures and unverified seed fallback remain visible. Upgrading archives prior crypto configuration, markets, approvals and the paper account atomically; the equity account starts with fresh USD paper cash, paused.
+Save it and use `python3 scripts/prismctl.py configure --config-file /path/to/settings.json`. The actual observation requirement can exceed `min_forward_sessions`: blocks also span at least the lookback and holding horizon, and significance can require more blocks. Defaults are not a promise of admission after 60 days. Changing a rule, execution policy, review protocol or implementation creates a new identity; it cannot rewrite earlier forward evidence.
 
-The fetcher reads RSS, Atom and ordinary HTML. It does not render JavaScript or extract PDFs. Unsupported documents retain any available feed summary and a fetch gap. Bing News RSS links may expose a summary or redirect page instead of a complete publisher article. Default feeds also include NVIDIA announcements, HPCwire, Semiconductor Engineering and Data Center Dynamics. Google News RSS is excluded because its robots policy blocked the search feed in the live check. Public source availability and coverage can change.
+## Evidence and information availability
+
+The AI infrastructure catalogue discovers current listed companies up to its configured limit, with observable source failures and seed fallback. Listing checks and topical matches are not verified revenue exposure or a survivorship-safe historical universe. Membership records identify their current observation basis.
+
+Public fetch bounds remain 48 pages, 160 requests, 90 seconds, depth two, 1 MB per response, 24,000 extracted characters, 256 shared items per collector packet, and 4,000 evidence records per cycle. HTML/RSS/Atom are supported; JavaScript rendering, PDFs, private sources and bypassing access controls are not.
+
+Evidence preserves publication, observation, availability, content identity, source family and event identity separately. A late fetch is not backdated to an article's publication. Historical signal eligibility additionally requires explicitly known original availability. New document versions remain separate records. A frozen cycle stores exact source documents and model requests/responses. Analyst quotations must be exact substrings of supplied documents. Packet truncation is explicit; absent passages cannot support a proposal.
+
+Supported rule families are momentum, mean reversion, breakout and bounded event surprise. An event feature requires explicit finite numeric actual and nonzero expectation values, a prior expectation timestamp, event/publication times and supporting evidence. Its availability is no earlier than actual observation. Headline sentiment and model confidence cannot become numeric return features.
+
+## Market data and execution
+
+The default Yahoo chart endpoint is unofficial and may be delayed or revised. It supplies adjusted development charts, separate vendor OHLC rows, actual quote time, available current regular-session metadata and split/dividend events. Only prior local dates enter closed daily history. Source timestamps are never reset to fetch time.
+
+Yahoo describes historical Close as split-adjusted and Adjusted Close as adjusted for splits and distributions. See [Yahoo historical data](https://finance.yahoo.com/quote/%5EGSPC/history/) and [adjusted-close methodology](https://help.yahoo.com/kb/SLN28256.html). The adapter therefore marks its historical execution basis and calendars unverified. It does not relabel those rows as original tradable share prices or invent historical session schedules. Historical replay requires a dataset with explicit unadjusted execution prices and observed opening/closing timestamps. Missing data produces an inconclusive development report.
+
+Real-equity execution uses the shared daily policy. Orders are committed before a future observed session open; opening observations older than 120 seconds cannot be backfilled. Missing session prices, stale quotes, unsupported policy hashes or exhausted liquidity block fills. Default modeled costs include six basis points of fees, three of slippage, ten of spread and a volume-dependent impact term. These assumptions are configurable and stressed; they are not broker-calibrated guarantees.
+
+Default entry budgets are 10% per symbol, 30% gross and 10% correlated exposure, with a 1% prior-volume participation budget. Candidate ranking uses declared forward excess per volatility and treats unknown correlation conservatively. Holdings can drift with prices; these are entry budgets, not a continuous guarantee on position weights. Stops use a completed-session price condition and a later eligible open. The default holding limit is 20 observed sessions. The legacy `position_ttl_seconds` field remains for minute fixtures and does not define the daily equity policy.
+
+Splits adjust shares idempotently. Dividend entitlements increase receivables, not spendable cash; known payable dates settle them. Partial exits do not count as completed round trips. A 10% drawdown or kill switch halts entries. Exits still need observed prices and participation capacity; the console distinguishes a halt from complete liquidation and marks incomplete valuations.
+
+## Experiments and prospective admission
+
+Every canonical candidate is registered with a frozen rule, policy, input snapshot, lineage, code/model/prompt/config versions and start time. Repeated equivalent proposals append attempts without resetting that start. Development evaluations, including failures and stress reports, are append-only. Current history is development data, regardless of chronological partitions.
+
+Data-supported candidates run in independent shadow accounts. Stock, market and sector buy-and-hold accounts establish prospective comparisons. Review requires recorded future sessions strictly after registration, completed round trips, independent blocks, positive returns after allocated model/data/infrastructure costs, excess over every declared baseline and acceptable drawdown. Missing observations and baselines are visible; metrics are not invented.
+
+Unique experiments receive `0.05 / (n * (n + 1))` alpha allocations. Review checkpoints receive further summable allocations across comparisons. Host code recomputes evidence before allowing promotion. Retired experiments cannot be reactivated through a renamed strategy. Negative and inconclusive outcomes feed the research memory. Statistical results remain conditional on the stated dependence/stationarity assumptions.
+
+The Test page exposes phases, observations, failure reasons, estimated model spend and coverage. Aggregate paper entries require prospective promotion. The Overview reports observed paper ledger values; operating economics and research attribution are separate diagnostics.
+
+## Offline datasets
+
+No service or API key is needed:
+
+```sh
+python3 scripts/research.py import --journal /tmp/research.sqlite3 --dataset /path/to/vendor-v1.json
+python3 scripts/research.py evaluate --journal /tmp/research.sqlite3 --dataset /path/to/vendor-v1.json \
+  --proposals /path/to/proposals.json --output /tmp/development-report.json
+```
+
+A dataset JSON object has `id`, named `source`, timezone-aware `as_of`, `markets`, `evidence`, and optional dated `universe` membership. Use a new ID for revisions. A market includes normal closed adjusted `candles`, `raw_candles`, explicit `raw_history_basis: "unadjusted"`, security/currency metadata and corporate actions. Raw replay rows require observed `open_ms`, `close_ms`, nominal `start_ms`/`end_ms`, OHLCV and closed status. Actions have stable IDs, type, effective and availability times, plus ratio or amount. Dataset imports retain provider declarations; they do not independently certify them.
+
+Universe rows carry `security_id`, `symbol`, `valid_from`, optional `valid_to`, and `available_at`. Evidence records carry IDs, source URLs, content, publication/first-observation/availability times and revisions. Structured event records may include `event: {actual, expected, expectation_available_at, event_at, symbol}` with supporting lineage. Proposals are a list of explicit symbol/family/lookback/threshold hypotheses and evidence IDs. All offline evaluation output is development evidence, including portfolio replay and parameter/cost diagnostics.
+
+## Storage, credentials and controls
+
+`PRISM_STATE_DIR` and `PRISM_CONTROL_TOKEN_FILE` choose the state/token locations. The default journal is `.prism-runtime/cascade.sqlite3`; private files retain restricted permissions. `/v1/state`, `/v1/control` and `/v1/config` remain bearer-authenticated on `127.0.0.1:8787` and reject browser origins.
+
+The OpenAI key comes from `PRISM_OPENAI_KEY_FILE`, `OPENAI_API_KEY`, the private runtime key file or existing Keychain integration. Models never receive credentials. On protocol upgrade, prior research and any nonempty simulated account are archived before a separate prospective account begins. No broker adapter or real-order capability is added.

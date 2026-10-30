@@ -12,6 +12,40 @@ struct RuntimeState: Decodable, Sendable {
     let config: RuntimeConfiguration
     /// Additive cascade metadata; nil when the backend omits the key (legacy / offline fixture).
     let cascade: CascadeMetadata?
+    let research: ResearchStatus?
+}
+
+struct ResearchStatus: Decodable, Sendable {
+    let phase: String?
+    let historicalResultsAreDevelopment: Bool?
+    let experimentCount: Int?
+    let statuses: [String: Int]?
+    let failureReasons: [String: Int]?
+    let operatingCosts: ResearchCosts?
+    let coverage: ResearchCoverage?
+    let forwardReports: [ForwardResearchReport]?
+}
+
+struct ResearchCosts: Decodable, Sendable {
+    let modelCostUsd: Double?
+    let totalCostUsd: Double?
+    let calls: Int?
+}
+
+struct ResearchCoverage: Decodable, Sendable {
+    let gaps: [String]?
+    let survivorshipSafe: Bool?
+}
+
+struct ForwardResearchReport: Decodable, Identifiable, Sendable {
+    var id: String { experimentId }
+    let experimentId: String
+    let status: String?
+    let sessions: Int?
+    let netReturn: Double?
+    let excessReturn: Double?
+    let operatingPnlUsd: Double?
+    let reasons: [String]?
 }
 
 // MARK: - Cascade metadata (additive; all fields optional for backward compatibility)
@@ -63,6 +97,7 @@ struct CascadeCollection: Decodable, Sendable {
     let evidenceCount: Int
     let sourceCount: Int
     let collectorCount: Int
+    let activeCollectorCount: Int?
 }
 
 struct RuntimeStatus: Decodable, Sendable {
@@ -156,6 +191,8 @@ struct StrategyResult: Decodable, Identifiable, Sendable {
     let createdAt: String
     let agentId: String?
     let spec: StrategySpecification?
+    let phase: String?
+    let experimentId: String?
 }
 
 struct StrategySpecification: Decodable, Sendable {
@@ -196,8 +233,12 @@ struct PaperPortfolio: Decodable, Sendable {
     let pnlHistory: [PaperPnlObservation]?
     let positions: [PaperPosition]
     let trades: [PaperTrade]
+    let valuationComplete: Bool?
+    let riskHalted: Bool?
+    let warnings: [String]?
+    let receivables: [IncomeReceivable]?
 
-    /// Equity already includes open positions, trading costs, and accrued funding.
+    /// Equity includes positions, simulated trading costs, and observed income entitlements.
     var totalPnl: Double? {
         guard let initialEquity, initialEquity.isFinite, initialEquity > 0, equity.isFinite else { return nil }
         let result = equity - initialEquity
@@ -230,6 +271,12 @@ struct PaperPortfolio: Decodable, Sendable {
             $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date
         }
     }
+}
+
+struct IncomeReceivable: Decodable, Identifiable, Sendable {
+    let id: String
+    let amount: Double
+    let payableAtMs: Double?
 }
 
 struct PaperPnlObservation: Decodable, Equatable, Sendable {

@@ -101,11 +101,11 @@ class SectorRuntimeIntegrationTests(unittest.TestCase):
         import json
         self.runtime.control('start')
         self.assertTrue(self.runtime.run_cycle())
-        self.assertEqual(len(self.calls), 24)
+        self.assertEqual(len(self.calls), 6)
         self.assertTrue(self.payloads)
-        self.assertEqual(set(self.counts), {24})
+        self.assertEqual(set(self.counts), {6})
         collectors = [(agent, p) for agent, p in self.payloads if p['layer'] == 'collector']
-        self.assertEqual(len(collectors), 24)
+        self.assertEqual(len(collectors), 6)
         for agent, payload in collectors:
             self.assertIn('CRDO', payload['allowed_symbols'])
             self.assertGreater(len(payload['evidence'][0]['content']), 2200)
@@ -120,14 +120,14 @@ class SectorRuntimeIntegrationTests(unittest.TestCase):
         self.store.update_config({'max_calls_per_day': 1, 'max_concurrency': 1})
         self.runtime.control('start')
         self.assertFalse(self.runtime.run_cycle())
-        self.assertEqual(len(self.calls), 24)
+        self.assertEqual(len(self.calls), 6)
         self.assertEqual(len(self.payloads), 1)
         self.store.update_config({'max_calls_per_day': 100})
         self.assertTrue(self.runtime.run_cycle())
-        self.assertEqual(len(self.calls), 24)
+        self.assertEqual(len(self.calls), 6)
         ids = [agent for agent, payload in self.payloads if payload['layer'] == 'collector']
         self.assertEqual(len(ids), len(set(ids)))
-        self.assertEqual(len(ids), 24)
+        self.assertEqual(len(ids), 6)
         self.assertEqual(self.store.budget()['reserved_usd'], 0)
 
     def test_pause_during_acquisition_prevents_model_calls_and_handoffs(self):

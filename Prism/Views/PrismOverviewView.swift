@@ -49,6 +49,15 @@ struct PrismOverviewView: View {
                 Text(issue).font(.system(size: 11)).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 360).padding(.top, 20)
             }
+            if runtime.state?.portfolio.valuationComplete == false {
+                Text("Valuation incomplete: fresh marks are missing.")
+                    .font(.system(size: 11)).foregroundStyle(.orange).padding(.top, 12)
+            }
+            if runtime.state?.portfolio.riskHalted == true {
+                Text("Entries halted. Open positions may remain until observed exit prices are available.")
+                    .font(.system(size: 11)).foregroundStyle(.orange)
+                    .multilineTextAlignment(.center).frame(maxWidth: 360).padding(.top, 12)
+            }
         }
     }
 }

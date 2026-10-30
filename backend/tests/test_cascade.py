@@ -64,7 +64,10 @@ class Provider:
                       'evidence_ids': ['invented' if self.invented_refs else 'observed-source'], 'symbols': ['MRVL'], 'importance': .8}]}
         elif layer == 'analyst':
             output = {'edges': [{'symbol': 'MRVL', 'kind': 'momentum', 'parameters': {'lookback': 3, 'threshold': .002},
-                       'evidence_ids': ['observed-source'], 'hypothesis': 'Synthetic momentum fixture'}]}
+                       'evidence_ids': ['observed-source'], 'hypothesis': 'Synthetic momentum fixture',
+                       'mechanism': 'Fixture persistence', 'invalidation': 'No prospective excess return',
+                       'prediction_horizon_sessions': 3, 'supporting_claims': [
+                           {'evidence_id': 'observed-source', 'excerpt': 'Synthetic closed-bar pattern.', 'stance': 'support'}]}]}
         elif layer == 'strategist':
             edge = payload['inputs'][0]['payload']
             output = {'strategies': [{'name': 'Frozen integration rule', 'symbol': edge['symbol'], 'family': edge['kind'],
@@ -99,25 +102,26 @@ class CascadeTests(unittest.TestCase):
         self.runtime.control('start_all')
         self.assertTrue(self.runtime.run_cycle())
         state = self.runtime.state()
-        self.assertEqual(self.provider.calls.count('collector'), 24)
-        self.assertEqual(self.provider.calls.count('analyst'), 6)
-        self.assertEqual(self.provider.calls.count('strategist'), 2)
-        self.assertEqual(self.provider.calls.count('executor'), 1)
+        self.assertEqual(self.provider.calls.count('collector'), 6)
+        self.assertEqual(self.provider.calls.count('analyst'), 2)
+        self.assertEqual(self.provider.calls.count('strategist'), 0)
+        self.assertEqual(self.provider.calls.count('executor'), 0)
         self.assertEqual(self.provider.calls, sorted(self.provider.calls, key=['collector', 'analyst', 'strategist', 'executor'].index))
         self.assertEqual(state['cascade']['cycle']['status'], 'completed')
-        self.assertEqual(state['cascade']['statistical_trial_count'], 6)
-        self.assertTrue(any(row['status'] == 'paper' for row in state['strategies']))
-        self.assertEqual(len(state['portfolio']['positions']), 1)
-        self.assertEqual(len(state['portfolio']['trades']), 1)
-        self.assertLess(state['portfolio']['equity'], 100000)
+        self.assertEqual(state['cascade']['statistical_trial_count'], 2)
+        self.assertTrue(any(row['status'] == 'shadow' for row in state['strategies']))
+        self.assertEqual(len(state['portfolio']['positions']), 0)
+        self.assertEqual(len(state['portfolio']['trades']), 0)
+        self.assertEqual(state['portfolio']['equity'], 100000)
         for row in self.provider.payloads:
             if row['layer'] == 'analyst':
-                self.assertLessEqual(row['markets'][0]['candles'][-1]['end_ms'], self.collector.market['candles'][1039]['end_ms'])
-        self.assertEqual(state['budget']['calls_today'], 33)
+                self.assertEqual(row['research_phase'], 'development')
+                self.assertLessEqual(row['markets'][0]['candles'][-1]['end_ms'], row['information_cutoff_ms'])
+        self.assertEqual(state['budget']['calls_today'], 8)
         self.assertEqual(state['budget']['reserved_usd'], 0)
         # A repeated market tick may mark, but cannot duplicate a same-bar entry.
         self.runtime.refresh_markets()
-        self.assertEqual(len(self.store.get_document('portfolio')['trades']), 1)
+        self.assertEqual(len(self.store.get_document('portfolio')['trades']), 0)
 
     def test_unbacked_collector_claims_never_reach_analysts(self):
         self.runtime.provider = Provider(invented_refs=True)
@@ -132,13 +136,13 @@ class CascadeTests(unittest.TestCase):
         self.runtime.control('start')
         self.assertFalse(self.runtime.run_cycle())
         self.assertEqual(len(self.provider.calls), 1)
-        self.assertEqual(len(self.collector.calls), 24)
+        self.assertEqual(len(self.collector.calls), 6)
         cycle = self.store.get_document('active_cycle')
         self.assertEqual(cycle['stage'], 0)
         self.store.update_config({'max_calls_per_day': 100})
         self.assertTrue(self.runtime.run_cycle())
-        self.assertEqual(len(self.collector.calls), 24)  # Source fetches resumed from checkpoints.
-        self.assertEqual(len(self.provider.calls), 33)
+        self.assertEqual(len(self.collector.calls), 6)  # Source fetches resumed from checkpoints.
+        self.assertEqual(len(self.provider.calls), 8)
 
     def test_stop_during_provider_call_prevents_handoffs_and_execution(self):
         gate = threading.Event()
