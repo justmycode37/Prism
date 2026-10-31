@@ -457,6 +457,8 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(quote['ask_size'], 10)
         self.assertEqual(quote['bid_size'], 12)
         self.assertEqual(quote['turnover_24h'], 1000000)
+        self.assertEqual(quote['book_timestamp_ms'], self.clock.ms - 1000)
+        self.assertEqual(quote['timestamp_ms'], quote['book_timestamp_ms'])
         self.clock.advance(20)
         self.service.ingest_message(ticker(self.clock.ms, sequence=1, kind='delta', data={'ask1Price': '100.03'}), 'linear')
         snap = self.service.snapshot('s')

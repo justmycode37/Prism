@@ -1,0 +1,185 @@
+{
+  "initial_equity": 100,
+  "fee_bps": 10,
+  "quantity": 0.1,
+  "stop_fraction": 0.1,
+  "max_quote_age_ms": 1000,
+  "max_bar_delay_ms": 1000,
+  "candidates": [
+    {
+      "name": "three_bar",
+      "lookback": 3,
+      "threshold": 0
+    },
+    {
+      "name": "high_threshold",
+      "lookback": 4,
+      "threshold": 0.2
+    }
+  ],
+  "events": [
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000059999,
+      "bid": 100,
+      "ask": 100.01,
+      "bid_size": 2,
+      "ask_size": 2
+    },
+    {
+      "type": "candle",
+      "timestamp_ms": 1800000060000,
+      "start_ms": 1800000000000,
+      "end_ms": 1800000060000,
+      "open": 100,
+      "high": 100.2,
+      "low": 99.8,
+      "close": 100
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000061000,
+      "bid": 100,
+      "ask": 100.01,
+      "bid_size": 2,
+      "ask_size": 2
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000119999,
+      "bid": 101,
+      "ask": 101.01,
+      "bid_size": 2,
+      "ask_size": 2
+    },
+    {
+      "type": "candle",
+      "timestamp_ms": 1800000120000,
+      "start_ms": 1800000060000,
+      "end_ms": 1800000120000,
+      "open": 101,
+      "high": 101.2,
+      "low": 100.8,
+      "close": 101
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000121000,
+      "bid": 101,
+      "ask": 101.01,
+      "bid_size": 2,
+      "ask_size": 2
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000179999,
+      "bid": 102,
+      "ask": 102.01,
+      "bid_size": 2,
+      "ask_size": 2
+    },
+    {
+      "type": "candle",
+      "timestamp_ms": 1800000180000,
+      "start_ms": 1800000120000,
+      "end_ms": 1800000180000,
+      "open": 102,
+      "high": 102.2,
+      "low": 101.8,
+      "close": 102
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000181000,
+      "bid": 102,
+      "ask": 102.01,
+      "bid_size": 2,
+      "ask_size": 2
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000239999,
+      "bid": 103,
+      "ask": 103.01,
+      "bid_size": 2,
+      "ask_size": 2
+    },
+    {
+      "type": "candle",
+      "timestamp_ms": 1800000240000,
+      "start_ms": 1800000180000,
+      "end_ms": 1800000240000,
+      "open": 103,
+      "high": 103.2,
+      "low": 102.8,
+      "close": 103
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000241000,
+      "bid": 103,
+      "ask": 103.01,
+      "bid_size": 2,
+      "ask_size": 2
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000299999,
+      "bid": 104,
+      "ask": 104.01,
+      "bid_size": 2,
+      "ask_size": 2
+    },
+    {
+      "type": "candle",
+      "timestamp_ms": 1800000300000,
+      "start_ms": 1800000240000,
+      "end_ms": 1800000300000,
+      "open": 104,
+      "high": 104.2,
+      "low": 103.8,
+      "close": 104
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000301000,
+      "bid": 104,
+      "ask": 104.01,
+      "bid_size": 2,
+      "ask_size": 0.04
+    },
+    {
+      "type": "funding",
+      "timestamp_ms": 1800000302000,
+      "id": "fund-1",
+      "rate": 0.001,
+      "mark_price": 104
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000359999,
+      "bid": 105,
+      "ask": 105.01,
+      "bid_size": 2,
+      "ask_size": 2
+    },
+    {
+      "type": "candle",
+      "timestamp_ms": 1800000360000,
+      "start_ms": 1800000300000,
+      "end_ms": 1800000360000,
+      "open": 105,
+      "high": 105.2,
+      "low": 104.8,
+      "close": 105
+    },
+    {
+      "type": "quote",
+      "timestamp_ms": 1800000361000,
+      "bid": 105,
+      "ask": 105.01,
+      "bid_size": 2,
+      "ask_size": 2
+    }
+  ]
+}

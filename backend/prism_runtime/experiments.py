@@ -32,7 +32,7 @@ def forward_report(observations, config=None, *, performance_basis=None):
     if any(not row.get('valuation_complete', False) for row in observations):
         result['reasons'] = ['Incomplete valuations cannot support promotion']
         return result
-    if performance_basis == 'operating' and any(row.get('source_cost_complete') is False for row in observations):
+    if performance_basis == 'operating' and any(row.get('source_cost_complete') is not True for row in observations):
         result['reasons'] = ['Imported source costs are incomplete; promotion requires known operating costs']
         return result
     dates = [row.get('session_ms', 0) for row in observations]
@@ -87,7 +87,8 @@ def forward_report(observations, config=None, *, performance_basis=None):
             value = row.get(name)
             if not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or value <= -1:
                 missing.add(name)
-                baseline_returns[name].append(0.)
+                # Keep alignment for complete rows only. A fabricated zero
+                # would turn an unknown paired observation into evidence.
             else:
                 baseline_returns[name].append(value)
     benchmark_wealth = {name: math.prod(1+r for r in values) for name,values in baseline_returns.items()}
@@ -120,6 +121,9 @@ def forward_report(observations, config=None, *, performance_basis=None):
     threshold = alpha/(look*(look+1)*3)
     statistics_by_benchmark = {}
     for name, values in baseline_returns.items():
+        if name in missing:
+            statistics_by_benchmark[name] = None
+            continue
         excess = [(1+a)/(1+b)-1 for a,b in zip(net_returns,values)]
         p, count, positives, correlation = _sign_test(excess,block)
         statistics_by_benchmark[name] = {'p_value':p,'nonzero_blocks':count,'positive_blocks':positives,'lag1_correlation':correlation}

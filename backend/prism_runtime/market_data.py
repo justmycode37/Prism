@@ -599,6 +599,12 @@ class MarketDataService:
             for wire, local in QUOTE_FIELDS.items():
                 if wire in data:
                     quote[local] = _number(data[wire])
+            # A ticker delta may only update turnover or one book field. Such
+            # a delta is not a new observation of both displayed price/size
+            # pairs and must not replenish simulated executable depth.
+            complete_book = all(field in data for field in ('bid1Price', 'ask1Price', 'bid1Size', 'ask1Size'))
+            if category == 'linear' and complete_book:
+                quote['book_timestamp_ms'] = stamp
             quote.update(timestamp_ms=stamp, received_at_ms=self._now(), source='websocket')
             # Keep the sequence high-water mark across a message that omits
             # ``cs``. Otherwise the next sequenced update could roll back to
@@ -626,6 +632,10 @@ class MarketDataService:
             instrument['quote_synchronized'] = instrument['ticker_synchronized']
         else:
             instrument['quote'] = copy.deepcopy(ticker)
+            if instrument['key'][0] == 'linear':
+                book_at = ticker.get('book_timestamp_ms')
+                instrument['quote']['ticker_timestamp_ms'] = ticker.get('timestamp_ms')
+                instrument['quote']['timestamp_ms'] = min(ticker.get('timestamp_ms', 0), book_at or 0)
             instrument['quote_synchronized'] = instrument['ticker_synchronized']
 
     def _ingest_book(self, message, category, symbol):

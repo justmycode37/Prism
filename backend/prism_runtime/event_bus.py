@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import time
 
@@ -19,6 +20,15 @@ class EventBus:
             db.execute('CREATE INDEX IF NOT EXISTS attention_due ON attention_events(status,available_at,priority)')
             db.execute('CREATE INDEX IF NOT EXISTS attention_target_status ON attention_events(kind,target,status,priority,available_at)')
             db.execute('CREATE INDEX IF NOT EXISTS idx_attention_recent ON attention_events(updated_at DESC)')
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS attention_event_origins (
+                    id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL, payload_hash TEXT NOT NULL);
+                CREATE TRIGGER IF NOT EXISTS attention_origin_no_update
+                    BEFORE UPDATE ON attention_event_origins BEGIN SELECT RAISE(ABORT,'immutable attention origin'); END;
+                CREATE TRIGGER IF NOT EXISTS attention_origin_no_delete
+                    BEFORE DELETE ON attention_event_origins BEGIN SELECT RAISE(ABORT,'immutable attention origin'); END;
+            ''')
             db.execute("UPDATE attention_events SET status='pending' WHERE status='working'")
 
     @staticmethod
@@ -38,11 +48,16 @@ class EventBus:
             raise ValueError('Unsupported attention event')
         ident = key or identity([kind, target, payload])
         now = self.clock()
+        if type(now) not in (int, float) or not math.isfinite(now) or now <= 0:
+            raise ValueError('Attention clock must be finite and positive')
         with self.store.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             old = db.execute('SELECT id FROM attention_events WHERE id=?', (ident,)).fetchone()
             if old:
                 return ident
+            origin_hash = hashlib.sha256(encoded([kind, target, payload]).encode()).hexdigest()
+            db.execute('INSERT INTO attention_event_origins VALUES (?,?,?,?,?)',
+                       (ident, kind, target, round(now * 1000), origin_hash))
             attention_order = (self._sol_attention_order(payload)
                 if kind in {'support', 'candle_closed'} else None)
             if attention_order is not None:

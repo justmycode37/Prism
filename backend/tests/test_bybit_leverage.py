@@ -179,7 +179,7 @@ class PaperLeverageTests(unittest.TestCase):
         self.now[0] += 1
         restarted.advance([{'category': 'linear', 'symbol': 'SOLUSDT', 'quote': {
             'bid': 99., 'ask': 100., 'bid_size': 10., 'ask_size': 10.,
-            'timestamp_ms': round(self.now[0] * 1000)}}])
+            'timestamp_ms': round(self.now[0] * 1000), 'book_timestamp_ms': round(self.now[0] * 1000)}}])
         position = restarted.request('GET', 'https://paper.bybit.invalid/v5/position/list?category=linear&symbol=SOLUSDT')['result']['list'][0]
         self.assertEqual(position['leverage'], '5')
         self.assertEqual(float(position['unrealisedPnl']), -2.)
@@ -215,7 +215,7 @@ class PaperLeverageTests(unittest.TestCase):
         self.now[0] += 1
         self.exchange.advance([{'category': 'linear', 'symbol': 'SOLUSDT', 'quote': {
             'bid': 100., 'ask': 100., 'bid_size': 10., 'ask_size': 10.,
-            'timestamp_ms': round(self.now[0] * 1000)}}])
+            'timestamp_ms': round(self.now[0] * 1000), 'book_timestamp_ms': round(self.now[0] * 1000)}}])
         position = self.request('GET', '/v5/position/list?category=linear&symbol=SOLUSDT')['result']['list'][0]
         self.assertEqual(float(position['size']), 2.)
         wallet = self.request('GET', '/v5/account/wallet-balance')['result']['list'][0]

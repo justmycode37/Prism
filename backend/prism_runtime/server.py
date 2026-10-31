@@ -105,7 +105,8 @@ def create_server(runtime, token, port=8787):
             try:
                 path = urlsplit(self.path).path
                 size = int(self.headers.get('Content-Length', '-1'))
-                maximum = 1_000_000 if path == '/v1/development-tape' else 16384
+                maximum = (1_000_000 if path == '/v1/development-tape' else
+                           128_000 if path == '/v1/sol-paper-run' else 16384)
                 if self.headers.get('Transfer-Encoding') or not 0 < size <= maximum:
                     self.respond(413, {'error': 'Request body exceeds this endpoint’s bounded input size.'})
                     return
@@ -131,6 +132,10 @@ def create_server(runtime, token, port=8787):
                     runtime.import_calendar(body)
                 elif path == '/v1/development-tape':
                     runtime.import_development_tape(body)
+                elif path == '/v1/sol-paper-run':
+                    result = runtime.sol_paper_run_control(body)
+                    self.respond(200, {'ok': True, 'paper_run': result})
+                    return
                 else:
                     self.respond(404, {'error': 'Unknown local endpoint.'})
                     return

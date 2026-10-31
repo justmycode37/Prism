@@ -1,0 +1,147 @@
+{
+  "purpose": "Exploratory synthetic stress of SOL shadow screening, not market performance",
+  "seed": 20261103,
+  "alpha_budget": 0.025,
+  "checkpoints": [
+    60,
+    80,
+    100,
+    120,
+    140,
+    160,
+    180
+  ],
+  "scenarios": [
+    {
+      "rho": 0.0,
+      "paths": 5000,
+      "raw_any_promotion": 4,
+      "screened_any_promotion": 2,
+      "screened_any_fraction": 0.0004,
+      "screened_any_wilson_95": [
+        0.00010970128207763504,
+        0.0014573865014234437
+      ],
+      "by_look": {
+        "60": {
+          "raw_promoted": 0,
+          "screened_promoted": 0
+        },
+        "80": {
+          "raw_promoted": 1,
+          "screened_promoted": 0
+        },
+        "100": {
+          "raw_promoted": 2,
+          "screened_promoted": 0
+        },
+        "120": {
+          "raw_promoted": 1,
+          "screened_promoted": 1
+        },
+        "140": {
+          "raw_promoted": 0,
+          "screened_promoted": 0
+        },
+        "160": {
+          "raw_promoted": 1,
+          "screened_promoted": 1
+        },
+        "180": {
+          "raw_promoted": 0,
+          "screened_promoted": 0
+        }
+      }
+    },
+    {
+      "rho": 0.8,
+      "paths": 5000,
+      "raw_any_promotion": 76,
+      "screened_any_promotion": 13,
+      "screened_any_fraction": 0.0026,
+      "screened_any_wilson_95": [
+        0.0015201269998326155,
+        0.004443582895110212
+      ],
+      "by_look": {
+        "60": {
+          "raw_promoted": 25,
+          "screened_promoted": 0
+        },
+        "80": {
+          "raw_promoted": 28,
+          "screened_promoted": 0
+        },
+        "100": {
+          "raw_promoted": 23,
+          "screened_promoted": 7
+        },
+        "120": {
+          "raw_promoted": 22,
+          "screened_promoted": 7
+        },
+        "140": {
+          "raw_promoted": 20,
+          "screened_promoted": 5
+        },
+        "160": {
+          "raw_promoted": 13,
+          "screened_promoted": 4
+        },
+        "180": {
+          "raw_promoted": 14,
+          "screened_promoted": 6
+        }
+      }
+    },
+    {
+      "rho": 0.95,
+      "paths": 5000,
+      "raw_any_promotion": 287,
+      "screened_any_promotion": 4,
+      "screened_any_fraction": 0.0008,
+      "screened_any_wilson_95": [
+        0.00031114697610156263,
+        0.0020553266458434704
+      ],
+      "by_look": {
+        "60": {
+          "raw_promoted": 199,
+          "screened_promoted": 0
+        },
+        "80": {
+          "raw_promoted": 128,
+          "screened_promoted": 0
+        },
+        "100": {
+          "raw_promoted": 87,
+          "screened_promoted": 1
+        },
+        "120": {
+          "raw_promoted": 46,
+          "screened_promoted": 2
+        },
+        "140": {
+          "raw_promoted": 35,
+          "screened_promoted": 1
+        },
+        "160": {
+          "raw_promoted": 23,
+          "screened_promoted": 1
+        },
+        "180": {
+          "raw_promoted": 19,
+          "screened_promoted": 0
+        }
+      }
+    }
+  ],
+  "limitations": [
+    "Independent simulated paths; within-path IID or stationary Gaussian AR(1) daily returns",
+    "Zero-mean arithmetic returns can have nonzero expected compounded wealth",
+    "Three identical zero-return benchmarks and synthetic trade counts are not realistic",
+    "This does not run the full LiveResearch gate or establish independence for SOL",
+    "The screen was developed using other simulations; this seed is a separate synthetic holdout",
+    "A finite collection of scenarios cannot establish universal type-I error control"
+  ]
+}

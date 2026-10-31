@@ -23,6 +23,7 @@ from . import analytics
 from .domain import identity, timestamp
 from .experiments import forward_report
 from .market_policy import INTERVAL_MS, measured_quote_source, validate_market_policy
+from .source_costs import source_cost as _source_cost
 from .store import encoded
 
 
@@ -32,6 +33,7 @@ MAX_DEVELOPMENT_BYTES = 32 * 1024 * 1024
 MAX_DEVELOPMENT_SAMPLE_BYTES = 512 * 1024
 MAX_EVENT_CAPTURES = 100_000
 _DAY_MS = 86_400_000
+_OBSERVE_RETRY = object()
 _MODE_SEMANTICS = {
     'closed': 'closed_candle_next_quote_v2',
     'intrabar': 'return_since_open_next_quote_v1',
@@ -67,21 +69,6 @@ def _policy_protocol(mode):
     }
 
 
-def _source_cost(sources):
-    costs, complete = {}, True
-    for source in sources:
-        run_id = source.get('acquisition_cost_id')
-        if not run_id:
-            continue
-        amount = source.get('acquisition_cost_usd')
-        valid = (source.get('acquisition_cost_complete') is True
-                 and _finite(amount, nonnegative=True))
-        complete = complete and valid
-        if valid:
-            costs[run_id] = max(float(amount), costs.get(run_id, 0.))
-    return sum(costs.values()), complete
-
-
 class LiveResearch:
     def __init__(self, store, *, clock=None, snapshot_verifier=None):
         self.store, self.clock = store, clock or time.time
@@ -92,6 +79,18 @@ class LiveResearch:
             # New protocol tables intentionally do not reinterpret legacy v2
             # captures whose signal/fill timing was not frozen consistently.
             db.executescript('''
+                CREATE TABLE IF NOT EXISTS md_snapshots (
+                    id TEXT PRIMARY KEY,strategy_id TEXT,signal_input_id TEXT,
+                    captured_at_ms INTEGER,invalidated INTEGER DEFAULT 0,reason TEXT);
+                CREATE TABLE IF NOT EXISTS live_research_source_epochs (
+                    strategy_id TEXT PRIMARY KEY,epoch INTEGER NOT NULL);
+                CREATE TRIGGER IF NOT EXISTS live_research_invalidation_epoch
+                AFTER UPDATE OF invalidated ON md_snapshots
+                WHEN OLD.invalidated=0 AND NEW.invalidated!=0
+                BEGIN
+                    INSERT INTO live_research_source_epochs(strategy_id,epoch) VALUES (NEW.strategy_id,1)
+                    ON CONFLICT(strategy_id) DO UPDATE SET epoch=epoch+1;
+                END;
                 CREATE TABLE IF NOT EXISTS live_research_v2_accounts (
                     experiment_id TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS md_snapshot_pins (id TEXT PRIMARY KEY);
@@ -135,7 +134,7 @@ class LiveResearch:
         if not isinstance(performance_basis, str) or performance_basis not in {'trading', 'operating'}:
             raise ValueError('Unsupported performance basis.')
         if execution_identity is not None:
-            if (not isinstance(execution_identity, dict) or not 1 <= len(execution_identity) <= 12
+            if (not isinstance(execution_identity, dict) or not 1 <= len(execution_identity) <= 16
                     or any(not isinstance(key, str) or not key or len(key) > 64 for key in execution_identity)):
                 raise ValueError('Execution identity must be a bounded object.')
             for value in execution_identity.values():
@@ -284,7 +283,7 @@ class LiveResearch:
             execution_identity = policy.get('execution_identity')
             if (policy.get('performance_basis') not in {'trading', 'operating'}
                     or execution_identity is not None and (
-                        not isinstance(execution_identity, dict) or not 1 <= len(execution_identity) <= 12
+                        not isinstance(execution_identity, dict) or not 1 <= len(execution_identity) <= 16
                         or any(not isinstance(key, str) or not key or len(key) > 64 for key in execution_identity)
                         or any(not ((isinstance(value, str) and len(value) <= 128)
                                     or isinstance(value, bool)
@@ -926,6 +925,15 @@ class LiveResearch:
         return self._observe(strategy_id, snapshot, signal_required=False)
 
     def _observe(self, strategy_id, snapshot, *, signal_required):
+        # Independent Store instances have independent Python locks. Retry a
+        # bounded optimistic conflict rather than applying a stale book twice.
+        for _ in range(4):
+            result = self._observe_once(strategy_id, snapshot, signal_required=signal_required)
+            if result is not _OBSERVE_RETRY:
+                return result
+        return None
+
+    def _observe_once(self, strategy_id, snapshot, *, signal_required):
         experiment = self.store.experiment(strategy_id)
         if (not experiment or experiment['policy'].get('version') != PROTOCOL_VERSION
                 or experiment['status'] in {'retired', 'rejected'} or not self._implemented_policy(experiment)):
@@ -940,15 +948,26 @@ class LiveResearch:
             return None
         policy = experiment['policy']
         snapshot_id = observation['snapshot_id']
+        source_scope = f"{observation['host'].get('environment')}:{strategy_id}"
         with self.store._lock:
             with self.store.connection() as db:
                 prior_capture = db.execute('SELECT value FROM live_research_v2_captures WHERE experiment_id=? AND snapshot_id=?',
                                            (strategy_id, snapshot_id)).fetchone()
                 account_row = db.execute('SELECT value FROM live_research_v2_accounts WHERE experiment_id=?',
                                          (strategy_id,)).fetchone()
-            if prior_capture:
-                return json.loads(prior_capture['value'])
+                source_row = db.execute('SELECT epoch FROM live_research_source_epochs WHERE strategy_id=?',
+                                        (source_scope,)).fetchone()
+            source_epoch = source_row['epoch'] if source_row else 0
             book = json.loads(account_row['value']) if account_row else self._new_book(policy)
+            if account_row is None:
+                book.update(causal_provenance_version=1, source_scope=source_scope, source_epoch=source_epoch)
+            elif (book.get('causal_provenance_version') != 1 or book.get('source_scope') != source_scope
+                  or book.get('source_epoch') != source_epoch):
+                # Pre-migration accounts lack a complete causal record, and a
+                # corrected source must not keep advancing a contaminated book.
+                return None
+            if prior_capture:
+                return json.loads(prior_capture['value']) if account_row is not None else None
             if not signal_required and not book.get('last_signal_key'):
                 return None
             if (observation['captured_at_ms'] <= book['last_capture_ms']
@@ -956,9 +975,11 @@ class LiveResearch:
                 return None
             previous_quote_ms = book['last_quote_ms']
             pending_snapshot = book.get('pending_snapshot_id')
+            pending_verified = False
             if pending_snapshot:
                 verified, _, _ = self._stored_host_snapshot(experiment, pending_snapshot,
                     at_capture=False, capture_verified=True)
+                pending_verified = verified
                 if not verified:
                     book.update(pending_target=None, pending_signal_at_ms=0,
                                 pending_signal_key=None, pending_snapshot_id=None)
@@ -994,7 +1015,12 @@ class LiveResearch:
                 prior_day_row = db.execute('SELECT day,value FROM live_research_v2_days WHERE experiment_id=? ORDER BY day DESC LIMIT 1',
                                            (strategy_id,)).fetchone()
             prior_day = json.loads(prior_day_row['value']) if prior_day_row else None
-            record_day = prior_day is None or current_day > prior_day['day']
+            # A fresh capture after midnight is not itself a fresh market
+            # observation. Do not turn yesterday's repeated quote into today's
+            # benchmark and valuation, even if its age is still within policy.
+            quote_ms = observation['quote']['timestamp_ms']
+            record_day = ((prior_day is None or current_day > prior_day['day'])
+                          and quote_ms > previous_quote_ms and quote_ms // _DAY_MS == current_day)
             if record_day:
                 charged = self.store.research_cost(strategy_id)
                 complete_cost = _finite(charged, nonnegative=True) and charged >= book['charged_research_cost_usd']
@@ -1023,6 +1049,38 @@ class LiveResearch:
             capture = self._persist_capture(strategy_id, observation, book, events, policy) if events else None
             with self.store.connection() as db:
                 db.execute('BEGIN IMMEDIATE')
+                current_account = db.execute('SELECT value FROM live_research_v2_accounts WHERE experiment_id=?',
+                                             (strategy_id,)).fetchone()
+                before = account_row['value'] if account_row else None
+                current = current_account['value'] if current_account else None
+                if current != before:
+                    return _OBSERVE_RETRY
+                latest_source = db.execute('SELECT epoch FROM live_research_source_epochs WHERE strategy_id=?',
+                                           (source_scope,)).fetchone()
+                if (latest_source['epoch'] if latest_source else 0) != source_epoch:
+                    return _OBSERVE_RETRY
+                # An invalidation can race the earlier immutable-snapshot
+                # check. Recheck MarketData's durable ledger inside the same
+                # write transaction as the account transition.
+                if self.snapshot_verifier is None:
+                    host = observation['host']
+                    frozen = db.execute('SELECT kind,value,as_of_ms FROM snapshots WHERE id=?',
+                                        (snapshot_id,)).fetchone()
+                    if (not frozen or frozen['kind'] != 'bybit_market' or
+                            frozen['as_of_ms'] != observation['captured_at_ms'] or
+                            json.loads(frozen['value']) != host):
+                        return None
+                    md = db.execute('SELECT * FROM md_snapshots WHERE id=?', (snapshot_id,)).fetchone()
+                    if (not md or md['invalidated'] or
+                            md['strategy_id'] != f"{host.get('environment')}:{strategy_id}" or
+                            md['captured_at_ms'] != observation['captured_at_ms'] or
+                            md['signal_input_id'] != host.get('signal_input_id')):
+                        return None
+                    if pending_snapshot and pending_verified:
+                        pending_md = db.execute('SELECT invalidated FROM md_snapshots WHERE id=?',
+                                                (pending_snapshot,)).fetchone()
+                        if pending_md and pending_md['invalidated']:
+                            return _OBSERVE_RETRY
                 if capture:
                     capture_count = db.execute('SELECT COUNT(*) FROM live_research_v2_captures WHERE experiment_id=?',
                                                (strategy_id,)).fetchone()[0]
@@ -1074,6 +1132,8 @@ class LiveResearch:
                 JOIN live_research_v2_captures c
                   ON c.experiment_id=d.experiment_id AND c.snapshot_id=d.snapshot_id
                 WHERE d.experiment_id=? ORDER BY d.day''', (strategy_id,)).fetchall()
+        if rows and not self._causal_provenance_valid(strategy_id):
+            return [], len(rows)
         verified, invalid = [], 0
         for row in rows:
             obs, capture = json.loads(row['value']), json.loads(row['capture'])
@@ -1082,7 +1142,13 @@ class LiveResearch:
             if not host_ok or not host:
                 invalid += 1
                 continue
-            if (capture.get('protocol_version') != PROTOCOL_VERSION
+            quote = host.get('quote') if isinstance(host, dict) else None
+            quote_ms = capture.get('quote_timestamp_ms')
+            if (not isinstance(quote, dict) or not _integer(quote_ms, positive=True)
+                    or quote_ms != quote.get('timestamp_ms')
+                    or not _integer(obs.get('session_ms'), positive=True)
+                    or quote_ms > obs['session_ms'] or quote_ms // _DAY_MS != obs.get('day')
+                    or capture.get('protocol_version') != PROTOCOL_VERSION
                     or capture.get('experiment_id') != strategy_id
                     or capture.get('snapshot_id') != row['snapshot_id']
                     or capture.get('policy_hash') != identity(policy)
@@ -1100,7 +1166,32 @@ class LiveResearch:
                 invalid += 1
                 continue
             verified.append(obs)
+        # A correction may have landed while individual daily snapshots were
+        # being checked. Never return a mixed pre/post-correction proof set.
+        if rows and not self._causal_provenance_valid(strategy_id):
+            return [], len(rows)
         return verified, invalid
+
+    def _causal_provenance_valid(self, strategy_id):
+        """Conservatively reject a book after any recorded source correction."""
+        if self.snapshot_verifier is not None:
+            # An external verifier can change without a durable SQLite epoch.
+            return False
+        with self.store.connection() as db:
+            row = db.execute('SELECT value FROM live_research_v2_accounts WHERE experiment_id=?',
+                             (strategy_id,)).fetchone()
+            if not row:
+                return False
+            book = json.loads(row['value'])
+            scope = book.get('source_scope')
+            epoch = book.get('source_epoch')
+            if (book.get('causal_provenance_version') != 1
+                    or scope not in {f'mainnet:{strategy_id}', f'testnet:{strategy_id}'}
+                    or type(epoch) is not int or epoch < 0):
+                return False
+            current = db.execute('SELECT epoch FROM live_research_source_epochs WHERE strategy_id=?',
+                                 (scope,)).fetchone()
+            return epoch == (current['epoch'] if current else 0)
 
     def observations(self, strategy_id):
         """Verified daily evidence for memory; never raw legacy-account rows."""
@@ -1121,23 +1212,107 @@ class LiveResearch:
         report = forward_report(verified, {'research': settings}, performance_basis=performance_basis)
         development = [row for row in experiment.get('evaluations', []) if row.get('phase') == 'development']
         reasons = list(report['reasons'])
+        dependence_screen = None
+        if (experiment['policy'].get('execution_identity') or {}).get('mode') == 'sol_perpetual':
+            from .sol_dependence import assess_sol_dependence
+            if performance_basis == 'trading':
+                dependence_screen = assess_sol_dependence(verified, block_sessions=settings['forward_block_sessions'])
+            else:
+                dependence_screen = {'status': 'insufficient', 'independence_verified': False,
+                    'reason': 'The SOL dependence screen does not yet assess operating-basis returns'}
+            if dependence_screen['status'] != 'passed_screen':
+                reasons.append(dependence_screen['reason'])
+            # A lag-one diagnostic cannot validate the sign test's independence
+            # assumption. A passed screen does not authorize promotion until a
+            # dependence-aware protocol has been independently validated.
+            reasons.append('SOL forward dependence is not validated for qualification')
+            if report['status'] == 'promoted':
+                report['status'] = 'inconclusive'
         if not development or not development[-1].get('supported'):
             reasons.append('Separate cost-adjusted development evaluation is insufficient')
         if invalid:
             reasons.append('One or more host snapshots were corrected, expired, or failed immutable verification')
+        causal_valid = self._causal_provenance_valid(strategy_id)
+        if invalid and not causal_valid:
+            reasons.append('A source correction or incomplete causal provenance invalidates downstream research evidence')
         if experiment['status'] in {'retired', 'rejected'}:
             reasons.append('Experiment is retired or rejected')
+        missing_days = sum(max(0, later['day'] - earlier['day'] - 1)
+                           for earlier, later in zip(verified, verified[1:]))
+        if missing_days:
+            reasons.append('Missing UTC daily observations prevent a complete prospective record')
         if verified and verified[-1]['session_ms'] - verified[0]['session_ms'] < 59 * _DAY_MS:
             reasons.append('Sixty distinct future calendar days have not elapsed')
+        # A trading-basis report deliberately permits missing source costs.
+        # Never present its partial operating tally as a complete economic result.
+        cost_status = self.store.research_cost_state(strategy_id)
+        operating_complete = bool(verified) and not invalid and not cost_status['reserved_calls'] and not cost_status['unknown_outcome_calls'] and all(
+            row.get('source_cost_complete') is True for row in verified)
+        if operating_complete:
+            recorded = sum(row.get('research_cost_usd', 0.) for row in verified)
+            recorded -= experiment['policy']['operating_costs']['source_cost_usd']
+            current_research_cost = cost_status['estimated_cost_usd']
+            operating_complete = (_finite(recorded) and recorded >= -1e-9
+                and _finite(current_research_cost, nonnegative=True)
+                and math.isclose(recorded, current_research_cost, rel_tol=1e-9, abs_tol=1e-9))
+        operating_pnl = report.get('operating_pnl_usd') if operating_complete else None
+        operating_cost = report.get('operating_cost_usd') if operating_complete else None
+        if not operating_complete:
+            report = {**report, 'operating_pnl_usd': None, 'operating_cost_usd': None}
+            if performance_basis == 'operating' and cost_status['unknown_outcome_calls']:
+                reasons.append('Unknown model call costs prevent operating-basis qualification')
+                if report['status'] == 'promoted':
+                    report['status'] = 'inconclusive'
         return {
             **report, 'eligible': report['status'] == 'promoted' and not reasons,
+            'sol_dependence_screen': dependence_screen,
             'reasons': list(dict.fromkeys(reasons)), 'policy_version': PROTOCOL_VERSION,
             'observation_unit': 'UTC_calendar_day',
             'accounting_semantics': experiment['policy']['accounting_semantics'],
             'performance_basis': performance_basis,
+            'qualification_evidence_scope': {
+                'signal_source': 'deterministic_signal_target_from_frozen_rule_and_verified_market_snapshot',
+                'allocation': 'fixed_simulated_allocation_fraction',
+                'discretionary_trader_decisions': False,
+                'support_or_reviewer_evidence': False,
+                'leverage_evidence': False,
+                'block_independence_verified': False,
+                'stationarity_verified': False,
+            },
             'benchmarks': ['same_instrument_buy_hold', 'same_instrument_market', 'cash'],
+            'benchmark_labels': {
+                'same_instrument_buy_hold': 'same_instrument_buy_and_hold_proxy',
+                'same_instrument_market': 'same_instrument_market_return_proxy',
+                'cash': 'cash_return_proxy',
+                'broad_market_index_included': False,
+                'sp500_included': False,
+            },
+            'operating_economics': {
+                'trading_pnl_usd': report.get('trading_pnl_usd'),
+                'operating_pnl_usd': operating_pnl,
+                'operating_cost_usd': operating_cost,
+                'recorded_cost_inputs_complete': operating_complete,
+                'operating_costs_complete': False,
+                'model_cost_basis': 'local_rate_estimates_not_invoices',
+                'acquisition_scope': 'referenced_evidence_only',
+                'reserved_model_calls': cost_status['reserved_calls'],
+                'unknown_model_calls': cost_status['unknown_outcome_calls'],
+                'recorded_through_ms': verified[-1]['session_ms'] if verified else None,
+                'trading_return_on_initial_equity': report.get('trading_pnl_usd') / experiment['policy']['initial_equity'] if report.get('trading_pnl_usd') is not None else None,
+                'operating_return_on_initial_equity': operating_pnl / experiment['policy']['initial_equity'] if operating_pnl is not None else None,
+                'qualification_basis_excludes_operating_costs': performance_basis == 'trading',
+            },
+            'limitations': ['qualification_is_rule_driven_simulated_evidence',
+                'fixed_allocation_does_not_establish_discretionary_trader_skill',
+                'no_support_or_reviewer_or_leverage_evidence',
+                'no_sp500_or_broad_market_index_benchmark',
+                'block_sign_independence_and_stationarity_are_not_established',
+                'operating_costs_are_separate_from_trading_basis'],
             'funding_basis': 'frozen_elapsed_millisecond_mark_reserve',
             'verified_observations': len(verified), 'invalid_observations': invalid,
+            'causal_provenance_verified': causal_valid,
+            'missing_utc_days': missing_days,
+            'latest_verified_utc_day': verified[-1]['day'] if verified else None,
             'history_omissions': self.store.get_document('live_research_retention_' + strategy_id, {}),
         }
 
@@ -1160,6 +1335,39 @@ class LiveResearch:
                 or strategy.get('market_policy') != experiment.get('policy', {}).get('market_policy')
                 or strategy.get('policy_version') != experiment.get('policy', {}).get('version')):
             reasons.append('Selected strategy version does not match its frozen qualification policy')
+        # A historical promotion is not ongoing evidence. This stricter SOL
+        # host gate leaves the frozen research result intact and holds new
+        # discretionary exposure until today's verified mark is available.
+        if strategy and strategy.get('trading_mode') == 'sol_perpetual':
+            today = self._now_ms() // _DAY_MS
+            if report.get('latest_verified_utc_day') != today:
+                reasons.append('A verified SOL forward observation for the current UTC day is required')
+            frozen_identity = (experiment or {}).get('policy', {}).get('execution_identity') or {}
+            try:
+                from .trading_modes import sol_behavior_digest, mode_settings
+                current_digest = sol_behavior_digest()
+                settings = mode_settings(config)
+            except (OSError, ValueError):
+                current_digest = None
+                settings = None
+            if not current_digest or frozen_identity.get('behavior_digest') != current_digest:
+                reasons.append('SOL behavior changed or its frozen identity is unavailable; a new qualification is required')
+            required_identity = {'mode': 'sol_perpetual', 'trader_model': 'gpt-6.1-sol',
+                'trader_reasoning_effort': 'xhigh', 'support_profile': 'gpt-6-luna:max',
+                'leverage_policy': 'agent_with_venue_ceiling', 'review_protocol_version': 2,
+                'reviewer_model': 'gpt-6-luna', 'reviewer_reasoning_effort': 'max',
+                'trade_review_required': True}
+            if (any(type(frozen_identity.get(key)) is not type(value) or frozen_identity.get(key) != value
+                    for key, value in required_identity.items())
+                    or not settings or settings['selected'] != 'sol_perpetual'
+                    or frozen_identity.get('swarm_size') != settings['swarm_size']
+                    or frozen_identity.get('support_timing_seconds') != str(settings['support_timeout_seconds']) + ':' + str(settings['support_max_age_seconds'])
+                    or frozen_identity.get('max_position_risk_fraction') != settings['max_position_risk_fraction']
+                    or type(frozen_identity.get('lifetime_model_budget_usd')) is not type(settings['lifetime_model_budget_usd'])
+                    or frozen_identity.get('lifetime_model_budget_usd') != settings['lifetime_model_budget_usd']):
+                reasons.append('Selected SOL behavior settings do not match frozen qualification')
+            if config['bybit']['mode'] != 'paper':
+                reasons.append('Discretionary SOL decisions have not been prospectively qualified for exchange execution')
         if strategy_id not in allowed or not allocation:
             reasons.append('Operator must allow this exact version and allocate capital')
         return {**report, 'eligible': report['eligible'] and not reasons,

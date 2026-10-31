@@ -118,6 +118,7 @@ class SystemEndToEndTests(unittest.TestCase):
             "id": "synthetic-system-source",
             "source_url": "https://example.invalid/synthetic-system-fixture",
             "content": "Synthetic offline test fixture; no performance claim.",
+            "acquisition_cost_usd": 0., "acquisition_cost_complete": True,
             "observed_at": timestamp(self.clock()),
             "symbols": [SYMBOL],
         }])

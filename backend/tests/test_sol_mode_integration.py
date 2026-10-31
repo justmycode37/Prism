@@ -1,5 +1,6 @@
 """Offline contracts for the opt-in Sol perpetual mode."""
 import copy
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -93,6 +94,26 @@ class SolModeIntegrationTests(unittest.TestCase):
         self.runtime.continuous = ExposureFixture(exposed=True)
         with self.assertRaises(ValueError):
             self.select_sol()
+
+    def test_owner_and_configuration_roll_back_together_on_write_failure(self):
+        self.select_sol()
+        old_owner = self.store.get_document('sol_mode_strategy_id')
+        old_config = self.store.config()
+        with self.store.connection() as db:
+            db.execute("""CREATE TRIGGER fail_sol_owner BEFORE UPDATE ON cascade_meta
+                       WHEN NEW.key='sol_mode_strategy_id'
+                       BEGIN SELECT RAISE(ABORT, 'injected owner write failure'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.runtime.update_configuration({'trading_mode': {'swarm_size': 5}})
+        self.assertEqual(self.store.get_document('sol_mode_strategy_id'), old_owner)
+        self.assertEqual(self.store.config(), old_config)
+        with self.store.connection() as db:
+            db.execute('DROP TRIGGER fail_sol_owner')
+        self.runtime.update_configuration({'trading_mode': {'swarm_size': 5}})
+        owner = self.store.get_document('sol_mode_strategy_id')
+        self.assertNotEqual(owner, old_owner)
+        self.assertEqual(self.store.experiment(owner)['policy']['execution_identity']['swarm_size'], 5)
+        self.assertEqual(self.store.config()['trading_mode']['swarm_size'], 5)
 
     def test_start_all_allows_pending_sol_execution_without_granting_exchange_permissions(self):
         self.select_sol()

@@ -1,0 +1,7 @@
+{
+  "close_prices": [100, 101, 103, 102, 105, 104],
+  "horizons": [1, 2],
+  "momentum_thresholds_bps": [0, 5],
+  "fee_bps": 1,
+  "slippage_bps": 2
+}

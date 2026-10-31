@@ -23,7 +23,7 @@ from . import temporal, simulation, experiments
 from .search import expand_hypothesis
 from .agent_runtime import ComponentBudget
 from .research_memory import ResearchMemory
-from .trading_modes import describe as describe_mode, is_sol_mode, mode_settings, sol_market_policy, sol_mode_strategy_spec
+from .trading_modes import describe as describe_mode, is_sol_mode, mode_settings, sol_market_policy, sol_mode_strategy_spec, sol_behavior_digest
 from .market_data import sol_chart_projection
 
 
@@ -49,7 +49,6 @@ class Runtime:
         self._cycle_lock = threading.Lock()
         self._execution_lock = threading.RLock()
         self._state_lock = threading.RLock()
-        self._trial_lock = threading.Lock()
         self._generation = 0
         self._market_thread = None
         self._key_configured = False
@@ -78,16 +77,26 @@ class Runtime:
         if is_sol_mode(self.store.config()):
             self.ensure_sol_strategy()
 
-    def ensure_sol_strategy(self, config=None):
+    def ensure_sol_strategy(self, config=None, *, select=True):
         """Register the selected mandate locally; never grant order authority."""
         from .live_research import LiveResearch
+        # Startup and worker refresh must not silently replace the owner of an
+        # existing position/order after a code or prompt change. Explicit mode
+        # configuration passes a config only after paused/flat checks.
+        if config is None:
+            selected = self.store.get_document('sol_mode_strategy_id')
+            if isinstance(selected, str) and selected:
+                return selected
         config = config or self.store.config()
         settings = mode_settings(config)
-        eid = 'operator-sol-perpetual-mandate-v1'
+        # Evidence is immutable; use a new ID for the explicitly costed mandate
+        # so an older uncosted record cannot be silently reinterpreted as free.
+        eid = 'operator-sol-perpetual-mandate-v2-zero-acquisition'
         self.store.save_evidence([{'id': eid, 'source_url': 'operator://prism/sol-perpetual',
             'title': 'Operator-selected SOLUSDT one-minute agent mandate',
             'content': 'Observe SOLUSDT linear perpetual closed one-minute candles with Sol xhigh and Luna max support. '
                        'This operator mandate is not market evidence or prospective qualification.',
+            'acquisition_cost_usd': 0., 'acquisition_cost_complete': True,
             'observed_at': timestamp(self.store._clock()), 'symbols': ['SOLUSDT']}])
         experiment = LiveResearch(self.store, clock=self.store._clock).register(
             sol_mode_strategy_spec(), sol_market_policy(), hypothesis='SOLUSDT one-minute Sol trader with bounded Luna support',
@@ -97,12 +106,14 @@ class Runtime:
                 'swarm_size': settings['swarm_size'],
                 'support_timing_seconds': str(settings['support_timeout_seconds']) + ':' + str(settings['support_max_age_seconds']),
                 'max_position_risk_fraction': settings['max_position_risk_fraction'],
+                'lifetime_model_budget_usd': settings['lifetime_model_budget_usd'],
                 'leverage_policy': 'agent_with_venue_ceiling', 'review_protocol_version': 2,
                 'reviewer_model': 'gpt-6-luna', 'reviewer_reasoning_effort': 'max',
-                'trade_review_required': True})
+                'trade_review_required': True, 'behavior_digest': sol_behavior_digest()})
         strategy = next(x for x in self.store.strategies() if x['id'] == experiment['id'])
         self.store.save_strategy({**strategy, 'trading_mode': 'sol_perpetual'})
-        self.store.set_document('sol_mode_strategy_id', experiment['id'])
+        if select:
+            self.store.set_document('sol_mode_strategy_id', experiment['id'])
         return experiment['id']
 
     def trading_mode_state(self):
@@ -434,8 +445,10 @@ class Runtime:
             # Prepare it before committing the selected mode; failure must leave
             # the previously selected workflow intact.
             if mode_changed and is_sol_mode(updated):
-                self.ensure_sol_strategy(updated)
-            result = self.store.update_config(validated)
+                candidate = self.ensure_sol_strategy(updated, select=False)
+                result = self.store.update_config(validated, _sol_owner=candidate, _expected_config=old)
+            else:
+                result = self.store.update_config(validated, _expected_config=old)
             if mode_changed:
                 self._generation += 1
             if self.continuous:
@@ -506,6 +519,78 @@ class Runtime:
         scheduler = Scheduler(self.store, clock=clock)
         scheduler.upsert_events(result['events'])
         scheduler.upsert_coverage(result['coverage'])
+        return result
+
+    def sol_paper_run_control(self, body):
+        """Explicit local control for a future audit on the existing paper book."""
+        from contextlib import nullcontext
+        from .bybit import BybitAdapter
+        from .paper_exchange import PaperExchange
+        from .sol_paper_audit import SolPaperAudit, _name
+        from .sol_paper_benchmark import (paper_benchmark_report, record_benchmark_mark,
+                                          record_benchmark_correction)
+        if not isinstance(body, dict) or not isinstance(body.get('action'), str) or body['action'] not in {
+                'inspect', 'register', 'activate', 'deactivate', 'report', 'record_mark', 'correct_mark'}:
+            raise ValueError('A paper-run action is required')
+        action = body['action']
+        required = ({'action'} if action == 'inspect' else {'action', 'declaration'} if action == 'register'
+                    else {'action', 'run_id', 'scheduled_ms', 'index', 'fx'} if action == 'record_mark'
+                    else {'action', 'run_id', 'scheduled_ms', 'correction_id', 'reason'} if action == 'correct_mark'
+                    else {'action', 'run_id'})
+        optional = {'event_limit', 'after_seq'} if action == 'report' else set()
+        if not required <= set(body) or set(body) - required - optional:
+            raise ValueError('Paper-run action has invalid fields')
+        if action not in {'inspect', 'register'}:
+            _name(body['run_id'], 'Run ID')
+        if action == 'report' and type(body.get('event_limit', 100)) is not int:
+            raise ValueError('A bounded integer event limit is required')
+        # Read-only reporting must not hold the execution/protection lock for
+        # the duration of a potentially long history replay.
+        lock = nullcontext() if action in {'inspect', 'report'} else self._execution_lock
+        with lock:
+            service = self.continuous
+            paper = getattr(service, 'paper', None) if service is not None else None
+            adapter = getattr(service, 'adapter', None) if service is not None else None
+            config = self.store.config()
+            if (type(paper) is not PaperExchange or type(adapter) is not BybitAdapter
+                    or paper.store.path != self.store.path
+                    or getattr(adapter, 'transport', None) is not paper
+                    or getattr(getattr(adapter, 'store', None), 'path', None) != self.store.path
+                    or getattr(adapter, 'mode', None) != 'paper' or config['bybit']['mode'] != 'paper'
+                    or adapter.config.get('mode') != 'paper'
+                    or adapter.config.get('account_id') != config['bybit'].get('account_id')):
+                raise ValueError('The initialized local paper service is required')
+            audit = SolPaperAudit(self.store, paper=paper)
+            if action == 'inspect':
+                result = {'strategy_id': self.store.get_document('sol_mode_strategy_id'),
+                          'simulator_assumptions': paper.simulator_metadata(),
+                          'initial_capital_usdt': paper._load().get('initial_equity'),
+                          'active_run_id': self.store.get_document('sol_paper_audit_active')}
+            elif action == 'register':
+                result = {'run_id': audit.register_run(body['declaration'])}
+            elif action == 'activate':
+                audit.activate(body['run_id'])
+                result = {'run_id': body['run_id'], 'active': True}
+            elif action == 'deactivate':
+                audit.deactivate(body['run_id'])
+                result = {'run_id': body['run_id'], 'active': False}
+            elif action == 'record_mark':
+                result = record_benchmark_mark(audit, body['run_id'], body['scheduled_ms'],
+                                               index=body['index'], fx=body['fx'])
+            elif action == 'correct_mark':
+                record_benchmark_correction(audit, body['run_id'], body['scheduled_ms'],
+                                            correction_id=body['correction_id'], reason=body['reason'])
+                result = {'run_id': body['run_id'], 'scheduled_ms': body['scheduled_ms'], 'corrected': True}
+            else:
+                result = audit.report(body['run_id'], event_limit=body.get('event_limit', 100),
+                                      after_seq=body.get('after_seq', 0))
+                comparison = paper_benchmark_report(audit, body['run_id'])
+                result['checkpoint_report'] = comparison.pop('checkpoint_report')
+                result['benchmark_report'] = comparison
+                result['report_consistency'] = ('Audit and benchmark sections are separate read snapshots; '
+                                                'benchmark and checkpoints share a snapshot')
+        if action in {'activate', 'deactivate'}:
+            service.wake()
         return result
 
     def operations_state(self):
@@ -1025,13 +1110,12 @@ class Runtime:
                     expanded.append(handoff(cycle['id'], 'analyst_proposal', source['producer'], variant,
                                             source['evidence_ids'], source['input_ids']))
             proposed += expanded
-            with self._trial_lock:
-                trials = self.store.get_document('statistical_trial_count', 0) + len(proposed) + len(deferred)
-                checkpoint = {'trial_count': max(1, trials), 'proposals': proposed,
-                              'generated_variants': len(expanded), 'deferred_proposal_ids': [row['id'] for row in deferred],
-                              'market_snapshot': self.store.freeze_markets(self._research_markets(cycle), cycle['information_cutoff_ms']),
-                              'validated_at': timestamp()}
-                self.store.commit_validation(cycle['id'], trials, checkpoint)
+            attempts = len(proposed) + len(deferred)
+            checkpoint = {'proposals': proposed, 'generated_variants': len(expanded),
+                          'deferred_proposal_ids': [row['id'] for row in deferred],
+                          'market_snapshot': self.store.freeze_markets(self._research_markets(cycle), cycle['information_cutoff_ms']),
+                          'validated_at': timestamp()}
+            checkpoint = self.store.commit_validation(cycle['id'], attempts, checkpoint)
         if 'markets' not in checkpoint:
             checkpoint['markets'] = self.store.market_snapshot(checkpoint['market_snapshot'])
         policy = simulation.execution_policy(config)

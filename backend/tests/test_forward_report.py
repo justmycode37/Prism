@@ -11,7 +11,7 @@ def observations(count=60):
     for i in range(count):
         equity*=1+.004+rng.uniform(-.001,.001)
         rows.append({'session_ms':1700000000000+i*86400000,'equity':equity,'initial_equity':100000.,
-            'valuation_complete':True,'completed_trades':(i+1)//5,'benchmark_return':.0001,
+            'valuation_complete':True,'source_cost_complete':True,'completed_trades':(i+1)//5,'benchmark_return':.0001,
             'market_return':.0002,'sector_return':.0003})
     return rows
 
@@ -30,6 +30,18 @@ class ForwardReportTests(unittest.TestCase):
         rows=observations()
         rows[0]['phase']='development'
         self.assertEqual(forward_report(rows)['status'],'inconclusive')
+
+    def test_operating_requires_explicit_cost_completeness_on_every_session(self):
+        for value in (None, False, 1, 'true'):
+            with self.subTest(value=value):
+                rows = observations()
+                rows[20]['source_cost_complete'] = value
+                self.assertEqual(forward_report(rows)['status'], 'inconclusive')
+                self.assertIn('Imported source costs are incomplete', forward_report(rows)['reasons'][0])
+        rows = observations()
+        del rows[20]['source_cost_complete']
+        self.assertEqual(forward_report(rows)['status'], 'inconclusive')
+        self.assertEqual(forward_report(rows, performance_basis='trading')['status'], 'promoted')
 
     def test_positive_trading_return_can_fail_operating_economics(self):
         rows=observations()
@@ -73,3 +85,15 @@ class ForwardReportTests(unittest.TestCase):
         self.assertEqual(result['status'], 'inconclusive')
         self.assertIsNone(result['baseline_returns']['benchmark_return'])
         self.assertIsNone(result['excess_return'])
+        self.assertIsNone(result['statistics']['benchmark_return'])
+        self.assertTrue(any('Missing prospective' in reason for reason in result['reasons']))
+
+    def test_missing_baseline_at_end_does_not_shrink_paired_sample_or_report_significance(self):
+        rows = observations()
+        rows[-1]['market_return'] = float('nan')
+        result = forward_report(rows)
+        self.assertEqual(result['status'], 'inconclusive')
+        self.assertIsNone(result['statistics']['market_return'])
+        self.assertIsNone(result['baseline_returns']['market_return'])
+        # Complete benchmark comparisons retain their existing qualification.
+        self.assertIsNotNone(result['statistics']['benchmark_return'])

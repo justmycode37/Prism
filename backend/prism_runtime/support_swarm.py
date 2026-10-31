@@ -225,6 +225,18 @@ class SupportSwarm:
             raise ValueError('Snapshot support payload exceeds the 64 KiB limit')
         return compact, int(candle_end)
 
+    @staticmethod
+    def _context_fingerprint(compact):
+        # Snapshot identity and age are checked separately; all measured input
+        # values used by specialists must still match the current context.
+        value = copy.deepcopy(compact)
+        value.pop('snapshot_id', None)
+        value.pop('captured_at_ms', None)
+        value.get('quote', {}).pop('timestamp_ms', None)
+        value.get('quote', {}).pop('quote_timestamp_ms', None)
+        value.get('data_quality', {}).pop('quote_age_ms', None)
+        return identity(value)
+
     def _invoke(self, role, payload, task_id, deadline_ms=None):
         if self.permission_check is not None and not self.permission_check():
             raise PermissionError('Support refresh is paused by host policy')
@@ -233,7 +245,8 @@ class SupportSwarm:
         return self.agents.structured('support', payload, REPORT_SCHEMA, task_id=task_id, role='support',
                                       deadline_ms=deadline_ms)
 
-    def refresh(self, strategy_id, snapshot, *, settings=None, max_age_seconds=45, deadline_ms=None):
+    def refresh(self, strategy_id, snapshot, *, settings=None, max_age_seconds=45, deadline_ms=None,
+                audit_run_id=None):
         if not isinstance(strategy_id, str) or not strategy_id or len(strategy_id) > 160:
             raise ValueError('strategy_id is required')
         if not isinstance(snapshot, dict):
@@ -246,6 +259,7 @@ class SupportSwarm:
         policy = self._policy(snapshot, settings)
         payload_base, candle_end = self._compact(snapshot, policy)
         snap_id, captured = payload_base['snapshot_id'], payload_base['captured_at_ms']
+        context_fingerprint = self._context_fingerprint(payload_base)
         capture_age = self.clock() - captured / 1000
         if capture_age < 0 or capture_age > max_age_seconds:
             raise ValueError('Support snapshot is outside the permitted freshness window')
@@ -277,11 +291,17 @@ class SupportSwarm:
                 with self.store.connection() as db:
                     db.execute('BEGIN IMMEDIATE')
                     for role in ROLES[:self.swarm_size]:
-                        task_id = identity(['support', strategy_id, snap_id, role])
+                        task_id = identity(['support', strategy_id, snap_id, role, 'paper-run', audit_run_id]
+                                           if audit_run_id is not None else ['support', strategy_id, snap_id, role])
                         row = db.execute('SELECT status,value FROM support_reports WHERE task_id=?', (task_id,)).fetchone()
                         retryable = row and row['status'] in {'busy', 'cancelled'}
                         if row and not retryable:
                             continue
+                        if audit_run_id is not None and (not row or retryable):
+                            for table, column in (('agent_completions', 'id'), ('agent_responses', 'task_id')):
+                                exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                                if exists and db.execute(f'SELECT 1 FROM {table} WHERE {column}=? LIMIT 1', (task_id,)).fetchone():
+                                    raise ValueError('An existing support task cannot be used as prospective work')
                         payload = {**payload_base, 'strategy_id': strategy_id, 'experiment_id': strategy_id, 'specialist': role,
                                    'instruction': 'Return a bounded market opinion from measured inputs. State uncertainty; do not claim authority.'}
                         if _json_bytes(payload) > MAX_INPUT_BYTES:
@@ -304,10 +324,10 @@ class SupportSwarm:
                         calls.append((role, task_id, payload))
                         if row:
                             db.execute("UPDATE support_reports SET status='working',value=?,completed_at=? WHERE task_id=?",
-                                       (encoded({}), self.clock(), task_id))
+                                       (encoded({'context_fingerprint': context_fingerprint}), self.clock(), task_id))
                         else:
                             db.execute('INSERT INTO support_reports VALUES (?,?,?,?,?,?,?,?,?)',
-                                       (task_id, strategy_id, snap_id, captured, candle_end, role, 'working', encoded({}), self.clock()))
+                                       (task_id, strategy_id, snap_id, captured, candle_end, role, 'working', encoded({'context_fingerprint': context_fingerprint}), self.clock()))
             except Exception:
                 for _ in calls:
                     self._slots.release()
@@ -362,8 +382,14 @@ class SupportSwarm:
 
     def _save_result(self, task_id, strategy_id, snapshot_id, captured, candle_end, role, status, value, quote_timestamp_ms=None):
         with self.store.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            prior = db.execute('SELECT value FROM support_reports WHERE task_id=? AND status=?', (task_id, 'working')).fetchone()
+            if not prior:
+                return
+            fingerprint = json.loads(prior['value']).get('context_fingerprint')
             db.execute('UPDATE support_reports SET status=?,value=?,completed_at=? WHERE task_id=? AND status=?',
-                       (status, encoded({'report': value, 'quote_timestamp_ms': quote_timestamp_ms}), self.clock(), task_id, 'working'))
+                       (status, encoded({'report': value, 'quote_timestamp_ms': quote_timestamp_ms,
+                                         'context_fingerprint': fingerprint}), self.clock(), task_id, 'working'))
 
     def _task_done(self, future):
         self._slots.release()
@@ -376,6 +402,7 @@ class SupportSwarm:
             raise ValueError('max_age_seconds must be between zero and 120')
         policy = self._policy(snapshot, None)
         compact, candle_end = self._compact(snapshot, policy)
+        fingerprint = self._context_fingerprint(compact)
         now_ms = int(self.clock() * 1000)
         age_ms = now_ms - compact['captured_at_ms']
         if age_ms < 0 or age_ms > max_age_seconds * 1000:
@@ -402,6 +429,9 @@ class SupportSwarm:
                 mismatch = True
                 continue
             saved = json.loads(row['value'])
+            if saved.get('context_fingerprint') != fingerprint:
+                mismatch = True
+                continue
             source_quote_ms = saved.get('quote_timestamp_ms')
             quote_age = None
             if type(source_quote_ms) is int:
@@ -413,9 +443,11 @@ class SupportSwarm:
                     stale_quote = True
                     continue
             seen.add(row['role'])
-            selected.append({'role': row['role'], 'report': saved.get('report', saved),
+            selected.append({'role': row['role'], 'report': saved.get('report', saved), 'task_id': row['task_id'],
                               'source_snapshot_id': row['snapshot_id'],
                               'source_captured_at_ms': row['captured_at_ms'],
+                              'completed_at_ms': round(row['completed_at'] * 1000)
+                                  if type(row['completed_at']) in (int, float) and math.isfinite(row['completed_at']) else None,
                               'report_age_seconds': report_age_ms / 1000,
                               'source_quote_timestamp_ms': source_quote_ms,
                               'source_quote_age_seconds': quote_age})

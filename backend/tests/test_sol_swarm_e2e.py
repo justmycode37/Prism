@@ -126,7 +126,7 @@ class SolMarketFixture:
                          'closed': True, 'source': 'websocket', 'revision': 0,
                          'contiguous_on_arrival': True, 'observed_at_ms': captured_at_ms}],
             'quote': {'bid': bid, 'ask': ask, 'bid_size': 100., 'ask_size': ask_size,
-                      'turnover_24h': 1_000_000., 'timestamp_ms': captured_at_ms,
+                      'turnover_24h': 1_000_000., 'timestamp_ms': captured_at_ms, 'book_timestamp_ms': captured_at_ms,
                       'source': 'websocket'},
             'indicators': {'sma_20': {'value': 100., 'ready': True}},
             'data_quality': {'warmup_complete': True, 'gap_count': 0, 'stale': False,
@@ -204,6 +204,58 @@ class SolSwarmEndToEndTests(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
+    def test_model_call_cost_status_does_not_invalidate_its_own_authorization(self):
+        cost_complete = [True]
+        self.controller.eligibility = lambda sid: {
+            'eligible': sid == self.strategy_id, 'status': 'fixture-approved', 'reasons': [],
+            'operating_economics': {'recorded_cost_inputs_complete': cost_complete[0],
+                                    'operating_costs_complete': False}}
+        def transport(body, key):
+            if body.get('model') == 'gpt-6.1-sol':
+                cost_complete[0] = False
+            return self.responses(body, key)
+        self.provider.transport = transport
+        result = self.controller.handle_event({'id': 'changing-cost-evidence',
+            'kind': 'candle_closed', 'strategy_id': self.strategy_id,
+            'category': 'linear', 'symbol': 'SOLUSDT'})
+        self.assertEqual(result['status'], 'submitted', result)
+        self.assertTrue(self.responses._execution_payload['operating_cost_evidence']['recorded_cost_inputs_complete'])
+        reviews = [r for r in self.responses.requests
+                   if r.get('text', {}).get('format', {}).get('name') == 'prism_trade_review']
+        review = json.loads(reviews[0]['input'][1]['content'])
+        self.assertFalse(review['operating_cost_evidence']['recorded_cost_inputs_complete'])
+
+    def test_inflight_reviewer_reservation_is_attributed_to_experiment(self):
+        started, release = threading.Event(), threading.Event()
+        def transport(body, key):
+            if body.get('text', {}).get('format', {}).get('name') == 'prism_trade_review':
+                started.set()
+                if not release.wait(5):
+                    raise TimeoutError('Offline test reviewer was not released')
+            return self.responses(body, key)
+        self.provider.transport = transport
+        result, errors = [], []
+        def run():
+            try:
+                result.append(self.controller.handle_event({'id': 'reviewer-cost-fixture',
+                    'kind': 'candle_closed', 'strategy_id': self.strategy_id,
+                    'category': 'linear', 'symbol': 'SOLUSDT'}))
+            except Exception as error:
+                errors.append(error)
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            self.assertTrue(started.wait(5))
+            state = self.store.research_cost_state(self.strategy_id)
+            self.assertEqual(state['reserved_calls'], 1)
+        finally:
+            release.set()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]['status'], 'submitted')
+        self.assertEqual(self.store.research_cost_state(self.strategy_id)['reserved_calls'], 0)
+
     def test_closed_candle_fans_out_to_luna_then_sol_intent_is_revalidated_on_paper(self):
         self.services.on_market({'id': 'sol-candle-event-1', 'kind': 'candle_closed',
             'strategy_id': self.strategy_id, 'category': 'linear', 'symbol': 'SOLUSDT'})
@@ -239,6 +291,10 @@ class SolSwarmEndToEndTests(unittest.TestCase):
             'submit_order_intent', 'amend_order', 'cancel_order', 'reduce_exposure', 'hold', 'set_leverage'])
 
         packet = self.responses._execution_payload
+        spread = packet['observed_execution_costs']
+        self.assertEqual(spread['status'], 'observed')
+        self.assertAlmostEqual(spread['same_quote_long_round_trip_spread_bps'],
+            (1 - self.snapshot['quote']['bid'] / self.snapshot['quote']['ask']) * 10000)
         support_context = packet['support_swarm']
         self.assertEqual(support_context['status'], 'compatible')
         self.assertEqual(len(support_context['reports']), 4)
@@ -250,6 +306,14 @@ class SolSwarmEndToEndTests(unittest.TestCase):
         review_packet = json.loads(review_requests[0]['input'][1]['content'])
         self.assertEqual(review_packet['tool_name'], 'submit_order_intent')
         self.assertEqual(review_packet['mode'], 'sol_perpetual')
+        self.assertEqual(review_packet['experiment_id'], self.strategy_id)
+        with self.store.connection() as db:
+            attributed = db.execute('''SELECT a.experiment_id,c.charged FROM component_calls x
+                JOIN attributed_calls a ON a.call_id=x.call_id JOIN cascade_calls c ON c.id=x.call_id
+                WHERE x.component='trade_review' ''').fetchall()
+        self.assertEqual(len(attributed), 1)
+        self.assertEqual(attributed[0]['experiment_id'], self.strategy_id)
+        self.assertGreater(attributed[0]['charged'], 0.)
         self.assertEqual(review_requests[0]['text']['format']['schema']['required'], ['decision', 'rationale'])
 
         orders = self.adapter.orders(category='linear', symbol='SOLUSDT')
@@ -287,6 +351,7 @@ class SolSwarmEndToEndTests(unittest.TestCase):
         later['captured_at_ms'] = round(self.now[0] * 1000)
         later['attention_deadline_ms'] = later['captured_at_ms'] + 60_000
         later['quote']['timestamp_ms'] = later['captured_at_ms']
+        later['quote']['book_timestamp_ms'] = later['captured_at_ms']
         later['snapshot_id'] = self.store.save_snapshot('bybit_market',
             {key: value for key, value in later.items() if key != 'snapshot_id'}, later['captured_at_ms'])
         self.market.values[self.strategy_id] = later
