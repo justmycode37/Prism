@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from prism_runtime.orchestrator import Runtime
 from prism_runtime.server import create_server
@@ -49,6 +50,23 @@ class ControlAPITests(unittest.TestCase):
         self.assertEqual(self.request('GET', '/health', authorized=False)[0], 401)
         self.assertEqual(self.request('GET', '/v1/state', headers={'Origin': 'https://example.org'})[0], 403)
         self.assertEqual(self.request('GET', '/v1/state', headers={'Host': 'attacker.example'})[0], 403)
+
+    def test_paper_run_control_requires_authentication_and_dispatches(self):
+        body = {'action': 'report', 'run_id': 'fixture-run'}
+        with patch.object(self.runtime, 'sol_paper_run_control', return_value={'eligible': False}) as control:
+            self.assertEqual(self.request('POST', '/v1/sol-paper-run', body, authorized=False)[0], 401)
+            self.assertEqual(self.request('POST', '/v1/sol-paper-run', body,
+                                          headers={'Origin': 'https://example.org'})[0], 403)
+            control.assert_not_called()
+            status, result = self.request('POST', '/v1/sol-paper-run', body)
+            self.assertEqual(status, 200)
+            self.assertEqual(result['paper_run'], {'eligible': False})
+            control.assert_called_once_with(body)
+        # A full declared benchmark schedule can exceed the generic control
+        # payload limit; its endpoint remains explicitly bounded.
+        with patch.object(self.runtime, 'sol_paper_run_control', return_value={'run_id': 'fixture-run'}):
+            self.assertEqual(self.request('POST', '/v1/sol-paper-run',
+                {'action': 'register', 'declaration': {'fixture_schedule': 'x' * 20000}})[0], 200)
 
     def test_native_start_stop_and_new_state(self):
         status, value = self.request('POST', '/v1/control', {'action': 'start_all'})

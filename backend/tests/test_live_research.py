@@ -33,7 +33,8 @@ class LiveResearchTests(unittest.TestCase):
         self.store = Store(Path(self.temp.name) / 'live.sqlite3', clock=lambda: self.now[0])
         self.research = LiveResearch(self.store, clock=lambda: self.now[0])
         self.store.save_evidence([{'id': 'source', 'source_url': 'https://example.org/offline-fixture',
-            'content': 'Synthetic source; no performance claim.', 'observed_at': timestamp(self.now[0]), 'symbols': ['BTCUSDT']}])
+            'content': 'Synthetic source; no performance claim.', 'observed_at': timestamp(self.now[0]), 'symbols': ['BTCUSDT'],
+            'acquisition_cost_usd': 0., 'acquisition_cost_complete': True}])
         self.spec = {'symbol': 'BTCUSDT', 'kind': 'momentum', 'parameters': {'lookback': 3, 'threshold': .001}}
         with self.store.connection() as db:
             db.execute('''CREATE TABLE IF NOT EXISTS md_snapshots (
@@ -230,6 +231,180 @@ class LiveResearchTests(unittest.TestCase):
         self.research.observe(exp['id'], last_snapshot)
         self.assertEqual(self.research.report(exp['id'])['sessions'], 1)
         self.assertEqual(before, self.store.experiment(exp['id']))
+
+    def test_daily_mark_requires_new_quote_from_same_utc_day(self):
+        exp = self.register()
+        day_ms = 86_400_000
+        first_at = (exp['registered_at_ms'] // day_ms + 1) * day_ms - 1000
+        first = self.snapshot(exp['id'], captured_ms=first_at, bar_end_ms=first_at)
+        self.assertIsNotNone(self.research.observe(exp['id'], first))
+        self.assertEqual(len(self.research.observations(exp['id'])), 1)
+
+        # Capturing a new snapshot just after midnight does not make the
+        # previous day's still-fresh quote a new valuation or benchmark mark.
+        second = self.snapshot(exp['id'], captured_ms=first_at + 2000, quote_age_ms=2000)
+        self.research.observe_quote(exp['id'], second)
+        self.assertEqual(len(self.research.observations(exp['id'])), 1)
+
+        # Legacy day rows written with that quote are rejected on read too.
+        with self.store.connection() as db:
+            first_day = json.loads(db.execute('SELECT value FROM live_research_v2_days WHERE experiment_id=?',
+                                              (exp['id'],)).fetchone()[0])
+            first_capture = json.loads(db.execute('SELECT value FROM live_research_v2_captures WHERE experiment_id=?',
+                                                  (exp['id'],)).fetchone()[0])
+            legacy = {**first_day, 'day': second['captured_at_ms'] // day_ms,
+                      'session_ms': second['captured_at_ms'], 'snapshot_id': second['snapshot_id']}
+            capture = {**first_capture, 'snapshot_id': second['snapshot_id'],
+                       'captured_at_ms': second['captured_at_ms'],
+                       'quote_timestamp_ms': second['quote']['timestamp_ms']}
+            db.execute('INSERT INTO live_research_v2_captures VALUES (?,?,?,?)',
+                       (exp['id'], second['snapshot_id'], second['captured_at_ms'], encoded(capture)))
+            db.execute('INSERT INTO live_research_v2_days VALUES (?,?,?,?)',
+                       (exp['id'], legacy['day'], encoded(legacy), second['snapshot_id']))
+        self.assertEqual(self.research.report(exp['id'])['invalid_observations'], 1)
+        with self.store.connection() as db:
+            db.execute('DELETE FROM live_research_v2_days WHERE experiment_id=? AND day=?',
+                       (exp['id'], legacy['day']))
+        third = self.snapshot(exp['id'], captured_ms=first_at + 3000)
+        self.research.observe_quote(exp['id'], third)
+        self.assertEqual(len(self.research.observations(exp['id'])), 2)
+
+    def test_operating_report_rejects_missing_cost_completeness(self):
+        from test_forward_report import observations
+        exp = self.register()
+        rows = observations()
+        for row in rows:
+            row['day'] = row['session_ms'] // 86_400_000
+        del rows[20]['source_cost_complete']
+        with patch.object(self.research, '_verified_observations', return_value=(rows, 0)):
+            report = self.research.report(exp['id'])
+        self.assertFalse(report['eligible'])
+        self.assertEqual(report['status'], 'inconclusive')
+        self.assertTrue(any('source costs are incomplete' in reason for reason in report['reasons']))
+        self.assertIsNone(report['operating_pnl_usd'])
+
+    def test_operating_estimates_hide_pending_and_late_attributed_model_costs(self):
+        exp = self.register()
+        self.now[0] += 60
+        first = self.snapshot(exp['id'])
+        self.assertIsNotNone(self.research.observe(exp['id'], first))
+        self.assertTrue(self.research.report(exp['id'])['operating_economics']['recorded_cost_inputs_complete'])
+        call = self.store.reserve('gpt-6-luna', 100, 100,
+                                  context={'experiment_id': exp['id']})
+        economics = self.research.report(exp['id'])['operating_economics']
+        self.assertEqual(economics['reserved_model_calls'], 1)
+        self.assertFalse(economics['recorded_cost_inputs_complete'])
+        self.assertIsNone(economics['operating_pnl_usd'])
+        self.store.settle(call, {'input_tokens': 100, 'output_tokens': 100})
+        economics = self.research.report(exp['id'])['operating_economics']
+        self.assertEqual(economics['reserved_model_calls'], 0)
+        self.assertFalse(economics['recorded_cost_inputs_complete'])
+        self.assertIsNone(economics['operating_pnl_usd'])
+        next_day = self.snapshot(exp['id'], captured_ms=first['captured_at_ms'] + 86_400_000)
+        self.research.observe_quote(exp['id'], next_day)
+        economics = self.research.report(exp['id'])['operating_economics']
+        self.assertTrue(economics['recorded_cost_inputs_complete'])
+        self.assertFalse(economics['operating_costs_complete'])
+        self.assertEqual(economics['model_cost_basis'], 'local_rate_estimates_not_invoices')
+        self.assertGreater(economics['operating_cost_usd'], 0.)
+
+    def test_unknown_model_outcome_never_becomes_a_complete_operating_cost(self):
+        exp = self.register()
+        self.now[0] += 60
+        first = self.snapshot(exp['id'])
+        self.assertIsNotNone(self.research.observe(exp['id'], first))
+        call = self.store.reserve('gpt-6-luna', 100, 100, context={'experiment_id': exp['id']})
+        self.store.settle(call, None, request_started=True)
+        next_day = self.snapshot(exp['id'], captured_ms=first['captured_at_ms'] + 86_400_000)
+        self.assertIsNotNone(self.research.observe_quote(exp['id'], next_day))
+        report = self.research.report(exp['id'])
+        economics = report['operating_economics']
+        self.assertEqual(economics['unknown_model_calls'], 1)
+        self.assertFalse(economics['recorded_cost_inputs_complete'])
+        self.assertIsNone(economics['operating_pnl_usd'])
+        self.assertFalse(report['eligible'])
+        self.assertIn('Unknown model call costs prevent operating-basis qualification', report['reasons'])
+
+    def test_independent_workers_cannot_apply_same_pending_fill_twice(self):
+        exp = self.register()
+        self.now[0] += 60
+        initial = self.snapshot(exp['id'])
+        self.assertIsNotNone(self.research.observe(exp['id'], initial))
+        base = initial['captured_at_ms']
+        older = self.snapshot(exp['id'], captured_ms=base + 1000, price=105.)
+        newer = self.snapshot(exp['id'], captured_ms=base + 2000, price=106.)
+        other_store = Store(self.store.path, clock=lambda: self.now[0])
+        self.addCleanup(other_store.close)
+        other_research = LiveResearch(other_store, clock=lambda: self.now[0])
+        barrier = threading.Barrier(2)
+        workers = (self.research, other_research)
+        for research in workers:
+            original = research._advance_book
+            waited = [False]
+            def interleave(*args, _original=original, _waited=waited, **kwargs):
+                if not _waited[0]:
+                    _waited[0] = True
+                    barrier.wait(timeout=5)
+                return _original(*args, **kwargs)
+            research._advance_book = interleave
+        results, errors = [], []
+        def run(research, snapshot):
+            try:
+                results.append(research.observe_quote(exp['id'], snapshot))
+            except Exception as error:
+                errors.append(error)
+        threads = [threading.Thread(target=run, args=(workers[0], older)),
+                   threading.Thread(target=run, args=(workers[1], newer))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        with self.store.connection() as db:
+            book = json.loads(db.execute('SELECT value FROM live_research_v2_accounts WHERE experiment_id=?',
+                                         (exp['id'],)).fetchone()[0])
+            captures = [json.loads(row[0]) for row in db.execute(
+                'SELECT value FROM live_research_v2_captures WHERE experiment_id=?', (exp['id'],))]
+        fills = [row for row in captures if 'entry_fill' in row['events']]
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(book['last_capture_ms'], newer['captured_at_ms'])
+        self.assertAlmostEqual(book['quantity'], fills[0]['book']['quantity'])
+        self.assertAlmostEqual(book['entry_price'], fills[0]['book']['entry_price'])
+
+    def test_snapshot_invalidations_are_rechecked_before_committing_a_fill(self):
+        for invalidate_pending in (False, True):
+            with self.subTest(invalidate_pending=invalidate_pending):
+                exp = self.research.register(
+                    {**self.spec, 'parameters': {'lookback': 3 if invalidate_pending else 4, 'threshold': .001}},
+                    policy(), hypothesis='Invalidation interleaving', evidence_ids=['source'])
+                self.now[0] += 120
+                first = self.snapshot(exp['id'])
+                # snapshot() uses self.spec for the signal, and both lookbacks
+                # produce the same positive target on this fixture.
+                self.assertIsNotNone(self.research.observe(exp['id'], first))
+                second = self.snapshot(exp['id'], captured_ms=first['captured_at_ms'] + 1000)
+                other = Store(self.store.path, clock=lambda: self.now[0])
+                self.addCleanup(other.close)
+                original = self.research._advance_book
+                changed = []
+                def invalidate(*args, **kwargs):
+                    result = original(*args, **kwargs)
+                    if not changed:
+                        changed.append(True)
+                        ident = first['snapshot_id'] if invalidate_pending else second['snapshot_id']
+                        with other.connection() as db:
+                            db.execute('UPDATE md_snapshots SET invalidated=1 WHERE id=?', (ident,))
+                    return result
+                with patch.object(self.research, '_advance_book', side_effect=invalidate):
+                    self.research.observe_quote(exp['id'], second)
+                with self.store.connection() as db:
+                    book = json.loads(db.execute('SELECT value FROM live_research_v2_accounts WHERE experiment_id=?',
+                                                 (exp['id'],)).fetchone()[0])
+                    captures = [json.loads(row[0]) for row in db.execute(
+                        'SELECT value FROM live_research_v2_captures WHERE experiment_id=?', (exp['id'],))]
+                self.assertEqual(book['quantity'], 0.)
+                self.assertFalse(any('entry_fill' in row['events'] for row in captures))
 
     def test_real_spot_composite_quotes_support_forward_marks_and_expire(self):
         from prism_runtime.market_data import MarketDataService
@@ -480,6 +655,19 @@ class LiveResearchTests(unittest.TestCase):
         observation = json.loads(row['value'])
         self.assertEqual(observation['research_cost_usd'], 3.25)
         self.assertTrue(observation['source_cost_complete'])
+
+        self.store.save_evidence([{'id': 'missing-source-cost', 'source_url': 'https://example.org/missing',
+            'content': 'Offline fixture without a cost receipt.',
+            'observed_at': timestamp(self.now[0]), 'symbols': ['BTCUSDT']}])
+        missing = self.research.register(self.spec, policy(), hypothesis='Missing cost fixture',
+                                         evidence_ids=['missing-source-cost'])
+        self.assertFalse(missing['policy']['operating_costs']['source_cost_complete'])
+        self.assertEqual(self.store.research_source_cost(missing['id']), (0., False))
+        self.now[0] += 60
+        self.research.observe(missing['id'], self.snapshot(missing['id']))
+        economics = self.research.report(missing['id'])['operating_economics']
+        self.assertFalse(economics['recorded_cost_inputs_complete'])
+        self.assertIsNone(economics['operating_pnl_usd'])
 
         self.store.save_evidence([{'id': 'unknown-source-cost', 'source_url': 'https://example.org/unknown',
             'content': 'Offline fixture with an incomplete acquisition cost.',

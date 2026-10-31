@@ -47,6 +47,13 @@ future reports cannot be presented as current support. Superseded or expired
 minute events are skipped. Model latency can reduce decision opportunities; a
 minute chart is not a promise of one order per minute.
 
+The trader's decision packet includes an indicative same-quote long round-trip
+spread when the snapshot and measured WebSocket quote are fresh and valid. It
+measures buying at the observed ask and selling at that same observed bid,
+relative to the ask. Fees, funding, changing quotes, slippage, impact and model
+costs are additional or unknown; the spread is not a return forecast. Invalid
+or stale quotes produce an unavailable diagnostic.
+
 Before buying support or trader work, the host can record a hold for a
 definitively unqualified or unapproved strategy when reconciliation is clear
 and it has no attributed position or unresolved order. Unknown state and
@@ -151,9 +158,32 @@ from the account's venue-cost P&L.
 The bounded entry rule remains the existing three-bar long/flat momentum guard;
 Luna advice and Sol discretion operate inside that guard. Existing prospective
 qualification and explicit strategy/account/instrument/risk approvals still
-apply. Frozen-rule results alone do not validate every discretionary model
-choice. No installed service or live account was activated while implementing
+apply. A fixed-rule shadow result does not qualify discretionary choices for
+exchange execution: SOL discretionary exposure increases and leverage changes
+are blocked on testnet and mainnet until a separate prospective qualification
+of the actual policy is implemented. The existing paper path remains available
+for research under its usual controls. Protective actions and permitted
+reductions remain available. No installed service or live account was activated while implementing
 this mode.
+
+The SOL host additionally requires a verified forward mark for the current UTC
+day before allowing new exposure. A stale historical pass cannot provide ongoing
+entry eligibility. Missing marks within the prospective record also block it.
+Protective actions continue under their existing independent controls.
+
+New SOL versions freeze a digest of the local decision roles, tool definitions
+and relevant runtime code. If those files change, the old version cannot reuse
+its qualification. A worker refresh or restart preserves the selected version
+and any existing exposure; register a new version through a paused, flat mode
+configuration transition and qualify it separately. This local digest cannot
+verify the provider's model weights or remote behavior.
+
+Operating-cost figures use locally estimated model rates and attributed source
+receipts. They do not establish reconciled invoices or account for every
+uncited acquisition. A pending model call or a charge newer than the last
+daily mark makes the current recorded operating estimate unavailable until the
+ledger catches up. The research result remains a rule-driven shadow evaluation,
+not proof of discretionary trader performance or S&P 500 outperformance.
 
 Use [the mode-only configuration example](../examples/sol-perpetual-mode.json)
 to inspect the schema. The native selector sends only the selected mode, so

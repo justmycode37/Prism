@@ -1,0 +1,52 @@
+{
+  "purpose": "Synthetic null calibration of the forward report, not market performance",
+  "seed": 20261030,
+  "alpha_budget": 0.05,
+  "sessions": 60,
+  "initial_equity": 100.0,
+  "daily_marginal_volatility": 0.0005,
+  "completed_trades": 12,
+  "benchmarks": "Three identical zero-return series; each scenario is tested once",
+  "assumptions": [
+    "Zero-mean arithmetic returns; correlated compounding may change expected wealth",
+    "Synthetic trade counts and costs are not a model of execution",
+    "IID and AR(1) processes do not establish the distribution of actual SOL returns",
+    "Intervals quantify Monte Carlo sampling uncertainty, not trading profitability",
+    "Calls forward_report alone, without full live-research eligibility gates"
+  ],
+  "scenarios": [
+    {
+      "rho": 0.0,
+      "paths": 5000,
+      "promoted": 0,
+      "retired": 0,
+      "promotion_fraction": 0.0,
+      "promotion_fraction_wilson_95": [
+        0.0,
+        0.0007677019450571244
+      ]
+    },
+    {
+      "rho": 0.8,
+      "paths": 5000,
+      "promoted": 19,
+      "retired": 0,
+      "promotion_fraction": 0.0038,
+      "promotion_fraction_wilson_95": [
+        0.002434138850885676,
+        0.005927728559389015
+      ]
+    },
+    {
+      "rho": 0.95,
+      "paths": 5000,
+      "promoted": 185,
+      "retired": 0,
+      "promotion_fraction": 0.037,
+      "promotion_fraction_wilson_95": [
+        0.032113277569115785,
+        0.04259761443200712
+      ]
+    }
+  ]
+}

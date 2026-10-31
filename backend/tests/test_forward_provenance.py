@@ -181,7 +181,8 @@ class ForwardProvenanceTests(unittest.TestCase):
                            'net_return': next_equity / equity - 1,
                            'baseline_equities': dict(baseline_equities),
                            **baseline_returns, 'completed_trades': index + 1,
-                           'valuation_complete': True, 'fees_paid': 0., 'risk_halted': False}
+                           'valuation_complete': True, 'source_cost_complete': True,
+                           'fees_paid': 0., 'risk_halted': False}
             captured_rows.append(self.store.record_captured_forward(
                 self.experiment['id'], observation, portfolio, baselines, markets))
             equity = next_equity

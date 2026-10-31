@@ -89,7 +89,7 @@ class PaperExchangeLongRunTests(unittest.TestCase):
         timestamp = round(self.now[0] * 1000)
         return {'category': self.category, 'symbol': self.symbol, 'quote': {
             'bid': float(bid), 'ask': float(ask), 'bid_size': float(bid_size),
-            'ask_size': float(ask_size), 'timestamp_ms': timestamp}}
+            'ask_size': float(ask_size), 'timestamp_ms': timestamp, 'book_timestamp_ms': timestamp}}
 
     def _advance_and_check(self, snapshot, expected):
         """Match one measured book, then compare fills to the independent plan."""

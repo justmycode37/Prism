@@ -45,6 +45,8 @@ class ContinuousServices:
         self._wake = threading.Event()
         self._plan_wake = threading.Event()
         self._account_wake = threading.Event()
+        self._checkpoint_wake = threading.Event()
+        self._sol_checkpoint_worker = None
         self._threads = []
         self._errors = {}
         self._error_lock = threading.RLock()
@@ -162,13 +164,24 @@ class ContinuousServices:
                 self.events.finish(event['id'], {'reason': reason}, status='superseded')
                 return None
             snapshot = {**source, 'snapshot_id': frozen['id']}
+            audit_run_id = self.store.get_document('sol_paper_audit_active')
+            if audit_run_id is not None:
+                try:
+                    from .sol_paper_audit import SolPaperAudit
+                    SolPaperAudit(self.store, paper=self.paper).validate_support_trigger(
+                        audit_run_id, event['id'], event['target'], frozen['id'])
+                except Exception as error:
+                    self.events.finish(event['id'], {'reason': 'Paper audit support admission failed (' + type(error).__name__ + ')'}, status='blocked')
+                    return {'status': 'blocked', 'reports': []}
             preflight = getattr(self.execution, 'support_preflight', None)
             admission = preflight(event['target']) if callable(preflight) else {'needed': True}
             if admission.get('needed') is False:
                 report = {'status': 'skipped', 'reason': admission.get('reason'), 'reports': []}
             else:
-                report = swarm.refresh(event['target'], snapshot,
-                    max_age_seconds=mode_settings(self.store.config())['support_max_age_seconds'])
+                refresh_options = {'max_age_seconds': mode_settings(self.store.config())['support_max_age_seconds']}
+                if audit_run_id is not None:
+                    refresh_options['audit_run_id'] = audit_run_id
+                report = swarm.refresh(event['target'], snapshot, **refresh_options)
             # Support may outlive its minute, Pause, or a mode reconfiguration.
             # A late result is journalled, but must not create new attention.
             reason = self._sol_minute_obsolete(event['target'], frozen)
@@ -232,6 +245,7 @@ class ContinuousServices:
         self._wake.set()
         self._plan_wake.set()
         self._account_wake.set()
+        self._checkpoint_wake.set()
         self._calendar_wake.set()
 
     def _error(self, component, error):
@@ -272,7 +286,8 @@ class ContinuousServices:
                 self.live.observe(sid, snapshot)
             key = payload.get('id') or payload.get('key') or event['id']
             kind = 'support' if is_sol_mode(self.store.config()) and payload['kind'] == 'candle_closed' else payload['kind']
-            attention = {**payload, 'snapshot_id': snapshot.get('snapshot_id')}
+            attention = {**payload, 'snapshot_id': snapshot.get('snapshot_id'),
+                         'upstream_event_id': event['id']}
             if kind == 'support':
                 # Observation evidence has already been written to the tape
                 # and research store. Only stale SOL model attention can be
@@ -401,6 +416,16 @@ class ContinuousServices:
             self._error('discovery', error)
             return {'status': 'blocked'}
 
+    def sol_checkpoint_step(self):
+        """Collect only due marks for an explicitly activated paper audit."""
+        if not self.store.get_document('sol_paper_audit_active'):
+            return None
+        if self._sol_checkpoint_worker is None:
+            from .sol_paper_audit import SolPaperAudit
+            from .sol_checkpoint_worker import SolCheckpointWorker
+            self._sol_checkpoint_worker = SolCheckpointWorker(SolPaperAudit(self.store, paper=self.paper))
+        return self._sol_checkpoint_worker.step()
+
     def protection_step(self):
         if self.paper:
             snapshots = []
@@ -450,6 +475,9 @@ class ContinuousServices:
             ('review', lambda: self._loop('review', self.research_step)),
             ('protection', lambda: self._loop('protection', self.protection_step,
                 predicate=self.monitoring_enabled, interval=lambda: self.store.config()['operations']['watchdog_seconds'])),
+            ('sol_checkpoint', lambda: self._loop('sol_checkpoint', self.sol_checkpoint_step,
+                predicate=lambda: self.paper is not None and bool(self.store.get_document('sol_paper_audit_active')),
+                interval=.25, wake=self._checkpoint_wake)),
             ('reconciliation', lambda: self._loop('reconciliation', self.execution.reconcile,
                 predicate=lambda: self.monitoring_enabled() and self._config['bybit']['enabled'],
                 interval=lambda: self.store.config()['operations']['reconcile_seconds'], wake=self._account_wake)),

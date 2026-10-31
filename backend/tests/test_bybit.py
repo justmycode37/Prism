@@ -465,6 +465,13 @@ class BybitAdapterTests(unittest.TestCase):
         rows = self.adapter.transactions()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["funding"], "0.42")
+        equivalent = {**transaction, 'funding': '0.4200', 'change': '0.420', 'cashBalance': '101'}
+        self.adapter._apply_transaction(equivalent)
+        with self.assertRaisesRegex(BybitError, 'Conflicting exchange transaction'):
+            self.adapter._apply_transaction({**transaction, 'funding': '0.43', 'change': '0.43'})
+        with self.assertRaisesRegex(BybitError, 'Conflicting exchange transaction'):
+            self.adapter._apply_transaction({**transaction, 'sourceTimestampMs': NOW, 'sourceTimeStatus': 'provided_unverified'})
+        self.assertEqual(self.adapter.transactions()[0]['funding'], '0.42')
         funding_execution = {"category": "linear", "symbol": "BTCUSDT", "execId": "FUND-EXEC-1",
                              "execType": "Funding", "execQty": "0", "execPrice": "0",
                              "execFee": "-0.42", "execPnl": "0", "execTime": str(NOW)}

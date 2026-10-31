@@ -36,7 +36,7 @@ class FixtureMarket:
             "candles": [{"start_ms": now - 60_000, "end_ms": now - 1000, "open": 100., "high": 101.,
                          "low": 99., "close": 100., "volume": 10., "turnover": 1000., "closed": True}],
             "quote": {"bid": bid, "ask": ask, "bid_size": 10., "ask_size": ask_size,
-                      "turnover_24h": 1_000_000., "timestamp_ms": now},
+                      "turnover_24h": 1_000_000., "timestamp_ms": now, "book_timestamp_ms": now},
             "signal": 1, "indicators": {"sma_20": {"value": 100., "ready": True}},
             "data_quality": {"live_observation": True}}
         ident = self.store.save_snapshot("bybit_market", value, now)

@@ -504,6 +504,35 @@ class BybitAdapter:
             return result
         return response
 
+    def _paper_capability_fields(self, route, payload, *, audit_context=None, host_action=None):
+        """Attach one-use authority to an exact local paper REST mutation."""
+        if self.mode != 'paper':
+            if audit_context is not None:
+                raise BybitError('Paper mutation authority cannot be used for an exchange account')
+            return {}
+        from .paper_exchange import PaperExchange
+        if type(self.transport) is not PaperExchange:
+            # Legacy paper transports and offline wrappers do not need the
+            # audit capability when no audit is active. During a run they must
+            # fail closed rather than impersonate the bound simulator.
+            if audit_context is not None or (host_action is not None and
+                    self.store.get_document('sol_paper_audit_active') is not None):
+                raise BybitError('Paper mutation authority requires the exact PaperExchange transport')
+            return {}
+        if audit_context is not None and host_action is not None:
+            raise BybitError('A paper mutation cannot combine reviewed and host-protection authority')
+        if audit_context is not None:
+            capability = self.transport.issue_order_capability(adapter=self, context=audit_context,
+                                                                route=route, payload=payload)
+            return {'_paperOrderCapability': capability['token'],
+                    '_paperAdapterBinding': capability['adapter_binding']}
+        if host_action is not None:
+            capability = self.transport.issue_host_protection_capability(adapter=self, action=host_action,
+                route=route, payload=payload)
+            return {'_paperHostCapability': capability['token'],
+                    '_paperAdapterBinding': capability['adapter_binding']}
+        return {}
+
     def synchronize_clock(self):
         """Measure exchange time against the midpoint of a local clock sample."""
         before = self._now_ms()
@@ -920,6 +949,8 @@ class BybitAdapter:
         price, order_link_id/orderLinkId, reduce_only/reduceOnly, stop_loss.
         Repeated link IDs return the saved outcome and are never resubmitted.
         """
+        paper_audit_context = kwargs.pop('_paper_audit_context', None)
+        paper_host_action = kwargs.pop('_paper_host_action', None)
         values = dict(intent or {})
         values.update(kwargs)
         category, symbol = values.get("category"), values.get("symbol")
@@ -1057,6 +1088,8 @@ class BybitAdapter:
             db.execute("UPDATE bybit_orders SET status='submitting',last_mutation='create',updated_at_ms=? WHERE mode=? AND order_link_id=?",
                        (now, self.mode, order_link_id))
         try:
+            payload.update(self._paper_capability_fields('/v5/order/create', payload,
+                audit_context=paper_audit_context, host_action=paper_host_action))
             result = self._request("POST", "/v5/order/create", payload=payload, private=self.mode != "paper")
         except BybitAPIError as exc:
             with self.store.connection() as db:
@@ -1076,7 +1109,8 @@ class BybitAdapter:
                        (result_id, self._now_ms(), self.mode, order_link_id))
         return self._order_view(self._order_row(order_link_id))
 
-    def amend_order(self, order_link_id, *, price=None, quantity=None, order_id=None):
+    def amend_order(self, order_link_id, *, price=None, quantity=None, order_id=None,
+                    _paper_audit_context=None):
         """Amend one tracked order. A timeout is recorded as unknown, never retried."""
         self._guard_environment()
         row = self._order_row(order_link_id)
@@ -1105,6 +1139,8 @@ class BybitAdapter:
             next_intent["referencePrice"] = payload["price"]
         self._mutation_start(order_link_id, "amend", intent=next_intent)
         try:
+            payload.update(self._paper_capability_fields('/v5/order/amend', payload,
+                audit_context=_paper_audit_context))
             result = self._request("POST", "/v5/order/amend", payload=payload, private=self.mode != "paper")
         except BybitAPIError:
             self._restore_mutation(order_link_id, intent, row["status"], "amend_rejected")
@@ -1117,7 +1153,7 @@ class BybitAdapter:
                        (_json(next_intent), self._now_ms(), self.mode, order_link_id))
         return self.query_order(order_link_id, reconcile=False) or {"order_link_id": order_link_id, "status": "acknowledged", "result": result}
 
-    def cancel_order(self, order_link_id, *, order_id=None):
+    def cancel_order(self, order_link_id, *, order_id=None, _host_protection=False):
         """Request cancellation; a cancel acknowledgement is not terminal state."""
         self._guard_environment()
         row = self._order_row(order_link_id)
@@ -1131,6 +1167,9 @@ class BybitAdapter:
             payload["orderId"] = order_id or row["order_id"]
         self._mutation_start(order_link_id, "cancel")
         try:
+            if _host_protection:
+                payload.update(self._paper_capability_fields('/v5/order/cancel', payload,
+                    host_action='cancel'))
             result = self._request("POST", "/v5/order/cancel", payload=payload, private=self.mode != "paper")
         except BybitAPIError:
             self._restore_mutation(order_link_id, json.loads(row["intent"]), row["status"], "cancel_rejected")
@@ -1333,14 +1372,26 @@ class BybitAdapter:
             link_id = row[0] if row else None
         raw = _json(item)
         with self.store.connection() as db:
-            cursor = db.execute("INSERT OR IGNORE INTO bybit_executions(mode,exec_id,order_link_id,order_id,category,symbol,qty,price,fee,fee_currency,realized_pnl,exec_time_ms,value) "
+            db.execute('BEGIN IMMEDIATE')
+            previous = db.execute('SELECT * FROM bybit_executions WHERE mode=? AND exec_id=?',
+                                  (self.mode, exec_id)).fetchone()
+            if previous is not None:
+                original = json.loads(previous['value'])
+                if (previous['order_link_id'] != link_id or previous['order_id'] != item.get('orderId')
+                        or previous['category'] != category or previous['symbol'] != symbol
+                        or Decimal(previous['qty']) != qty or Decimal(previous['price']) != price
+                        or Decimal(previous['fee']) != fee or previous['fee_currency'] != item.get('feeCurrency')
+                        or Decimal(previous['realized_pnl']) != pnl or previous['exec_time_ms'] != executed_at
+                        or original.get('execType', 'Trade') != exec_type
+                        or original.get('side') != item.get('side')
+                        or str(original.get('seq')) != str(item.get('seq'))):
+                    raise BybitError('Conflicting exchange execution identity requires reconciliation')
+                return False
+            db.execute("INSERT INTO bybit_executions(mode,exec_id,order_link_id,order_id,category,symbol,qty,price,fee,fee_currency,realized_pnl,exec_time_ms,value) "
                                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                  (self.mode, exec_id, link_id, item.get("orderId"), category, symbol, _decimal_string(qty),
                                   _decimal_string(price), _decimal_string(fee), item.get("feeCurrency"),
                                   _decimal_string(pnl), executed_at, raw))
-            if cursor.rowcount == 0:
-                # execId is Bybit's idempotency key; duplicate delivery is a no-op.
-                return False
             if link_id and not financial_only:
                 order = db.execute("SELECT * FROM bybit_orders WHERE mode=? AND order_link_id=?",
                                    (self.mode, link_id)).fetchone()
@@ -1413,7 +1464,22 @@ class BybitAdapter:
         cash_flow = _number(item.get("cashFlow", "0"), "transaction cash flow")
         change = _number(item.get("change", "0"), "transaction change")
         with self.store.connection() as db:
-            db.execute("INSERT OR IGNORE INTO bybit_transactions(mode,transaction_id,category,symbol,currency,transaction_time_ms,funding,fee,cash_flow,change_amount,value) "
+            db.execute('BEGIN IMMEDIATE')
+            existing = db.execute('SELECT * FROM bybit_transactions WHERE mode=? AND transaction_id=?',
+                                  (self.mode, ident)).fetchone()
+            if existing is not None:
+                original = json.loads(existing['value'])
+                if (existing['category'] != item.get('category') or existing['symbol'] != item.get('symbol')
+                        or existing['currency'] != item.get('currency') or existing['transaction_time_ms'] != trans_ms
+                        or Decimal(existing['funding']) != funding or Decimal(existing['fee']) != fee
+                        or Decimal(existing['cash_flow']) != cash_flow or Decimal(existing['change_amount']) != change
+                        or original.get('type') != item.get('type')
+                        or original.get('fundingProvenance') != item.get('fundingProvenance')
+                        or original.get('sourceTimestampMs') != item.get('sourceTimestampMs')
+                        or original.get('sourceTimeStatus') != item.get('sourceTimeStatus')):
+                    raise BybitError('Conflicting exchange transaction identity requires reconciliation')
+            else:
+                db.execute("INSERT INTO bybit_transactions(mode,transaction_id,category,symbol,currency,transaction_time_ms,funding,fee,cash_flow,change_amount,value) "
                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (self.mode, ident, item.get("category"), item.get("symbol"), item.get("currency"), trans_ms,
                         _decimal_string(funding), _decimal_string(fee), _decimal_string(cash_flow),
@@ -1529,7 +1595,7 @@ class BybitAdapter:
             raise BybitError("Only verified one-way linear position mode is supported")
         return True
 
-    def set_leverage(self, category, symbol, leverage):
+    def set_leverage(self, category, symbol, leverage, *, _paper_audit_token=None):
         """Set exact linear leverage only while the instrument is reconciled flat.
 
         The exchange acknowledgment is never treated as proof: the resulting
@@ -1594,6 +1660,10 @@ class BybitAdapter:
 
         payload = {'category': 'linear', 'symbol': symbol,
                    'buyLeverage': _decimal_string(requested), 'sellLeverage': _decimal_string(requested)}
+        if _paper_audit_token is not None:
+            if self.mode != 'paper':
+                raise ValueError('Paper audit attribution cannot be used for an exchange account')
+            payload['_paperAudit'] = _paper_audit_token
         try:
             self._request('POST', '/v5/position/set-leverage', payload=payload, private=self.mode != 'paper')
         except BybitAPIError:
@@ -1809,7 +1879,8 @@ class BybitAdapter:
                 "quote_coin": info["quote_coin"], "notional": sizing["notional"],
                 "unprotected_dust_quantity": float(dust), "unprotected_dust_notional": float(dust * reference)}
 
-    def set_exchange_stop_loss(self, category, symbol, stop_loss, *, position_idx=0, trigger_by="MarkPrice"):
+    def set_exchange_stop_loss(self, category, symbol, stop_loss, *, position_idx=0, trigger_by="MarkPrice",
+                               host_protection=False):
         """Set linear position protection and return query verification."""
         if category != "linear":
             raise ValueError("Exchange stop loss is supported for linear contracts only")
@@ -1823,6 +1894,9 @@ class BybitAdapter:
         self._verify_account_identity(category=category, write=True, position=True)
         payload = {"category": category, "symbol": symbol, "tpslMode": "Full", "positionIdx": position_idx,
                    "stopLoss": value, "slTriggerBy": trigger_by}
+        if host_protection:
+            payload.update(self._paper_capability_fields('/v5/position/trading-stop', payload,
+                host_action='linear_stop'))
         self._request("POST", "/v5/position/trading-stop", payload=payload, private=self.mode != "paper")
         return self.verify_exchange_protection(category, symbol, value, position_idx=position_idx)
 
@@ -1921,7 +1995,7 @@ class BybitAdapter:
 
     def set_spot_exchange_protection(self, symbol, quantity, stop_loss, *, order_link_id,
                                      strategy_id=None, snapshot_id=None, rationale=None,
-                                     parent_order_link_id=None):
+                                     parent_order_link_id=None, host_protection=False):
         """Create one durable cash Spot sell StopOrder and verify venue state.
 
         Spot ``StopOrder`` conditionals do not reserve base assets on Bybit until
@@ -2020,6 +2094,9 @@ class BybitAdapter:
             db.execute("UPDATE bybit_orders SET status='submitting',last_mutation='create_spot_protection',updated_at_ms=? "
                        "WHERE mode=? AND order_link_id=?", (now, self.mode, order_link_id))
         try:
+            if host_protection:
+                payload.update(self._paper_capability_fields('/v5/order/create', payload,
+                    host_action='spot_stop'))
             result = self._request("POST", "/v5/order/create", payload=payload, private=self.mode != "paper")
         except BybitAPIError as exc:
             with self.store.connection() as db:
@@ -2106,6 +2183,8 @@ class BybitAdapter:
                        "WHERE mode=? AND order_link_id=? AND status NOT IN ('filled','cancelled','rejected')",
                        (self._now_ms(), self.mode, order_link_id))
         try:
+            payload.update(self._paper_capability_fields('/v5/order/cancel', payload,
+                host_action='spot_cancel'))
             self._request("POST", "/v5/order/cancel", payload=payload, private=self.mode != "paper")
         except Exception:
             # A timeout or a terminal-state race is resolved from actual order

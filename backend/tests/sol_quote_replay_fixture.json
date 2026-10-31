@@ -1,0 +1,13 @@
+{
+  "initial_equity": 1000.0,
+  "fee_bps": 10.0,
+  "events": [
+    {"type": "quote", "timestamp_ms": 1800000000000, "bid": 99.0, "ask": 100.0, "bid_size": 2.0, "ask_size": 2.0},
+    {"type": "order", "timestamp_ms": 1800000000100, "id": "open", "side": "Buy", "quantity": 1.0, "limit_price": 101.0, "stop_loss": 90.0},
+    {"type": "quote", "timestamp_ms": 1800000000200, "bid": 99.0, "ask": 100.0, "bid_size": 2.0, "ask_size": 0.4},
+    {"type": "quote", "timestamp_ms": 1800000000300, "bid": 99.0, "ask": 100.0, "bid_size": 2.0, "ask_size": 0.6},
+    {"type": "funding", "timestamp_ms": 1800000000400, "id": "fund-1", "amount": -0.2},
+    {"type": "order", "timestamp_ms": 1800000000500, "id": "close", "side": "Sell", "quantity": 1.0, "limit_price": 101.0},
+    {"type": "quote", "timestamp_ms": 1800000000600, "bid": 102.0, "ask": 103.0, "bid_size": 2.0, "ask_size": 2.0}
+  ]
+}

@@ -68,6 +68,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_experiment_status_latest ON experiment_status(experiment_id,id DESC);
                 CREATE INDEX IF NOT EXISTS idx_experiment_attempts_hash ON experiment_attempts(spec_hash,id);
                 CREATE INDEX IF NOT EXISTS idx_attributed_calls_cycle ON attributed_calls(cycle_id);
+                CREATE INDEX IF NOT EXISTS idx_attributed_calls_experiment ON attributed_calls(experiment_id);
             ''')
         self.path.chmod(0o600)
         # No automatic retry of a call whose remote outcome is unknown after a crash.
@@ -210,22 +211,33 @@ class Store:
             raise ValueError('Frozen market snapshot is missing')
         return self._expand_markets(snapshot['value'])
 
-    def config(self):
+    def config(self, *, _db=None):
         from .operations_config import OPERATION_DEFAULTS, merge_settings
         result = default_config()
-        saved = self.get_document('config', {})
+        if _db is None:
+            saved = self.get_document('config', {})
+        else:
+            row = _db.execute('SELECT value FROM cascade_meta WHERE key=?', ('config',)).fetchone()
+            saved = json.loads(row['value']) if row else {}
         for key, value in saved.items():
             result[key] = merge_settings(result[key], value) if key in OPERATION_DEFAULTS else {**result[key], **value} if key in {'risk', 'ingestion', 'sector', 'model_prices', 'research', 'trading_mode'} else value
         return result
 
-    def update_config(self, changes):
+    def update_config(self, changes, *, _sol_owner=None, _expected_config=None):
         from .operations_config import OPERATION_DEFAULTS, merge_settings
         changes = validate_config_update(changes)
-        with self._lock:
-            result = self.config()
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            result = self.config(_db=db)
+            if _expected_config is not None and result != _expected_config:
+                raise ValueError('Configuration changed while preparing the SOL strategy; retry the update')
             for key, value in changes.items():
                 result[key] = merge_settings(result[key], value) if key in OPERATION_DEFAULTS else {**result[key], **value} if key in {'risk', 'ingestion', 'sector', 'model_prices', 'research', 'trading_mode'} else value
-            self.set_document('config', result)
+            db.execute('INSERT INTO cascade_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                       ('config', encoded(result)))
+            if _sol_owner is not None:
+                db.execute('INSERT INTO cascade_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                           ('sol_mode_strategy_id', encoded(_sol_owner)))
         self.event('configuration', 'Updated ' + ', '.join(sorted(changes)))
         return result
 
@@ -307,9 +319,28 @@ class Store:
             db.execute('INSERT INTO cascade_strategies VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value', (value['id'], encoded(value)))
 
     def commit_validation(self, cycle_id, trial_count, checkpoint):
+        """Atomically register one cycle checkpoint and increment the global count.
+
+        ``trial_count`` is the number of attempts in this cycle (not a precomputed
+        global total). Existing cycle checkpoints win, making retries idempotent.
+        """
+        if not isinstance(cycle_id, str) or not cycle_id or type(trial_count) is not int or trial_count < 0 or not isinstance(checkpoint, dict):
+            raise ValueError('Validation requires a cycle, nonnegative attempt count and checkpoint')
         with self.connection() as db:
-            for key, value in [('statistical_trial_count', trial_count), ('validation_' + cycle_id, checkpoint)]:
-                db.execute('INSERT INTO cascade_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, encoded(value)))
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT value FROM cascade_meta WHERE key=?', ('validation_' + cycle_id,)).fetchone()
+            if row:
+                return json.loads(row['value'])
+            row = db.execute('SELECT value FROM cascade_meta WHERE key=?', ('statistical_trial_count',)).fetchone()
+            previous = json.loads(row['value']) if row else 0
+            if type(previous) is not int or previous < 0:
+                raise ValueError('Stored trial count must be a nonnegative integer')
+            total = previous + trial_count
+            checkpoint = {**checkpoint, 'trial_count': max(1, total)}
+            db.execute('INSERT INTO cascade_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                       ('statistical_trial_count', encoded(total)))
+            db.execute('INSERT INTO cascade_meta VALUES (?,?)', ('validation_' + cycle_id, encoded(checkpoint)))
+            return checkpoint
 
     def strategies(self):
         with self.connection() as db:
@@ -926,35 +957,49 @@ class Store:
             report = evaluation.get('edge', evaluation.get('report', {}))
             if isinstance(report, dict):
                 refs.update(report.get('evidence_ids', []))
-        costs, complete = {}, True
-        for item in self.evidence(list(refs)):
-            run_id = item.get('acquisition_cost_id')
-            if run_id:
-                amount = item.get('acquisition_cost_usd')
-                valid = (item.get('acquisition_cost_complete') is True and isinstance(amount, (int, float))
-                         and not isinstance(amount, bool) and math.isfinite(amount) and amount >= 0)
-                complete = complete and valid
-                if valid:
-                    costs[run_id] = max(amount, costs.get(run_id, 0.))
-        return sum(costs.values()), complete
+        from .source_costs import source_cost
+        sources = self.evidence(list(refs))
+        total, complete = source_cost(sources)
+        return total, complete and {item['id'] for item in sources} == refs
 
     def research_cost(self, ident):
-        experiment = self.experiment(ident)
-        if not experiment:
-            return 0.
+        return self.research_cost_state(ident)['estimated_cost_usd']
+
+    def research_cost_state(self, ident):
+        """Read attributed estimates and unsettled states in one SQLite snapshot.
+
+        Charges use locally configured rates, not reconciled provider invoices.
+        """
         with self.connection() as db:
-            digest = db.execute('SELECT spec_hash FROM experiments WHERE id=?', (ident,)).fetchone()[0]
+            db.execute('BEGIN')
+            experiment = db.execute('SELECT spec_hash FROM experiments WHERE id=?', (ident,)).fetchone()
+            if not experiment:
+                return {'estimated_cost_usd': 0., 'reserved_calls': 0, 'unknown_outcome_calls': 0}
+            digest = experiment['spec_hash']
             contexts = [json.loads(row[0]).get('context', {}) for row in db.execute('SELECT payload FROM experiment_attempts WHERE spec_hash=?', (digest,))]
             cycles = {context.get('cycle_id') for context in contexts if context.get('cycle_id')}
             allocations = []
             for cycle in cycles:
                 count = db.execute("SELECT COUNT(DISTINCT spec_hash) FROM experiment_attempts WHERE json_extract(payload,'$.context.cycle_id')=?", (cycle,)).fetchone()[0]
-                allocations.append(self.cycle_cost(cycle) / max(1, count))
+                cycle_cost = db.execute("SELECT COALESCE(SUM(c.charged + CASE WHEN c.status='reserved' THEN c.reserved ELSE 0 END),0) FROM cascade_calls c JOIN attributed_calls a ON a.call_id=c.id WHERE a.cycle_id=?", (cycle,)).fetchone()[0]
+                allocations.append(cycle_cost / max(1, count))
             direct = sum(row['charged'] for row in db.execute(
                 'SELECT c.charged,a.cycle_id FROM attributed_calls a JOIN cascade_calls c ON c.id=a.call_id WHERE a.experiment_id=?',
                 (ident,)) if row['cycle_id'] not in cycles)
-        external = sum(row.get('research_cost_usd', 0.) for row in experiment['evaluations'] if not row.get('cycle_id'))
-        return sum(allocations) + external + direct
+            evaluations = [json.loads(row[0]) for row in db.execute(
+                'SELECT payload FROM experiment_evaluations WHERE experiment_id=?', (ident,))]
+            external = sum(row.get('research_cost_usd', 0.) for row in evaluations if not row.get('cycle_id'))
+            rows = db.execute('''SELECT c.status,COUNT(*) AS n
+                FROM attributed_calls a JOIN cascade_calls c ON c.id=a.call_id
+                WHERE a.experiment_id=? OR a.cycle_id IN (
+                    SELECT json_extract(payload,'$.context.cycle_id') FROM experiment_attempts
+                    WHERE spec_hash=(SELECT spec_hash FROM experiments WHERE id=?)
+                      AND json_extract(payload,'$.context.cycle_id') IS NOT NULL)
+                GROUP BY c.status''', (ident, ident)).fetchall()
+        counts = {row['status']: row['n'] for row in rows}
+        return {'estimated_cost_usd': sum(allocations) + external + direct,
+                'reserved_calls': counts.get('reserved', 0),
+                'unknown_outcome_calls': counts.get('unknown', 0)}
 
     def research_memory(self, limit=20):
         if isinstance(limit, bool) or not isinstance(limit, int):

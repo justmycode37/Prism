@@ -33,7 +33,7 @@ class PaperExchangeTests(unittest.TestCase):
     def advance(self, category='spot', depth=.2, bid=99.9, ask=100.1):
         self.now[0] += 1
         snapshot = {'category': category, 'symbol': 'BTCUSDT', 'quote': {'bid': bid, 'ask': ask,
-            'bid_size': depth, 'ask_size': depth, 'timestamp_ms': round(self.now[0] * 1000)}}
+            'bid_size': depth, 'ask_size': depth, 'timestamp_ms': round(self.now[0] * 1000), 'book_timestamp_ms': round(self.now[0] * 1000)}}
         messages = self.transport.advance([snapshot])
         for message in messages:
             self.adapter._handle_private_message(message)
@@ -84,6 +84,24 @@ class PaperExchangeTests(unittest.TestCase):
         self.assertEqual(len(self.adapter.transactions()), 1)
         self.assertEqual(len(self.adapter.executions()), 2)
 
+    def test_funding_id_replay_rejects_conflicts_and_retains_declared_provenance(self):
+        provenance = {'source': 'synthetic fixture', 'rate': .001, 'mark_price': 100.,
+                      'position_quantity': .5, 'source_verified': False}
+        self.transport.apply_funding('linear', 'BTCUSDT', -.05, event_id='fund-1', provenance=provenance)
+        self.transport.apply_funding('linear', 'BTCUSDT', -.05, event_id='fund-1', provenance=provenance)
+        with self.assertRaisesRegex(ValueError, 'Conflicting'):
+            self.transport.apply_funding('linear', 'BTCUSDT', -.1, event_id='fund-1', provenance=provenance)
+        with self.assertRaisesRegex(ValueError, 'Conflicting'):
+            self.transport.apply_funding('linear', 'BTCUSDT', -.05, event_id='fund-1')
+        with self.assertRaisesRegex(ValueError, 'not verified'):
+            self.transport.apply_funding('linear', 'BTCUSDT', -.05, event_id='fund-2',
+                                         provenance={'source_verified': True})
+        self.adapter.reconcile()
+        rows = self.adapter.transactions()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['fundingProvenance'], provenance)
+        self.assertAlmostEqual(self.adapter.account_snapshot()['wallet_balance'], 9999.95)
+
     def test_older_or_revised_same_timestamp_quote_cannot_reuse_liquidity(self):
         self.submit('quote-replay', quantity=1.)
         first, _ = self.advance(depth=.2)
@@ -114,6 +132,49 @@ class PaperExchangeTests(unittest.TestCase):
             'ticker_timestamp_ms': book_time + 1000}}
         self.assertEqual(self.transport.advance([stats]), [])
         self.assertEqual(len(self.transport._load()['executions']), 1)
+
+    def test_linear_stats_tick_cannot_refill_consumed_book(self):
+        self.submit('linear-reused-book', category='linear', quantity=1.)
+        first, _ = self.advance(category='linear', depth=.2)
+        self.now[0] += 1
+        stats = json.loads(json.dumps(first))
+        stats['quote']['timestamp_ms'] = round(self.now[0] * 1000)
+        self.assertEqual(self.transport.advance([stats]), [])
+        self.assertAlmostEqual(self.adapter.query_order('linear-reused-book')['filled_quantity'], .2)
+        self.assertEqual(len(self.transport._load()['executions']), 1)
+        without_book = json.loads(json.dumps(stats))
+        del without_book['quote']['book_timestamp_ms']
+        self.assertEqual(self.transport.advance([without_book]), [])
+
+    def test_triggered_stop_cancels_addons_and_latches_partial_exit(self):
+        self.submit('initial-stop-position', category='linear', quantity=.5)
+        self.advance(category='linear', depth=1.)
+        addon = {'category': 'linear', 'symbol': 'BTCUSDT', 'side': 'Buy', 'qty': '.5',
+                 'orderType': 'Limit', 'price': '101', 'orderLinkId': 'unsafe-addon', 'stopLoss': '90'}
+        self.transport.request('POST', '/v5/order/create', body=json.dumps(addon))
+        self.adapter._apply_exchange_order(self.transport._load()['orders']['unsafe-addon'])
+        _, messages = self.advance(category='linear', depth=.2, bid=94., ask=94.01)
+        self.assertTrue(any(m['topic'] == 'order' and m['data'][0]['orderLinkId'] == 'unsafe-addon'
+                            and m['data'][0]['orderStatus'] == 'Cancelled' for m in messages))
+        state = self.transport._load()
+        self.assertAlmostEqual(state['positions']['linear:BTCUSDT']['quantity'], .3)
+        self.assertTrue(state['positions']['linear:BTCUSDT']['stop_triggered'])
+        self.assertEqual(state['orders']['unsafe-addon']['orderStatus'], 'Cancelled')
+        self.advance(category='linear', depth=1., bid=100., ask=100.01)
+        state = self.transport._load()
+        self.assertAlmostEqual(state['positions']['linear:BTCUSDT']['quantity'], 0.)
+        self.assertFalse(state['positions']['linear:BTCUSDT']['stop_triggered'])
+
+    def test_addon_cannot_loosen_existing_stop(self):
+        self.submit('initial-protection', category='linear', quantity=.5)
+        self.advance(category='linear', depth=1.)
+        addon = {'category': 'linear', 'symbol': 'BTCUSDT', 'side': 'Buy', 'qty': '.5',
+                 'orderType': 'Limit', 'price': '101', 'orderLinkId': 'addon-low-stop', 'stopLoss': '90'}
+        self.transport.request('POST', '/v5/order/create', body=json.dumps(addon))
+        self.advance(category='linear', depth=1.)
+        position = self.transport._load()['positions']['linear:BTCUSDT']
+        self.assertAlmostEqual(position['quantity'], 1.)
+        self.assertEqual(position['stop_loss'], 95.)
 
     def test_fill_or_kill_never_leaves_a_partial_fill(self):
         self.submit('fok-insufficient', quantity=.5, time_in_force='FOK')

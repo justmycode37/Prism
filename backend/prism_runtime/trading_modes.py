@@ -5,7 +5,9 @@ This module describes policy only. Selecting a mode does not grant live authorit
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
+from pathlib import Path
 
 MODE_DEFAULTS = {
     'selected': 'research',
@@ -15,6 +17,37 @@ MODE_DEFAULTS = {
     'lifetime_model_budget_usd': 400.0,
     'max_position_risk_fraction': .01,
 }
+
+_POLICY_FILES = ('agent_roles/sol_trader.md', 'agent_roles/support.md', 'agent_roles/trade_reviewer.md',
+                 'prism_runtime/execution_contract.py', 'prism_runtime/execution.py',
+                 'prism_runtime/trade_review.py', 'prism_runtime/support_swarm.py',
+                 'prism_runtime/agent_runtime.py', 'prism_runtime/provider.py',
+                 'prism_runtime/live_execution.py', 'prism_runtime/risk_controls.py',
+                 'prism_runtime/market_data.py', 'prism_runtime/market_policy.py',
+                 'prism_runtime/continuous.py', 'prism_runtime/bybit.py',
+                 'prism_runtime/paper_exchange.py', 'prism_runtime/live_research.py',
+                 'prism_runtime/analytics.py', 'prism_runtime/experiments.py', 'prism_runtime/source_costs.py',
+                 'prism_runtime/sol_paper_audit.py', 'prism_runtime/sol_paper_accounting.py',
+                 'prism_runtime/sol_paper_checkpoint.py', 'prism_runtime/sol_paper_benchmark.py',
+                 'prism_runtime/sol_checkpoint_worker.py', 'prism_runtime/sol_benchmark.py',
+                 'prism_runtime/sol_dependence.py', 'prism_runtime/sol_leverage_audit.py', 'prism_runtime/store.py',
+                 'prism_runtime/research_memory.py', 'prism_runtime/config.py',
+                 'prism_runtime/operations_config.py', 'prism_runtime/domain.py',
+                 'prism_runtime/scheduling.py', 'prism_runtime/event_bus.py',
+                 'prism_runtime/trading_modes.py', 'prism_runtime/orchestrator.py')
+
+def sol_behavior_digest(root=None) -> str:
+    """SHA-256 over the bounded SOL prompts, tools, schemas and request/runtime code."""
+    base = Path(root) if root is not None else Path(__file__).resolve().parent.parent
+    digest = hashlib.sha256()
+    for name in _POLICY_FILES:
+        path = base / name
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise FileNotFoundError(f'Missing SOL behavior identity input: {name}') from exc
+        digest.update(name.encode()); digest.update(b'\0'); digest.update(data); digest.update(b'\0')
+    return digest.hexdigest()
 
 
 def validate_mode_update(changes: dict) -> dict:

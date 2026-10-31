@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import threading
@@ -271,7 +272,7 @@ class SupportSwarmTests(unittest.TestCase):
         self.swarm.refresh('one', original)
         self.now[0] += 1
         current = self.snapshot('s2', captured=int(self.now[0] * 1000))
-        current['quote'] = {'mark_price': 101, 'timestamp_ms': int(self.now[0] * 1000)}
+        current['quote'] = {'mark_price': 100, 'timestamp_ms': int(self.now[0] * 1000)}
         context = self.swarm.context('one', current)
         self.assertEqual(context['status'], 'compatible')
         self.assertEqual({x['source_snapshot_id'] for x in context['reports']}, {'s1'})
@@ -279,6 +280,20 @@ class SupportSwarmTests(unittest.TestCase):
         self.assertTrue(all(x['source_quote_age_seconds'] == 1 for x in context['reports']))
         previous = self.snapshot('s3', captured=int(self.now[0] * 1000), candle_end=1793361440000)
         self.assertEqual(self.swarm.context('one', previous)['status'], 'snapshot_mismatch')
+
+    def test_context_changes_in_supporting_frame_and_quote_invalidate_reports(self):
+        original = self.snapshot()
+        original['supporting_timeframes'] = {'5': {'candles': [
+            {'end_ms': 1793361500000, 'open': 100, 'high': 101, 'low': 99, 'close': 100}]}}
+        self.swarm.refresh('one', original)
+        changed = copy.deepcopy(original)
+        changed['snapshot_id'] = 'new-context'
+        changed['supporting_timeframes']['5']['candles'][0]['close'] = 110
+        self.assertEqual(self.swarm.context('one', changed)['status'], 'snapshot_mismatch')
+        changed = copy.deepcopy(original)
+        changed['snapshot_id'] = 'new-quote'
+        changed['quote']['mark_price'] = 101
+        self.assertEqual(self.swarm.context('one', changed)['status'], 'snapshot_mismatch')
 
     def test_permission_is_rechecked_inside_worker_before_agent_call(self):
         checks = iter((True, False, False, False, False))

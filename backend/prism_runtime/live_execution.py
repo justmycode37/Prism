@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import math
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -1170,7 +1171,8 @@ class ExecutionController:
             "constraints": self._constraints(strategy_id)})
 
     def _prepare_trade_review(self, name, args, tool_id, *, strategy_id, decision_snapshot,
-                              decision_world=None, decision_config=None, decision_eligibility=None):
+                              decision_world=None, decision_config=None, decision_eligibility=None,
+                              audit_context=None):
         """Call the reviewer with immutable measured evidence, outside the mutation lock."""
         config = self._config()
         if not is_sol_mode(config):
@@ -1198,9 +1200,14 @@ class ExecutionController:
             strategy = self._strategy(strategy_id)
             if not strategy:
                 return block("Strategy version is unavailable")
+            if strategy.get('experiment_id') != strategy_id:
+                return block('SOL strategy is not bound to its exact experiment')
             snapshot_id = args.get("snapshot_id")
             snapshot = self._approve_snapshot(strategy_id, snapshot_id, {snapshot_id})
             latest = self._fresh_market(strategy_id)
+            if audit_context is not None:
+                audit_context['audit'].validate_snapshot(audit_context['run_id'], snapshot_id, require_closed=True)
+                audit_context['audit'].validate_snapshot(audit_context['run_id'], latest.get('snapshot_id'), require_closed=True)
             reviewed_signal = snapshot.get("signal_input_id")
             latest_signal = latest.get("signal_input_id")
             reviewed_candles = snapshot.get("candles", [])
@@ -1236,8 +1243,11 @@ class ExecutionController:
                 return block("Trade proposal snapshot or expiry is stale")
             binding = self._trade_review_binding(strategy_id=strategy_id, snapshot_id=snapshot_id,
                 world=review_world, config=config, permission=True)
+            review_eligibility = self._eligibility(strategy_id)
             evidence = {"tool_id": tool_id, "tool_name": name, "arguments": copy.deepcopy(args),
-                "strategy_id": strategy_id, "mode": "sol_perpetual", "config": {"bybit": {
+                "strategy_id": strategy_id,
+                "experiment_id": strategy_id,
+                "mode": "sol_perpetual", "config": {"bybit": {
                     key: copy.deepcopy(config["bybit"].get(key)) for key in
                     ("mode", "enabled", "mainnet_enabled", "allowed_categories", "allowed_instruments")},
                     "live_execution": copy.deepcopy(config["live_execution"])},
@@ -1247,17 +1257,29 @@ class ExecutionController:
                 "positions": copy.deepcopy(review_world["positions"]),
                 "orders": self._order_history_projection(review_world["orders"]),
                 "constraints": self._constraints(strategy_id),
-                "eligibility": self._eligibility_projection(strategy_id),
+                "eligibility": self._eligibility_projection(strategy_id, review_eligibility),
+                "operating_cost_evidence": self._operating_cost_projection(review_eligibility),
                 "runtime_permission": True, "state_binding": binding,
                 "approval_expires_at_ms": valid_until}
+            if audit_context is not None:
+                evidence['paper_experiment'] = {'run_id': audit_context['run_id'],
+                    'authorized': self._paper_experiment_authorized(strategy_id, audit_context),
+                    'exchange_qualification': False}
             if callable(self.support_context_provider):
                 try:
                     evidence["support_reports"] = self.support_context_provider(strategy_id, snapshot)
+                    if audit_context is not None:
+                        evidence["support_reports"] = self._audit_support_context(evidence["support_reports"], audit_context)
                 except Exception:
                     evidence["support_reports"] = {"status": "unavailable", "reports": []}
             # One durable review slot per model tool identity. An exact replay
             # reuses the record; changed arguments or evidence hit the same slot
             # and are rejected without another paid request.
+            if audit_context is not None:
+                audit_context['audit'].assert_new_model_task(review_task)
+                with self.store.connection() as db:
+                    if db.execute('SELECT 1 FROM trade_reviews WHERE review_id=?', (review_task,)).fetchone():
+                        raise ValueError('A preexisting review cannot be used as prospective work')
             result = reviewer.review(evidence, task_id=review_task, deadline_ms=valid_until)
             if not isinstance(result, dict):
                 return {"status": "blocked", "reason": "Trade reviewer returned no decision"}
@@ -1313,15 +1335,156 @@ class ExecutionController:
         except Exception as error:
             return {"eligible": False, "reasons": ["Eligibility unavailable (" + type(error).__name__ + ")"]}
 
+    def _paper_experiment_authorized(self, strategy_id, audit_context=None):
+        """Authorize only a bound local paper run, never exchange qualification."""
+        try:
+            from .bybit import BybitAdapter
+            from .paper_exchange import PaperExchange
+            from .sol_paper_audit import SolPaperAudit
+            config = self._config()
+            adapter_config = getattr(self.adapter, 'config', {})
+            paper = getattr(self.adapter, 'transport', None)
+            if (type(self.adapter) is not BybitAdapter or config['bybit']['mode'] != 'paper'
+                    or getattr(self.adapter, 'mode', None) != 'paper'
+                    or getattr(self.adapter, 'store', None) is not self.store
+                    or not isinstance(adapter_config, dict) or adapter_config.get('mode') != 'paper'
+                    or adapter_config.get('account_id') != config['bybit'].get('account_id')
+                    or type(paper) is not PaperExchange or paper.store is not self.store):
+                return False
+            run_id = self.store.get_document('sol_paper_audit_active')
+            if not isinstance(run_id, str):
+                return False
+            if audit_context is not None:
+                audit = audit_context['audit']
+                if (type(audit) is not SolPaperAudit or audit_context['run_id'] != run_id
+                        or audit.paper is not paper or audit.store is not self.store):
+                    return False
+                audit.assert_active_decision(run_id, audit_context['decision_id'])
+            else:
+                audit = SolPaperAudit(self.store, paper=paper)
+            paper._audit_instance = audit
+            with self.store.connection() as db:
+                db.execute('BEGIN')
+                row, manifest = audit._run(db, run_id)
+                audit._binding(db, row, manifest)
+                active = db.execute("SELECT value FROM cascade_meta WHERE key='sol_paper_audit_active'").fetchone()
+                if (row['strategy_id'] != strategy_id or not active or json.loads(active['value']) != run_id
+                        or not manifest['start_ms'] <= self._now_ms() < manifest['end_ms']):
+                    return False
+                if audit_context is None:
+                    from .sol_leverage_audit import history_continuity
+                    epoch, leverages = history_continuity(db, row, manifest)
+                    _, _, current = audit._paper_state(db)
+                    if (epoch != db.execute('SELECT epoch FROM sol_paper_audit_leverage_epoch WHERE singleton=1').fetchone()['epoch']
+                            or current != leverages):
+                        return False
+            return True
+        except (KeyError, TypeError, ValueError, OSError, sqlite3.Error):
+            return False
+
+    def _paper_order_authorization(self, strategy_id, audit_context, tool_id, tool_name, args, approval):
+        """Create the immutable decision context passed to the trusted adapter."""
+        if audit_context is None:
+            return None
+        if not self._paper_experiment_authorized(strategy_id, audit_context):
+            raise IntentRejected('Paper experiment authorization is no longer active')
+        return {'audit': audit_context['audit'], 'run_id': audit_context['run_id'],
+            'decision_id': audit_context['decision_id'], 'tool_id': tool_id, 'tool_name': tool_name,
+            'arguments': copy.deepcopy(args), 'approval': copy.deepcopy(approval),
+            'snapshot_id': args.get('snapshot_id')}
+
+    def _paper_host_kwargs(self, name, value):
+        """Only the exact paper adapter receives the private protection marker."""
+        if getattr(self.adapter, 'mode', None) != 'paper':
+            return {}
+        try:
+            from .bybit import BybitAdapter
+            from .paper_exchange import PaperExchange
+            if (type(self.adapter) is BybitAdapter and type(self.adapter.transport) is PaperExchange
+                    and self.adapter.store is self.store and self.adapter.transport.store is self.store):
+                return {name: value}
+        except (AttributeError, ImportError):
+            pass
+        return {}
+
+    def _paper_risk_eligibility(self, strategy_id, eligibility, audit_context):
+        """Supply a paper-only risk permission without altering qualification."""
+        if audit_context is not None and self._paper_experiment_authorized(strategy_id, audit_context):
+            return {**eligibility, 'eligible': True}
+        return eligibility
+
     def _eligibility_projection(self, strategy_id, result=None):
         result = result if isinstance(result, dict) else self._eligibility(strategy_id)
         keys = ("eligible", "status", "allocation", "policy_version", "observation_unit",
                 "verified_observations", "sessions", "trades", "net_return", "drawdown",
-                "benchmark_return", "cost_complete")
+                "benchmark_return", "cost_complete", "performance_basis", "missing_utc_days",
+                "latest_verified_utc_day", "causal_provenance_verified")
         projected = {key: result[key] for key in keys if key in result and
                      (isinstance(result[key], (str, int, float, bool)) or result[key] is None)}
+        scope = result.get('qualification_evidence_scope')
+        if isinstance(scope, dict):
+            projected['qualification_evidence_scope'] = {key: scope[key] for key in
+                ('discretionary_trader_decisions', 'support_or_reviewer_evidence', 'leverage_evidence',
+                 'block_independence_verified', 'stationarity_verified')
+                if type(scope.get(key)) is bool}
+            if isinstance(scope.get('signal_source'), str):
+                projected['qualification_evidence_scope']['signal_source'] = _bounded_text(scope['signal_source'], 200)
+        labels = result.get('benchmark_labels')
+        if isinstance(labels, dict) and type(labels.get('sp500_included')) is bool:
+            projected['sp500_benchmark_included'] = labels['sp500_included']
         projected["reasons"] = [_bounded_text(item, 400) for item in result.get("reasons", [])[:12]]
         return projected
+
+    @staticmethod
+    def _operating_cost_projection(result):
+        """Inform the model without binding authorization to its own call costs."""
+        costs = result.get('operating_economics') if isinstance(result, dict) else None
+        if not isinstance(costs, dict):
+            return {'status': 'unavailable'}
+        keys = ('recorded_cost_inputs_complete', 'operating_costs_complete', 'model_cost_basis',
+                'acquisition_scope', 'reserved_model_calls', 'unknown_model_calls', 'recorded_through_ms')
+        return {key: copy.deepcopy(costs[key]) for key in keys if key in costs}
+
+    def _audit_support_context(self, context, audit_context):
+        """Exclude support generated from data or model work before the run."""
+        if not isinstance(context, dict):
+            return {'status': 'unavailable', 'reports': []}
+        result = copy.deepcopy(context)
+        selected = []
+        now = self._now_ms()
+        for report in result.get('reports', []):
+            if not isinstance(report, dict):
+                continue
+            captured, quote, completed = (report.get('source_captured_at_ms'),
+                report.get('source_quote_timestamp_ms'), report.get('completed_at_ms'))
+            if any(type(value) is not int or not audit_context['start_ms'] <= value <= now
+                   for value in (captured, quote, completed)):
+                continue
+            try:
+                verified = audit_context['audit'].validate_snapshot(audit_context['run_id'],
+                    report.get('source_snapshot_id'), require_closed=True)
+            except (ValueError, OSError):
+                continue
+            task_id = identity(['support', context.get('strategy_id'), report.get('source_snapshot_id'),
+                                report.get('role'), 'paper-run', audit_context['run_id']])
+            if (verified['captured_at_ms'] != captured or verified['quote_timestamp_ms'] != quote
+                    or report.get('task_id') != task_id):
+                continue
+            with self.store.connection() as db:
+                row = db.execute('''SELECT r.status,r.created_at,c.completed_at,a.experiment_id,k.status AS call_status
+                    FROM agent_responses r JOIN agent_completions c ON c.id=r.task_id
+                    JOIN attributed_calls a ON a.call_id=r.call_id JOIN cascade_calls k ON k.id=r.call_id
+                    WHERE r.task_id=? AND r.component='support' AND c.component='support' ''', (task_id,)).fetchone()
+            if (not row or row['status'] != 'completed' or row['call_status'] != 'settled'
+                    or row['experiment_id'] != context.get('strategy_id')
+                    or not _finite(row['created_at']) or not _finite(row['completed_at'])
+                    or not captured <= round(row['created_at'] * 1000) <= round(row['completed_at'] * 1000) <= completed):
+                continue
+            selected.append(report)
+        result['reports'] = selected
+        if not selected:
+            result['status'] = 'unavailable'
+        return result
 
     def support_preflight(self, strategy_id):
         """Cheap, host-only support fanout gate for the continuous SOL worker.
@@ -1352,7 +1515,9 @@ class ExecutionController:
         except Exception as error:
             return {"needed": True, "reason": "Host state is uncertain (" + type(error).__name__ + ")"}
         try:
-            no_action = self._flat_no_action_preflight(strategy_id, world, eligibility, config,
+            preflight_eligibility = ({**eligibility, 'eligible': True}
+                if self._paper_experiment_authorized(strategy_id) else eligibility)
+            no_action = self._flat_no_action_preflight(strategy_id, world, preflight_eligibility, config,
                                                        budget_available=self._budget_available())
         except Exception as error:
             return {"needed": True, "reason": "Host preflight is uncertain (" + type(error).__name__ + ")"}
@@ -1361,9 +1526,14 @@ class ExecutionController:
                 "reason": "Host controls block discretionary mutations and no position or active order needs management"}
         return {"needed": True, "reason": "A discretionary decision may be actionable"}
 
-    def _continuation_stop_reason(self, strategy_id, strategy, snapshot, config, eligibility):
+    def _continuation_stop_reason(self, strategy_id, strategy, snapshot, config, eligibility, audit_context=None):
         """Lightweight authorization and source freshness check between model rounds."""
         current = self._config()
+        if audit_context is not None:
+            try:
+                audit_context['audit'].assert_active_decision(audit_context['run_id'], audit_context['decision_id'])
+            except Exception:
+                return 'Authorization changed: paper audit continuity is unavailable'
         if not is_sol_mode(current):
             return "Authorization changed: SOL Perpetual mode is no longer selected"
         if not self._permission_allowed():
@@ -1522,7 +1692,7 @@ class ExecutionController:
             raise IntentRejected('The current SOLUSDT venue leverage limit is unavailable')
         return limit
 
-    def _set_leverage(self, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None):
+    def _set_leverage(self, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None, audit_context=None):
         """A journalled, flat-only leverage choice, separate from order authority."""
         if not is_sol_mode(self._config()) or args.get('strategy_id') != strategy_id:
             raise IntentRejected('Agent leverage selection is scoped to SOL Perpetual mode')
@@ -1548,7 +1718,7 @@ class ExecutionController:
                 raise IntentRejected('Requested leverage exceeds the verified venue ceiling')
             if not isinstance(args.get('rationale'), str) or not args['rationale'].strip():
                 raise IntentRejected('A leverage rationale is required')
-            eligibility = self._eligibility(strategy_id)
+            eligibility = self._paper_risk_eligibility(strategy_id, self._eligibility(strategy_id), audit_context)
             if eligibility.get('eligible') is not True or strategy_id not in config['live_execution']['eligible_strategy_versions']:
                 raise IntentRejected('Qualified strategy and explicit operator approval are required')
             if not self._budget_available():
@@ -1573,8 +1743,18 @@ class ExecutionController:
             if not self._permission_allowed() or self._config() != config or self._now_ms() >= expiry:
                 raise IntentRejected('Execution permission changed before leverage mutation')
             self._verify_trade_approval(trade_approval, 'set_leverage', args, tool_id, strategy_id)
+            audit_token = None
+            if audit_context is not None:
+                if getattr(self.adapter, 'mode', None) != 'paper':
+                    raise IntentRejected('Audited leverage attribution is paper-only')
+                from .sol_leverage_audit import prepare
+                audit_token = prepare(audit_context['audit'], audit_context['run_id'],
+                                      audit_context['decision_id'], tool_id, args, trade_approval)
             try:
-                result = self.adapter.set_leverage('linear', 'SOLUSDT', requested)
+                if audit_token is not None:
+                    result = self.adapter.set_leverage('linear', 'SOLUSDT', requested, _paper_audit_token=audit_token)
+                else:
+                    result = self.adapter.set_leverage('linear', 'SOLUSDT', requested)
             except Exception as error:
                 return self._mutation_finish(tool_id, {'status': 'unknown',
                     'reason': 'Leverage readback required (' + type(error).__name__ + ')'}, 'uncertain')
@@ -1583,7 +1763,11 @@ class ExecutionController:
                     'reason': 'Exchange leverage was not verified'}, 'uncertain')
             result.update(rationale=args['rationale'], expires_at_ms=expiry)
             self.store.set_document('live_execution_state', self._state_value(self._world()))
-            return self._mutation_finish(tool_id, result)
+            result = self._mutation_finish(tool_id, result)
+            if audit_token is not None:
+                from .sol_leverage_audit import verify
+                verify(audit_context['audit'], audit_token, result)
+            return result
 
     def _check_order(self, link_id, strategy_id, orders, *, allow_expired=False, allow_terminal=False):
         if not isinstance(link_id, str) or not link_id:
@@ -1628,7 +1812,8 @@ class ExecutionController:
             result["reason"] = error_name
         return result
 
-    def _submit_intent(self, name, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None):
+    def _submit_intent(self, name, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None,
+                       audit_context=None):
         if args.get("strategy_id") != strategy_id:
             raise IntentRejected("Tool is scoped to the event strategy version")
         if not self._permission_allowed():
@@ -1665,7 +1850,7 @@ class ExecutionController:
             current_market = self._fresh_market(strategy_id)
             world = self._world()
             intent = {**args, "order_type": args.get("order_type"), "limit_price": args.get("limit_price")}
-            eligibility = self._eligibility(strategy_id)
+            eligibility = self._paper_risk_eligibility(strategy_id, self._eligibility(strategy_id), audit_context)
             approved = self._risk_check(intent, strategy=strategy, decision_snapshot=decision_snapshot,
                 current_market=current_market, world=world, orders=world["orders"],
                 eligibility=eligibility, budget_available=self._budget_available())
@@ -1674,6 +1859,8 @@ class ExecutionController:
             if self._config() != config:
                 raise IntentRejected("Execution configuration changed during submission validation")
             self._verify_trade_approval(trade_approval, name, args, tool_id, strategy_id)
+            if audit_context is not None and not self._paper_experiment_authorized(strategy_id, audit_context):
+                raise IntentRejected('Paper experiment authorization is no longer active')
             payload = {"category": strategy["market_policy"]["category"], "symbol": strategy["market_policy"]["symbol"],
                 "side": approved["side"], "order_type": approved["order_type"], "quantity": approved["quantity"],
                 "price": approved["limit_price"], "reduce_only": approved["reduce_only"],
@@ -1691,7 +1878,10 @@ class ExecutionController:
                 db.execute("INSERT OR REPLACE INTO execution_order_controls VALUES (?,?,?,?)",
                            (link_id, approved["expires_at_ms"], approved["rationale"], self._now_ms()))
             try:
-                order = self.adapter.submit_order(payload)
+                paper_authorization = self._paper_order_authorization(
+                    strategy_id, audit_context, tool_id, name, args, trade_approval)
+                order = self.adapter.submit_order(payload, **({'_paper_audit_context': paper_authorization}
+                    if paper_authorization is not None else {}))
             except OrderOutcomeUnknown:
                 try:
                     order = self.adapter.reconcile_order(link_id)
@@ -1714,7 +1904,8 @@ class ExecutionController:
             self.store.set_document("live_execution_state", self._state_value(world))
             return self._mutation_finish(tool_id, result, "completed" if result["status"] != "unknown" else "uncertain")
 
-    def _amend_order(self, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None):
+    def _amend_order(self, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None,
+                     audit_context=None):
         if not self._permission_allowed():
             raise IntentRejected("Runtime permission is paused; order amendment is blocked")
         existing_mutation = self._mutation_existing(tool_id, "amend_order", args)
@@ -1756,7 +1947,7 @@ class ExecutionController:
                 "order_type": "Limit", "quantity": args["quantity"], "limit_price": price,
                 "reduce_only": False, "expires_at_ms": args["expires_at_ms"], "rationale": args["rationale"]}
             other_orders = [row for row in world["orders"] if row.get("order_link_id") != order["order_link_id"]]
-            eligibility = self._eligibility(strategy_id)
+            eligibility = self._paper_risk_eligibility(strategy_id, self._eligibility(strategy_id), audit_context)
             approved = self._risk_check(intent, strategy=strategy, decision_snapshot=decision_snapshot,
                 current_market=current_market, world=world, orders=other_orders,
                 eligibility=eligibility, budget_available=self._budget_available())
@@ -1765,6 +1956,8 @@ class ExecutionController:
             if self._config() != config:
                 raise IntentRejected("Execution configuration changed during amendment validation")
             self._verify_trade_approval(trade_approval, "amend_order", args, tool_id, strategy_id)
+            if audit_context is not None and not self._paper_experiment_authorized(strategy_id, audit_context):
+                raise IntentRejected('Paper experiment authorization is no longer active')
             old_expiry = order.get("expires_at_ms") or approved["expires_at_ms"]
             # Until the venue result is known, an uncertain amendment keeps the
             # earlier local deadline. A completed amendment may extend it.
@@ -1773,8 +1966,11 @@ class ExecutionController:
                            (order["order_link_id"], min(old_expiry, approved["expires_at_ms"]),
                             approved["rationale"], self._now_ms()))
             try:
+                paper_authorization = self._paper_order_authorization(
+                    strategy_id, audit_context, tool_id, 'amend_order', args, trade_approval)
                 changed = self.adapter.amend_order(order["order_link_id"], price=approved["limit_price"],
-                    quantity=approved["quantity"])
+                    quantity=approved["quantity"], **({'_paper_audit_context': paper_authorization}
+                    if paper_authorization is not None else {}))
             except OrderOutcomeUnknown:
                 try:
                     changed = self.adapter.reconcile_order(order["order_link_id"])
@@ -1828,8 +2024,11 @@ class ExecutionController:
                                       allow_expired=True, allow_terminal=True)
             if order.get("spot_protection") is True:
                 raise IntentRejected("Spot exchange protection is host managed; request a reduction to exit safely")
+            if order.get("reduce_only") is True:
+                raise IntentRejected("A reducing order cannot be cancelled through the host cancellation path")
             try:
-                result = self.adapter.cancel_order(order["order_link_id"])
+                result = self.adapter.cancel_order(order["order_link_id"],
+                    **self._paper_host_kwargs('_host_protection', True))
             except OrderOutcomeUnknown:
                 try:
                     result = self.adapter.reconcile_order(order["order_link_id"])
@@ -1852,7 +2051,8 @@ class ExecutionController:
             return self._mutation_finish(tool_id, result,
                 "uncertain" if result.get("status") == "unknown" else "completed")
 
-    def _reduce_exposure(self, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None):
+    def _reduce_exposure(self, args, tool_id, *, strategy_id, approved_snapshots, trade_approval=None,
+                         audit_context=None):
         if args.get("strategy_id") != strategy_id:
             raise IntentRejected("Tool is scoped to the event strategy version")
         previous = self._mutation_existing(tool_id, "reduce_exposure", args)
@@ -1915,7 +2115,10 @@ class ExecutionController:
                 "snapshot_id": approved["snapshot_id"], "rationale": approved["rationale"],
                 "expires_at_ms": approved["expires_at_ms"]}
             try:
-                order = self.adapter.submit_order(payload)
+                paper_authorization = self._paper_order_authorization(
+                    strategy_id, audit_context, tool_id, 'reduce_exposure', args, trade_approval)
+                order = self.adapter.submit_order(payload, **({'_paper_audit_context': paper_authorization}
+                    if paper_authorization is not None else {}))
             except OrderOutcomeUnknown:
                 try:
                     order = self.adapter.reconcile_order(link)
@@ -1933,7 +2136,7 @@ class ExecutionController:
             return result
 
     def _handle_tool(self, name, args, tool_id, *, strategy_id, approved_snapshots, decision_snapshot, world,
-                     trade_approval=None):
+                     trade_approval=None, audit_context=None):
         if name == "inspect_strategies":
             strategy = self._strategy(strategy_id)
             return {"strategy": self._strategy_projection(strategy),
@@ -1963,28 +2166,34 @@ class ExecutionController:
                     "acknowledgements_are_not_fills": True}
         if name == "submit_order_intent":
             return self._submit_intent(name, args, tool_id, strategy_id=strategy_id,
-                                       approved_snapshots=approved_snapshots, trade_approval=trade_approval)
+                                       approved_snapshots=approved_snapshots, trade_approval=trade_approval,
+                                       audit_context=audit_context)
         if name == 'set_leverage':
             return self._set_leverage(args, tool_id, strategy_id=strategy_id,
-                                      approved_snapshots=approved_snapshots, trade_approval=trade_approval)
+                                      approved_snapshots=approved_snapshots, trade_approval=trade_approval,
+                                      audit_context=audit_context)
         if name == "amend_order":
             return self._amend_order(args, tool_id, strategy_id=strategy_id,
-                                     approved_snapshots=approved_snapshots, trade_approval=trade_approval)
+                                     approved_snapshots=approved_snapshots, trade_approval=trade_approval,
+                                     audit_context=audit_context)
         if name == "cancel_order":
             return self._cancel_order(args, tool_id, strategy_id=strategy_id)
         if name == "reduce_exposure":
             return self._reduce_exposure(args, tool_id, strategy_id=strategy_id,
-                                         approved_snapshots=approved_snapshots, trade_approval=trade_approval)
+                                         approved_snapshots=approved_snapshots, trade_approval=trade_approval,
+                                         audit_context=audit_context)
         if name == "hold":
             return {"status": "held", "strategy_id": strategy_id,
                     "rationale": args.get("rationale", "")}
         raise IntentRejected("Execution tool is not permitted")
 
     def _dispatch_tool(self, name, args, tool_id, *, strategy_id, approved_snapshots, decision_snapshot, world,
-                       decision_config=None, decision_eligibility=None):
+                       decision_config=None, decision_eligibility=None, audit_context=None):
         try:
             trade_approval = None
             reviewed_tools = {"submit_order_intent", "amend_order", "reduce_exposure", "set_leverage"}
+            if audit_context is not None and name in reviewed_tools:
+                audit_context['audit'].validate_snapshot(audit_context['run_id'], args.get('snapshot_id'), require_closed=True)
             if is_sol_mode(self._config()) and name in reviewed_tools:
                 # Existing durable tool identities retain their exact idempotent
                 # replay/reconciliation semantics and never trigger a new review.
@@ -1992,7 +2201,7 @@ class ExecutionController:
                     trade_approval = self._prepare_trade_review(name, args, tool_id,
                         strategy_id=strategy_id, decision_snapshot=decision_snapshot,
                         decision_world=world, decision_config=decision_config,
-                        decision_eligibility=decision_eligibility)
+                        decision_eligibility=decision_eligibility, audit_context=audit_context)
                     if not isinstance(trade_approval, dict) or trade_approval.get("status") != "approved":
                         return {"status": "blocked", "reason": _bounded_text(
                             (trade_approval or {}).get("reason", "Dedicated trade approval is required")),
@@ -2005,9 +2214,17 @@ class ExecutionController:
                     # only while its original approval still matches current
                     # state. Completed idempotent outcomes return without use.
                     trade_approval = self.trade_reviewer.approval_for_tool(tool_id, name, args)
+            if audit_context is not None and name in reviewed_tools:
+                audit_context['audit'].assert_active_decision(audit_context['run_id'], audit_context['decision_id'])
             result = self._handle_tool(name, args, tool_id, strategy_id=strategy_id,
                 approved_snapshots=approved_snapshots, decision_snapshot=decision_snapshot, world=world,
-                trade_approval=trade_approval)
+                trade_approval=trade_approval, audit_context=audit_context)
+            if audit_context is not None and name == 'inspect_market':
+                try:
+                    audit_context['audit'].validate_snapshot(audit_context['run_id'], result.get('snapshot_id'), require_closed=True)
+                except (ValueError, OSError):
+                    approved_snapshots.discard(result.get('snapshot_id'))
+                    raise IntentRejected('Market inspection is outside the prospective paper run')
             if is_sol_mode(self._config()) and name in reviewed_tools and isinstance(result, dict):
                 review = (trade_approval if trade_approval and trade_approval.get("status") == "approved"
                           else self.trade_reviewer.outcome_for_tool(tool_id) if self.trade_reviewer else None)
@@ -2047,6 +2264,32 @@ class ExecutionController:
         if isinstance(result.get("reason"), str):
             result["reason"] = _bounded_text(result["reason"], 400)
         return result
+
+    @staticmethod
+    def _sol_spread_context(snapshot, now_ms, max_age_seconds):
+        """Same-quote crossing cost, not a forecast or an estimate of all costs."""
+        unavailable = {'status': 'unavailable', 'same_quote_long_round_trip_spread_bps': None}
+        try:
+            quote = snapshot.get('quote')
+            if (snapshot.get('ready') is not True or snapshot.get('stale') is not False
+                    or not isinstance(quote, dict) or quote.get('source') != 'websocket'):
+                return unavailable
+            captured, at = snapshot.get('captured_at_ms'), quote.get('timestamp_ms')
+            bid, ask = quote.get('bid'), quote.get('ask')
+            if (type(now_ms) is not int or type(captured) is not int or type(at) is not int
+                    or not 0 < at <= captured <= now_ms or not _finite(max_age_seconds)
+                    or max_age_seconds <= 0 or now_ms - at > max_age_seconds * 1000
+                    or not _finite(bid) or not _finite(ask) or bid <= 0 or ask < bid):
+                return unavailable
+            spread = (1 - bid / ask) * 10000
+            if not math.isfinite(spread):
+                return unavailable
+            return {'status': 'observed', 'same_quote_long_round_trip_spread_bps': spread,
+                    'quote_timestamp_ms': at, 'quote_age_ms': now_ms - at,
+                    'basis': 'buy at observed ask, sell at the same observed bid',
+                    'limitations': 'Indicative only; excludes fees, funding, quote movement, slippage, market impact and operating costs. It is not an expected return.'}
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return unavailable
 
     def _constraints(self, strategy_id):
         config = self._config()
@@ -2143,6 +2386,51 @@ class ExecutionController:
         return result
 
     def handle_event(self, event):
+        """Record an opted-in paper run's trigger before executing its decision."""
+        run_id = self.store.get_document('sol_paper_audit_active')
+        if run_id is None:
+            return self._handle_event_unjournaled(event)
+        if not isinstance(event, dict):
+            return {'status': 'blocked', 'reason': 'Invalid event during an active paper audit'}
+        config = self._config()
+        strategy_id = event.get('strategy_id')
+        event_id = str(event.get('id') or identity(event))[:256]
+        decision_id = identity([self._environment(), self._scope(config['bybit'].get('account_id', 'unbound')),
+                                strategy_id, event_id])
+        try:
+            from .sol_paper_audit import SolPaperAudit
+            audit = getattr(self, '_paper_audit_journal', None)
+            if audit is None:
+                audit = self._paper_audit_journal = SolPaperAudit(self.store, paper=getattr(self.adapter, 'transport', None))
+            else:
+                audit.paper = getattr(self.adapter, 'transport', None)
+            if not is_sol_mode(config) or config['bybit'].get('mode') != 'paper':
+                audit.invalidate(run_id, 'Execution mode changed during the active paper run')
+                return {'status': 'blocked', 'reason': 'Paper audit invalidated by execution-mode change'}
+            payload = {'event_id': event_id, 'strategy_id': strategy_id,
+                       'snapshot_id': event.get('snapshot_id'), 'trigger_kind': event.get('kind'),
+                       'event': self._event_summary(event)}
+            started = audit.begin_decision(run_id, decision_id, payload)
+            if started['replay']:
+                return started['outcome']
+        except Exception as error:
+            return {'status': 'blocked', 'reason': 'Paper audit could not admit the decision (' + type(error).__name__ + '); '
+                    'trader-mediated exits and cancellations are blocked, while independent host protection remains active'}
+        try:
+            outcome = self._handle_event_unjournaled(event, audit_context={
+                'audit': audit, 'run_id': run_id, 'start_ms': started['start_ms'], 'decision_id': decision_id})
+        except Exception as error:
+            outcome = {'status': 'unknown', 'reason': 'Decision failed after audit admission (' + type(error).__name__ + ')'}
+        try:
+            audit.finish_decision(run_id, decision_id, outcome)
+        except Exception as error:
+            # A tool mutation may already have occurred. Preserve the started
+            # record and never describe an uncertain outcome as a clean block.
+            return {'status': 'unknown', 'reason': 'Decision outcome could not be journalled (' + type(error).__name__ + ')',
+                    'decision_outcome': outcome}
+        return outcome
+
+    def _handle_event_unjournaled(self, event, *, audit_context=None):
         """Run one bounded Sol conversation for a durable runtime event."""
         if not isinstance(event, dict):
             return {"status": "blocked", "reason": "Invalid execution event"}
@@ -2178,6 +2466,14 @@ class ExecutionController:
                 rationale="Host market/account reconciliation failed (" + type(error).__name__ + ")")
             return value
         snapshot_id = snapshot["snapshot_id"]
+        if audit_context is not None:
+            try:
+                audit_context['audit'].validate_snapshot(audit_context['run_id'], snapshot_id,
+                    require_closed=event.get('kind') in {'candle_closed', 'signal', 'intrabar'})
+            except (ValueError, OSError):
+                return self._decision_value(decision_id=decision_id, event_id=event_id, strategy_id=strategy_id,
+                    fingerprint=identity([strategy_id, snapshot_id, 'pre-run-market-input']), status='blocked',
+                    snapshot_id=snapshot_id, rationale='Actual decision snapshot is outside the paper run or invalid')
         event_payload = self._event_summary(event)
         account = world["account"]
         account_fingerprint = {key: account.get(key) for key in ("equity", "available_balance", "daily_pnl",
@@ -2207,8 +2503,9 @@ class ExecutionController:
             self._record_memory(world, value)
             return value
         try:
+            risk_eligibility = self._paper_risk_eligibility(strategy_id, eligibility_result, audit_context)
             no_action = is_sol_mode(config) and self._flat_no_action_preflight(strategy_id, world,
-                eligibility_result, config, budget_available=budget_available)
+                risk_eligibility, config, budget_available=budget_available)
         except Exception:
             no_action = False
         if no_action:
@@ -2246,21 +2543,31 @@ class ExecutionController:
             "eligibility": eligibility,
             "runtime_permission": True, "account_reconciliation_required": world["account"]["reconciliation_required"],
             "protection_state": safe_state["account"]}
+        if audit_context is not None:
+            payload['paper_experiment'] = {'run_id': audit_context['run_id'],
+                'authorized': self._paper_experiment_authorized(strategy_id, audit_context),
+                'exchange_qualification': False}
         if callable(self.support_context_provider):
             try:
                 payload['support_swarm'] = self.support_context_provider(strategy_id, snapshot)
+                if audit_context is not None:
+                    payload['support_swarm'] = self._audit_support_context(payload['support_swarm'], audit_context)
             except Exception:
                 payload['support_swarm'] = {'status': 'unavailable', 'reports': []}
         payload['experiment_id'] = strategy.get('experiment_id', strategy_id)
         request_check = None
         tool_check = None
         if is_sol_mode(config):
+            payload['operating_cost_evidence'] = self._operating_cost_projection(eligibility_result)
+            payload['observed_execution_costs'] = self._sol_spread_context(snapshot, self._now_ms(),
+                min(config['live_execution']['max_quote_age_seconds'],
+                    strategy['market_policy']['max_data_age_seconds']))
             request_check = lambda: self._continuation_stop_reason(
-                strategy_id, strategy, snapshot, config, eligibility)
+                strategy_id, strategy, snapshot, config, eligibility, audit_context)
             safe_tools = {"inspect_strategies", "inspect_market", "inspect_account",
                           "inspect_orders", "hold", "cancel_order"}
             tool_check = lambda name, args: (None if name in safe_tools else
-                self._continuation_stop_reason(strategy_id, strategy, snapshot, config, eligibility))
+                self._continuation_stop_reason(strategy_id, strategy, snapshot, config, eligibility, audit_context))
         decision_deadline_ms = None
         if is_sol_mode(config):
             captured = snapshot.get("captured_at_ms")
@@ -2272,11 +2579,16 @@ class ExecutionController:
                 if type(attention) is int:
                     decision_deadline_ms = min(decision_deadline_ms, attention)
         try:
+            model_task_id = ('execution-' + identity([audit_context['run_id'], decision_id])
+                             if audit_context is not None else 'execution-' + decision_id)
+            if audit_context is not None:
+                audit_context['audit'].assert_new_model_task(model_task_id)
             result = self.agents.tools(payload, SOL_EXECUTION_TOOLS if is_sol_mode(config) else EXECUTION_TOOLS,
                 lambda name, args, key: self._dispatch_tool(name, args, key, strategy_id=strategy_id,
                     approved_snapshots=approved_snapshots, decision_snapshot=snapshot, world=world,
-                    decision_config=copy.deepcopy(config), decision_eligibility=copy.deepcopy(eligibility)),
-                task_id="execution-" + decision_id, request_check=request_check,
+                    decision_config=copy.deepcopy(config), decision_eligibility=copy.deepcopy(eligibility),
+                    audit_context=audit_context),
+                task_id=model_task_id, request_check=request_check,
                 tool_check=tool_check, deadline_ms=decision_deadline_ms)
         except BudgetExceeded as error:
             status = "blocked"
@@ -2422,7 +2734,8 @@ class ExecutionController:
     def _confirm_cancel_order(self, order):
         """Cancel a normal order and reconcile its fill/cancel race."""
         try:
-            result = self.adapter.cancel_order(order["order_link_id"])
+            result = self.adapter.cancel_order(order["order_link_id"],
+                **self._paper_host_kwargs('_host_protection', True))
         except OrderOutcomeUnknown:
             result = None
         except Exception:
@@ -2538,7 +2851,8 @@ class ExecutionController:
             result = self.adapter.set_spot_exchange_protection(symbol, position["quantity"], stop,
                 order_link_id=desired_link, strategy_id=strategy_id,
                 snapshot_id=(snapshot or {}).get("snapshot_id"),
-                rationale="Host-calculated cash Spot stop protection")
+                rationale="Host-calculated cash Spot stop protection",
+                **self._paper_host_kwargs('host_protection', True))
             check = result.get("verification", {})
         except OrderOutcomeUnknown:
             try:
@@ -2565,7 +2879,8 @@ class ExecutionController:
 
     def _protect_order(self, order, reason):
         try:
-            result = self.adapter.cancel_order(order["order_link_id"])
+            result = self.adapter.cancel_order(order["order_link_id"],
+                **self._paper_host_kwargs('_host_protection', True))
             return {"action": "cancel", "order_link_id": order["order_link_id"],
                     "status": result.get("status", "cancel_pending"), "reason": reason}
         except OrderOutcomeUnknown:
@@ -2620,7 +2935,8 @@ class ExecutionController:
                 "side": "Sell", "order_type": "Market", "quantity": quantity, "price": None,
                 "reduce_only": True, "order_link_id": link_id, "strategy_id": strategy_id,
                 "snapshot_id": "host-protection", "rationale": _bounded_text(reason),
-                "expires_at_ms": self._now_ms() + 60_000})
+                "expires_at_ms": self._now_ms() + 60_000},
+                **self._paper_host_kwargs('_paper_host_action', 'reduce'))
             return {"action": "reduce", "strategy_id": strategy_id, "symbol": position["symbol"],
                     "status": result.get("status", "unknown"), "filled_quantity": result.get("filled_quantity", 0.),
                     "acknowledgement_is_not_fill": True, "reason": reason}
@@ -2669,7 +2985,13 @@ class ExecutionController:
         return None
 
     def protect(self):
-        """Run model-free cancellation, risk, stop, TTL, and retirement controls."""
+        """Run model-free cancellation, risk, stop, TTL, and retirement controls.
+
+        Paper protection uses a separate, one-use host capability for these
+        actions. It permits closing existing long quantity, installing or
+        tightening protective stops, and cancelling tracked opening orders or
+        protective stops. It cannot open exposure or amend an order decision.
+        """
         config = self._config()
         if not config["bybit"].get("enabled"):
             return {"status": "idle", "reason": "Bybit is disabled", "actions": []}
@@ -2763,7 +3085,8 @@ class ExecutionController:
                                 else:
                                     check = self.adapter.verify_exchange_protection("linear", position["symbol"], expected)
                                     if not check.get("verified"):
-                                        check = self.adapter.set_exchange_stop_loss("linear", position["symbol"], expected)
+                                        check = self.adapter.set_exchange_stop_loss("linear", position["symbol"], expected,
+                                            **self._paper_host_kwargs('host_protection', True))
                                 if not check.get("verified"):
                                     reason = reason or "Exchange linear stop could not be verified"
                                 else:

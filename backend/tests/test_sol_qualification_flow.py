@@ -2,6 +2,7 @@
 import copy
 import importlib
 import unittest
+from unittest.mock import patch
 
 _e2e_fixture = importlib.import_module('test_sol_swarm_e2e')
 from prism_runtime import analytics
@@ -109,6 +110,27 @@ class SolQualificationFlowTests(unittest.TestCase):
 
         report = self.research.report(sid)
         self.assertEqual(report['verified_observations'], 1)
+        self.assertFalse(report['qualification_evidence_scope']['discretionary_trader_decisions'])
+        self.assertFalse(report['benchmark_labels']['sp500_included'])
+        projected = self.controller._eligibility_projection(sid, report)
+        self.assertFalse(projected['qualification_evidence_scope']['discretionary_trader_decisions'])
+        self.assertFalse(projected['qualification_evidence_scope']['block_independence_verified'])
+        self.assertFalse(projected['sp500_benchmark_included'])
+        self.assertNotIn('recorded_cost_inputs_complete', projected)
+        cost_evidence = self.controller._operating_cost_projection(report)
+        self.assertFalse(cost_evidence['operating_costs_complete'])
+        self.assertTrue(cost_evidence['recorded_cost_inputs_complete'])
+        self.assertTrue(report['operating_economics']['qualification_basis_excludes_operating_costs'])
+        self.assertTrue(report['operating_economics']['recorded_cost_inputs_complete'])
+        self.assertFalse(report['operating_economics']['operating_costs_complete'])
+        self.assertIsNotNone(report['operating_economics']['operating_return_on_initial_equity'])
+        incomplete = copy.deepcopy(self.research.observations(sid))
+        incomplete[0]['source_cost_complete'] = False
+        with patch.object(self.research, '_verified_observations', return_value=(incomplete, 0)):
+            economics = self.research.report(sid)['operating_economics']
+        self.assertFalse(economics['recorded_cost_inputs_complete'])
+        self.assertIsNone(economics['operating_pnl_usd'])
+        self.assertIsNone(economics['operating_return_on_initial_equity'])
         self.assertFalse(report['eligible'])
         self.assertTrue(any('60 distinct future calendar days' in reason or
                             'Need at least 60 observed future sessions' in reason
@@ -170,6 +192,122 @@ class SolQualificationFlowTests(unittest.TestCase):
                       status['reasons'])
         self.assertFalse(self.controller.support_preflight(sid)['needed'])
 
+    def test_worker_refresh_never_replaces_selected_owner_after_code_change(self):
+        runtime = self.fixture.runtime
+        sid = self.fixture.strategy_id
+        before = len(self.fixture.store.experiments())
+        with patch('prism_runtime.orchestrator.sol_behavior_digest', return_value='changed-behavior'):
+            self.assertEqual(runtime.ensure_sol_strategy(), sid)
+        self.assertEqual(self.fixture.store.get_document('sol_mode_strategy_id'), sid)
+        self.assertEqual(len(self.fixture.store.experiments()), before)
+
+    def test_mismatched_persisted_mode_settings_fail_closed(self):
+        f = self.fixture
+        f.store.update_config({'trading_mode': {'swarm_size': 5}})
+        result = self.research.eligibility(f.strategy_id)
+        self.assertFalse(result['eligible'])
+        self.assertIn('Selected SOL behavior settings do not match frozen qualification', result['reasons'])
+
+    def test_shadow_promotion_cannot_authorize_exchange_discretion(self):
+        f = self.fixture
+        config = f.store.config()
+        passing = {'eligible': True, 'reasons': [],
+                   'latest_verified_utc_day': int(f.clock() // 86400)}
+        with patch.object(self.research, 'report', return_value=passing):
+            self.assertTrue(self.research.eligibility(f.strategy_id)['eligible'])
+            for mode in ('testnet', 'mainnet'):
+                with self.subTest(mode=mode):
+                    changed = copy.deepcopy(config)
+                    changed['bybit']['mode'] = mode
+                    with patch.object(f.store, 'config', return_value=changed):
+                        result = self.research.eligibility(f.strategy_id)
+                    self.assertFalse(result['eligible'])
+                    self.assertIn('Discretionary SOL decisions have not been prospectively qualified for exchange execution', result['reasons'])
+
+    def test_model_budget_drift_invalidates_frozen_behavior(self):
+        f = self.fixture
+        frozen = f.store.experiment(f.strategy_id)['policy']['execution_identity']
+        self.assertEqual(frozen['lifetime_model_budget_usd'], f.store.config()['trading_mode']['lifetime_model_budget_usd'])
+        f.store.update_config({'trading_mode': {'lifetime_model_budget_usd': 123.0}})
+        with patch.object(self.research, 'report', return_value={'eligible': True, 'reasons': [],
+                'latest_verified_utc_day': self.research._now_ms() // 86_400_000}):
+            result = self.research.eligibility(f.strategy_id)
+        self.assertFalse(result['eligible'])
+        self.assertIn('Selected SOL behavior settings do not match frozen qualification', result['reasons'])
+
+    def test_wrong_frozen_execution_mode_blocks_even_a_passing_report(self):
+        f = self.fixture
+        experiment = f.store.experiment(f.strategy_id)
+        experiment['policy']['execution_identity']['mode'] = 'research'
+        passing = {'eligible': True, 'reasons': [],
+                   'latest_verified_utc_day': int(f.clock() // 86400)}
+        with patch.object(self.research, 'report', return_value=passing), \
+             patch.object(f.store, 'experiment', return_value=experiment):
+            result = self.research.eligibility(f.strategy_id)
+        self.assertFalse(result['eligible'])
+        self.assertIn('Selected SOL behavior settings do not match frozen qualification', result['reasons'])
+
+    def test_missing_utc_day_cannot_qualify_even_with_sixty_observations(self):
+        from test_forward_report import observations
+        rows = observations(61)
+        for row in rows:
+            row['day'] = row['session_ms'] // 86_400_000
+            row['source_cost_complete'] = True
+        del rows[10]
+        with patch.object(self.research, '_verified_observations', return_value=(rows, 0)):
+            result = self.research.report(self.fixture.strategy_id)
+        self.assertEqual(result['sessions'], 60)
+        self.assertEqual(result['missing_utc_days'], 1)
+        self.assertFalse(result['eligible'])
+        self.assertIn('Missing UTC daily observations prevent a complete prospective record', result['reasons'])
+
+    def test_periodic_blocks_cannot_qualify_even_when_lag_one_screen_passes(self):
+        from prism_runtime.experiments import forward_report
+        from prism_runtime.sol_dependence import assess_sol_dependence
+        from test_forward_report import observations
+
+        rows = observations(120)
+        equity = rows[0]['initial_equity']
+        for i, row in enumerate(rows):
+            equity *= (1 + (0.04, 0.03, 0.02, 0.03)[(i // 5) % 4]) ** (1 / 5)
+            row.update(equity=equity, benchmark_return=0., market_return=0., sector_return=0.,
+                       day=row['session_ms'] // 86_400_000)
+        self.assertEqual(assess_sol_dependence(rows)['status'], 'passed_screen')
+        self.assertEqual(forward_report(rows, {'research': {'alpha_budget': .025}},
+                                        performance_basis='trading')['status'], 'promoted')
+        with patch.object(self.research, '_verified_observations', return_value=(rows, 0)):
+            result = self.research.report(self.fixture.strategy_id)
+        self.assertEqual(result['sol_dependence_screen']['status'], 'passed_screen')
+        self.assertEqual(result['status'], 'inconclusive')
+        self.assertFalse(result['eligible'])
+        self.assertIn('SOL forward dependence is not validated for qualification', result['reasons'])
+
+    def test_corrected_intraday_signal_invalidates_downstream_daily_proofs(self):
+        f = self.fixture
+        sid = f.strategy_id
+        base = f.store.experiment(sid)['registered_at_ms'] + 120_000
+        first = self.freeze_sol_snapshot(base, rising=False, quote_price=100.)
+        self.assertIsNotNone(self.research.observe(sid, first))
+        signal = self.freeze_sol_snapshot(base + 60_000, rising=True, quote_price=100.)
+        self.assertIsNotNone(self.research.observe(sid, signal))
+        fill_quote = self.freeze_sol_snapshot(base + 61_000, rising=True, quote_price=100.)
+        fill = self.research.observe_quote(sid, fill_quote)
+        self.assertIn('entry_fill', fill['events'])
+        next_day = self.freeze_sol_snapshot(base + 86_400_000, rising=True, quote_price=101.)
+        self.assertIsNotNone(self.research.observe(sid, next_day))
+        self.assertEqual(self.research.report(sid)['verified_observations'], 2)
+        with f.store.connection() as db:
+            db.execute('UPDATE md_snapshots SET invalidated=1,reason=? WHERE id=?',
+                       ('synthetic intraday correction', signal['snapshot_id']))
+        corrected = self.research.report(sid)
+        self.assertEqual(corrected['verified_observations'], 0)
+        self.assertEqual(corrected['invalid_observations'], 2)
+        self.assertFalse(corrected['eligible'])
+        self.assertEqual(self.research.observations(sid), [])
+        self.assertIsNone(self.research.observe(sid, next_day))
+        later = self.freeze_sol_snapshot(base + 86_461_000, rising=True, quote_price=101.)
+        self.assertIsNone(self.research.observe_quote(sid, later))
+
     def test_synthetic_producer_path_can_satisfy_every_predeclared_gate(self):
         f = self.fixture
         sid = f.strategy_id
@@ -221,15 +359,30 @@ class SolQualificationFlowTests(unittest.TestCase):
             self.research.observe_quote(sid, observations[3])
 
         report = self.research.report(sid)
-        self.assertEqual(report['status'], 'promoted', report)
-        self.assertTrue(report['eligible'], report['reasons'])
+        self.assertEqual(report['status'], 'inconclusive', report)
+        self.assertFalse(report['eligible'], report['reasons'])
+        self.assertEqual(report['sol_dependence_screen']['status'], 'insufficient')
         self.assertEqual(report['verified_observations'], 60)
         self.assertGreaterEqual(report['completed_trades'], 8)
         self.assertEqual(report['invalid_observations'], 0)
         self.assertEqual(report['missing_baselines'], [])
         self.assertTrue(all(item['nonzero_blocks'] >= 12 and item['positive_blocks'] == 12
                             for item in report['statistics'].values()))
-        self.assertTrue(self.research.eligibility(sid)['eligible'])
+        self.assertFalse(self.research.eligibility(sid)['eligible'])
+
+        with patch('prism_runtime.trading_modes.sol_behavior_digest', return_value='changed-behavior'):
+            drift = self.research.eligibility(sid)
+        self.assertFalse(drift['eligible'])
+        self.assertIn('SOL behavior changed or its frozen identity is unavailable; a new qualification is required',
+                      drift['reasons'])
+
+        # A prior passing study cannot indefinitely authorize fresh exposure
+        # after the daily prospective record stops advancing.
+        f.now[0] += 30 * 86400
+        stale = self.research.eligibility(sid)
+        self.assertFalse(stale['eligible'])
+        self.assertIn('A verified SOL forward observation for the current UTC day is required', stale['reasons'])
+        f.now[0] -= 30 * 86400
 
         # A later host correction revokes the producer proof and qualification.
         last_day = self.research.observations(sid)[-1]
